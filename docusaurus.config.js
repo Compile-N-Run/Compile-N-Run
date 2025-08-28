@@ -254,7 +254,7 @@ const config = {
                 },
                 announcementBar: {
                     id: "replay_announcement",
-                    content: 'The best website to learn any programming language and frameworks for free! Now is your turn to compile and run!',
+                    content: '⭐ Star us on <a href="https://github.com/Compile-N-Run/Compile-N-Run">GitHub</a> to support the project!',
                     backgroundColor: "#312e81",
                     textColor: "#ffffff",
                     isCloseable: true,

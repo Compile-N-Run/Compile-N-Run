@@ -1,5 +1,8 @@
 # Compile N Run
 
+![Home](static/homepage.png)
+
+
 - https://www.compilenrun.com/
 
 **Compile N Run** is a comprehensive learning platform designed for developers and computer science enthusiasts. Whether you're preparing for technical interviews, strengthening your programming fundamentals, or exploring new technologies, our platform provides curated resources across the entire software development stack.
