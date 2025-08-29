@@ -27,6 +27,8 @@ const config = {
                 removeLegacyPostBuildHeadAttribute: true, // required
             },
             experimental_faster: {
+                rspackBundler: true, // required flag
+                rspackPersistentCache: true, // new flag
                 ssgWorkerThreads: true,
             },
         },
@@ -254,7 +256,7 @@ const config = {
                 },
                 announcementBar: {
                     id: "replay_announcement",
-                    content: '⭐ Star us on <a href="https://github.com/Compile-N-Run/Compile-N-Run">GitHub</a> to support the project!',
+                    content: ' The best website to learn any programming language for free! ⭐ Star us on <a href="https://github.com/Compile-N-Run/Compile-N-Run" target="_blank">GitHub</a> to support the project!',
                     backgroundColor: "#312e81",
                     textColor: "#ffffff",
                     isCloseable: true,
