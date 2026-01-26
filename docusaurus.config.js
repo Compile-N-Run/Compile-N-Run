@@ -26,11 +26,21 @@ const config = {
             v4: {
                 removeLegacyPostBuildHeadAttribute: true, // required
             },
+            // experimental_faster: {
+            //     rspackBundler: true, // required flag
+            //     rspackPersistentCache: true, // new flag
+            //     ssgWorkerThreads: true,
+            // },
             experimental_faster: {
-                rspackBundler: true, // required flag
-                rspackPersistentCache: true, // new flag
-                ssgWorkerThreads: true,
-            },
+                    swcJsLoader: true,
+                    swcJsMinimizer: true,
+                    swcHtmlMinimizer: true,
+                    lightningCssMinimizer: true,
+                    rspackBundler: true,
+                    rspackPersistentCache: true,
+                    ssgWorkerThreads: true,
+                    mdxCrossCompilerCache: true,
+                }
         },
         title: 'Compile N Run',
         tagline: 'The best website to learn any programming language for free!',
