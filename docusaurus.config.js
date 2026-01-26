@@ -96,7 +96,7 @@ const config = {
                 "data-website-id": "5cd1a168-25dd-480c-8560-15c0becd3768",
             },
             {
-                src: 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-8558870819217345',
+                src: 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4639688777749090',
                 async: true,
                 crossorigin: 'anonymous',
             },
