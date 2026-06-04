@@ -633,6 +633,11 @@ const config = {
                         //     label: 'Algorithm',
                         //     to: "/docs/algorithm"
                         // }
+                        {
+                            label: 'About',
+                            to: '/about',
+                            position: 'right',
+                        },
                     ],
                 },
                 footer: {
@@ -659,16 +664,33 @@ const config = {
                             title: 'Links',
                             items: [
                                 {
-                                    label: 'About me',
-                                    to: 'https://www.yuyangwang.org/',
+                                    label: 'About',
+                                    to: '/about',
                                 },
                                 {
-                                    label: 'CN Site',
-                                    to: 'https://www.echo.cool/',
+                                    label: 'Contact',
+                                    to: '/contact',
+                                },
+                                {
+                                    label: 'Maintainer',
+                                    to: 'https://www.yuyangwang.org/',
                                 },
                                 {
                                     label: 'Github',
                                     to: 'https://github.com/Compile-N-Run/Compile-N-Run',
+                                },
+                            ],
+                        },
+                        {
+                            title: 'Legal',
+                            items: [
+                                {
+                                    label: 'Privacy Policy',
+                                    to: '/privacy-policy',
+                                },
+                                {
+                                    label: 'Terms of Use',
+                                    to: '/terms',
                                 },
                             ],
                         },
