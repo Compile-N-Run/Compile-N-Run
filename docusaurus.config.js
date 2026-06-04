@@ -31,7 +31,8 @@ const config = {
             //     rspackPersistentCache: true, // new flag
             //     ssgWorkerThreads: true,
             // },
-            experimental_faster: {
+            // Renamed from `experimental_faster` to `faster` in Docusaurus 3.10
+            faster: {
                     swcJsLoader: true,
                     swcJsMinimizer: true,
                     swcHtmlMinimizer: true,
@@ -158,6 +159,10 @@ const config = {
 
         markdown: {
             mermaid: true,
+            hooks: {
+                // Moved from the deprecated top-level `onBrokenMarkdownLinks` in Docusaurus 3.9+
+                onBrokenMarkdownLinks: 'warn',
+            },
         },
 
 
@@ -167,7 +172,6 @@ const config = {
         // projectName: 'docusaurus', // Usually your repo name.
 
         onBrokenLinks: 'warn',
-        onBrokenMarkdownLinks: 'warn',
 
         // Even if you don't use internationalization, you can use this field to set
         // useful metadata like html lang. For example, if your site is Chinese, you
