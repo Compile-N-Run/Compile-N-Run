@@ -35,26 +35,26 @@ export default function Home() {
             description="The best website to learn any programming language for free!">
             <HomepageHeader/>
             <main className="homepage_content">
-                <section className="container" style={{maxWidth: '860px', margin: '2.5rem auto 0', padding: '0 1rem'}}>
-                    <h2>Learn Programming and Computer Science — for Free</h2>
-                    <p>
-                        <strong>Compile N Run</strong> is a free, open learning platform for developers, computer
-                        science students, and self-taught programmers. We publish structured, hands-on tutorials that
-                        take you from the fundamentals to production-grade skills — no sign-up, no paywall.
-                    </p>
-                    <p>
-                        Our library spans more than a dozen programming languages, popular web frameworks, databases,
-                        DevOps and observability tools, operating systems, and core CS topics such as data structures,
-                        algorithms, computer networks, and interview preparation. Every guide is organized as a
-                        progressive learning path with clear explanations, runnable code examples, and diagrams so you
-                        can learn by doing.
-                    </p>
-                    <p>
-                        New here? Pick a topic below to get started, or read more about{' '}
-                        <Link to="/about">our mission and approach</Link>. Have feedback or found an error?{' '}
-                        <Link to="/contact">Get in touch</Link> — we read every message.
-                    </p>
-                </section>
+                {/*<section className="container" style={{maxWidth: '860px', margin: '2.5rem auto 0', padding: '0 1rem'}}>*/}
+                {/*    <h2>Learn Programming and Computer Science — for Free</h2>*/}
+                {/*    <p>*/}
+                {/*        <strong>Compile N Run</strong> is a free, open learning platform for developers, computer*/}
+                {/*        science students, and self-taught programmers. We publish structured, hands-on tutorials that*/}
+                {/*        take you from the fundamentals to production-grade skills — no sign-up, no paywall.*/}
+                {/*    </p>*/}
+                {/*    <p>*/}
+                {/*        Our library spans more than a dozen programming languages, popular web frameworks, databases,*/}
+                {/*        DevOps and observability tools, operating systems, and core CS topics such as data structures,*/}
+                {/*        algorithms, computer networks, and interview preparation. Every guide is organized as a*/}
+                {/*        progressive learning path with clear explanations, runnable code examples, and diagrams so you*/}
+                {/*        can learn by doing.*/}
+                {/*    </p>*/}
+                {/*    <p>*/}
+                {/*        New here? Pick a topic below to get started, or read more about{' '}*/}
+                {/*        <Link to="/about">our mission and approach</Link>. Have feedback or found an error?{' '}*/}
+                {/*        <Link to="/contact">Get in touch</Link> — we read every message.*/}
+                {/*    </p>*/}
+                {/*</section>*/}
                 <HomepageFeatures/>
             </main>
         </Layout>
