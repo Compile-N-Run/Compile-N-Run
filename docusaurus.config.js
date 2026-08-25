@@ -43,7 +43,7 @@ const config = {
                     mdxCrossCompilerCache: true,
                 }
         },
-        title: 'Compile N Run',
+        title: 'omniscanner',
         tagline: 'The best website to learn any programming language for free!',
         favicon: 'favicon.ico',
 
@@ -150,7 +150,7 @@ const config = {
                 innerHTML: JSON.stringify({
                     '@context': 'https://schema.org',
                     '@type': 'WebSite',
-                    "name": 'Compile N Run',
+                    "name": 'omniscanner',
                     "alternateName": ["Compile and Run", "Compile-N-Run"],
                     "url": 'https://www.compilenrun.com/',
                 }),
@@ -260,7 +260,7 @@ const config = {
                     },
                     {
                         name: 'apple-mobile-web-app-title',
-                        content: 'Compile N Run'
+                        content: 'omniscanner'
                     },
                 ],
                 colorMode: {
@@ -276,7 +276,7 @@ const config = {
                     isCloseable: true,
                 },
                 navbar: {
-                    title: 'Compile N Run',
+                    title: 'omniscanner',
                     logo: {
                         alt: 'Compile and Run Logo',
                         src: 'img/logo.png',
@@ -648,7 +648,7 @@ const config = {
                     style: 'dark',
                     links: [
                         {
-                            title: 'Compile N Run',
+                            title: 'omniscanner',
                             items: [
                                 {
                                     label: 'Home',
@@ -748,7 +748,7 @@ const config = {
                         //     ],
                         //   },
                     ],
-                    copyright: `Copyright © ${new Date().getFullYear()} Compile N Run.`,
+                    copyright: `Copyright © ${new Date().getFullYear()} omniscanner.`,
                 },
                 prism: {
                     theme: prismThemes.github,
