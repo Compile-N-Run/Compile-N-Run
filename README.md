@@ -1,11 +1,11 @@
-# omniscanner
+# Compile N Run
 
-![Home](public/homepage.png)
+![Home](static/homepage.png)
 
 
 - https://www.compilenrun.com/
 
-**omniscanner** is a comprehensive learning platform designed for developers and computer science enthusiasts. Whether you're preparing for technical interviews, strengthening your programming fundamentals, or exploring new technologies, our platform provides curated resources across the entire software development stack.
+**Compile N Run** is a comprehensive learning platform designed for developers and computer science enthusiasts. Whether you're preparing for technical interviews, strengthening your programming fundamentals, or exploring new technologies, our platform provides curated resources across the entire software development stack.
 
 
 
@@ -57,44 +57,39 @@ Our content spans essential areas of software development:
 
 ### Installation
 
-```bash
-npm install
+```
+$ yarn
 ```
 
 ### Local Development
 
-```bash
-npm run dev
+```
+$ yarn start
 ```
 
-The site runs on `http://localhost:3002`. Fumadocs watches the Markdown/MDX files in `docs/` and refreshes changed pages during development.
-
-### Content migration
-
-```bash
-npm run migrate:content
-```
-
-This repeatable migration generates Fumadocs `meta.json` navigation files, fills legacy titles that Docusaurus inferred from headings, and copies document assets into `public/docs-assets/`. Run it after changing the Docusaurus sidebar or category metadata.
-
-Validate the migrated URL and navigation inventory with:
-
-```bash
-npm run validate:routes
-npm run validate:routes -- --production
-```
-
-The production check compares every local document and generated category URL with the live sitemap.
+This command starts a local development server and opens up a browser window. Most changes are reflected live without having to restart the server.
 
 ### Build
 
-```bash
-npm run build
-npm start
+```
+$ yarn build
 ```
 
-Document pages intentionally do not use `generateStaticParams`. Next.js resolves and caches each page on its first request instead of compiling all 10,000+ documents during the build.
+This command generates static content into the `build` directory and can be served using any static contents hosting service.
 
 ### Deployment
 
-Deploy this project to a Node.js-compatible Next.js host. The on-demand document loader reads the `docs/` directory at runtime, so the deployment artifact must include that directory; a static-only GitHub Pages deployment is not sufficient.
+Using SSH:
+
+```
+$ USE_SSH=true yarn deploy
+```
+
+Not using SSH:
+
+```
+$ GIT_USER=<Your GitHub username> yarn deploy
+```
+
+If you are using GitHub pages for hosting, this command is a convenient way to build the website and push to the `gh-pages` branch.
+
