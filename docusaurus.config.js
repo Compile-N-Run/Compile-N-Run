@@ -269,8 +269,8 @@ const config = {
                     respectPrefersColorScheme: true,
                 },
                 announcementBar: {
-                    id: "replay_announcement",
-                    content: ' The best website to learn any programming language for free! ⭐ Star us on <a href="https://github.com/Compile-N-Run/Compile-N-Run" target="_blank">GitHub</a> to support the project!',
+                    id: "tencent_cloud_promo",
+                    content: '☁️ Ready to put your skills into practice? Build and deploy real projects on <a href="https://www.tencentcloud.com/act/pro/promo?intl_cps_key=5b991a8773ba69e8379fd7c10b7806d4" target="_blank" rel="noopener sponsored">Tencent Cloud</a> — big discounts on cloud servers, databases, and more are live now!',
                     backgroundColor: "#312e81",
                     textColor: "#ffffff",
                     isCloseable: true,
