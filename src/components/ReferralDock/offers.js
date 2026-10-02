@@ -1,0 +1,55 @@
+// Referral offers shown in the bottom dock. Order = rotation order.
+const offers = [
+    {
+        id: 'robinhood',
+        brand: 'Robinhood',
+        emoji: '🪶',
+        accent: '#00c805',
+        headline: 'Not on Robinhood yet?',
+        body: 'Sign up with my link and claim a free stock reward.',
+        cta: 'Claim stock',
+        url: 'https://join.robinhood.com/yuyangw-75308f',
+    },
+    {
+        id: 'tesla',
+        brand: 'Tesla',
+        emoji: '⚡',
+        accent: '#e82127',
+        headline: 'Ordering a Tesla?',
+        body: 'Use my referral link to unlock perks on your new order.',
+        cta: 'Get referral',
+        url: 'https://ts.la/yuyang411885',
+    },
+    {
+        id: 'chase-sapphire',
+        brand: 'Chase Sapphire',
+        emoji: '💎',
+        accent: '#117aca',
+        headline: 'Up to 100,000 bonus points',
+        body: '100k with Sapphire Reserve® or 75k with Sapphire Preferred®. I may be rewarded if you apply and are approved.',
+        cta: 'Apply',
+        url: 'https://www.referyourchasecard.com/19y/UFSA4741EO',
+    },
+    {
+        id: 'chase-freedom',
+        brand: 'Chase Freedom',
+        emoji: '💳',
+        accent: '#117aca',
+        headline: 'Earn cash back every day',
+        body: 'Chase Freedom Unlimited or Freedom Flex. I may be rewarded if you apply and are approved.',
+        cta: 'Learn more',
+        url: 'https://www.referyourchasecard.com/18s/CGEENX826P',
+    },
+    {
+        id: 'rakuten',
+        brand: 'Rakuten',
+        emoji: '🛍️',
+        accent: '#bf0000',
+        headline: 'Cash back on your shopping',
+        body: 'Join Rakuten with my link and earn cash back at thousands of stores.',
+        cta: 'Join Rakuten',
+        url: 'https://www.rakuten.com/r/YW8863?eeid=44749',
+    },
+];
+
+export default offers;
