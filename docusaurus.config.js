@@ -494,6 +494,10 @@ const config = {
                                 {
                                     label: 'Python - TensorFlow',
                                     to: "/docs/library/tensorflow"
+                                },
+                                {
+                                    label: 'AI Agents',
+                                    to: "/docs/ai/agents"
                                 }
 
                             ]

@@ -77,6 +77,7 @@ import grafanaLogo from '@site/static/img/observability-logo/grafana_logo.png';
 import lokiLogo from '@site/static/img/observability-logo/loki_logo.png';
 import prometheusLogo from '@site/static/img/observability-logo/prometheus_logo.png';
 import terraformLogo from '@site/static/img/devops-logo/terraform_logo.png';
+import agentsLogo from '@site/static/img/ai-logo/agents_logo.png';
 
 const programmingLanguagesList = [
     {
@@ -525,6 +526,18 @@ const databaseList = [
     }
 ];
 
+const aiList = [
+    {
+        title: "AI Agents",
+        Icon: (alt) => {
+            return <Image img={agentsLogo} className={styles.featureImage} alt={alt.alt}/>;
+        },
+        url: "/docs/ai/agents",
+        description: <>Learn how AI agents work, how to build them with tools, memory and MCP, and how to integrate,
+            evaluate, secure and run them in production.</>,
+    },
+];
+
 const devopsList = [
     {
         title: "CI/CD",
@@ -717,6 +730,15 @@ export default function HomepageFeatures() {
                 </div>
                 <div className="row">
                     {observabilityList.map((props, idx) => (
+                        <IndexPageItem key={idx} {...props} />
+                    ))}
+                </div>
+                {/* AI Section */}
+                <div style={{marginTop: "2rem"}}>
+                    <h2>AI &amp; Agents</h2>
+                </div>
+                <div className="row">
+                    {aiList.map((props, idx) => (
                         <IndexPageItem key={idx} {...props} />
                     ))}
                 </div>

@@ -1,0 +1,350 @@
+---
+title: "Handling Tool Errors"
+description: "Handle tool failures in AI agents: return is_error tool results, write actionable error messages, retry transient failures, and stop runaway error loops."
+---
+
+# Handling Tool Errors
+
+## Introduction
+
+Tools fail. APIs time out, records do not exist, users mistype IDs, and sometimes the model sends an argument your code did not expect. How your agent handles those failures decides whether it **recovers gracefully** or **gives up, loops, or makes things up**.
+
+The core idea is simple: **a tool failure is information for the model, not a crash for your program.** Instead of raising an exception that kills the agent loop, you send back a `tool_result` with `is_error: true` and a message that explains what went wrong and what to do next. The model reads it like any other result and adapts: it corrects the input, tries another tool, asks the user, or explains the problem.
+
+This page covers:
+
+- The difference between API errors and tool errors
+- The `is_error` flag and how the model reacts to it
+- How to write error messages that lead to recovery
+- A reusable `safe_execute` wrapper with validation, retries, and safe logging
+- Guards against error loops
+
+## Two Kinds of Errors
+
+```mermaid
+flowchart TD
+    A["Something failed"] --> B{"Where?"}
+    B -->|"Calling the model API (429, 500, network)"| C["API error: handle in your code"]
+    C --> C1["SDK retries automatically, then catch RateLimitError / APIStatusError / APIConnectionError"]
+    B -->|"Inside a tool your code runs"| D["Tool error: tell the model"]
+    D --> D1["tool_result with is_error: true + actionable message"]
+    D1 --> E["Model retries, adapts, or explains to the user"]
+```
+
+| | API errors | Tool errors |
+| --- | --- | --- |
+| Example | Rate limit, server overload, network outage | Order not found, invalid date, upstream API down |
+| Who should handle it | Your application code | The model, with your help |
+| Mechanism | SDK retries, then exceptions such as `anthropic.RateLimitError` | `tool_result` with `is_error: true` |
+| Covered in | [Error Handling and Retries](../1-agents-llm-apis/9-agents-api-error-handling.mdx) | This page |
+
+## The is_error Flag
+
+```json
+{
+  "type": "tool_result",
+  "tool_use_id": "toolu_01A09q90qw90lq917835lq9",
+  "content": "No order 'ORD-9'. Order ids look like 'ORD-1001'; ask the customer to check.",
+  "is_error": true
+}
+```
+
+What the model typically does with an error result:
+
+- **Invalid or missing input:** it corrects the arguments and calls again. Anthropic's docs note that the model usually retries two or three times with corrections before apologizing to the user.
+- **Not found / permission denied:** it asks the user for clarification or explains the limitation.
+- **Service unavailable:** it tells the user, or tries an alternative tool if one exists.
+
+Without `is_error`, the model might misread an error string as data. With it, the model knows for sure that the call failed.
+
+## Writing Error Messages the Model Can Act On
+
+The single most important rule: **say what went wrong and what to do next.** Opaque codes and stack traces waste tokens and leave the model guessing.
+
+| Bad | Good |
+| --- | --- |
+| `Error 404` | `No order 'ORD-9'. Order ids look like 'ORD-1001'; ask the customer to double-check.` |
+| `ValueError` | `start_date must be in the future (got 2025-01-03). Today is 2026-10-10.` |
+| `Traceback (most recent call last): ...` | `search_logs failed due to an internal error. Do not retry; tell the user the log service has a problem.` |
+| `failed` | `Rate limit exceeded on the CRM API. Retry after 60 seconds, or continue without CRM data.` |
+| `Too many results` | `Query matched 4,812 tickets; only the first 20 are shown. Add a status or date filter to narrow it.` |
+
+Guidelines:
+
+1. **Name the field or condition** that failed.
+2. **Give the valid format or an example.**
+3. **Tell the model whether to retry**, and if so, how. "Do not retry" is a valid and useful instruction.
+4. **Never leak secrets or internals**: no connection strings, API keys, stack traces, or internal hostnames. Log those for engineers instead.
+5. **Keep it short.** One to three sentences is usually right.
+
+This is the same advice Anthropic gives in [Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents): prompt-engineer your error responses to communicate specific, actionable improvements rather than opaque error codes.
+
+## A Reusable Error-Handling Wrapper
+
+Here is a dispatcher that handles every error category in one place. Each tool is registered with its function and a Pydantic input model.
+
+```python
+import json
+import logging
+import random
+import time
+
+from pydantic import BaseModel, ValidationError
+
+logger = logging.getLogger("agent.tools")
+
+
+class ToolFailure(Exception):
+    """An expected failure with a message written for the model."""
+
+
+class TransientError(Exception):
+    """A temporary upstream problem (timeout, 503, rate limit) worth retrying."""
+
+
+def with_retries(func, *, attempts: int = 3, base_delay: float = 0.5):
+    """Retry transient errors with exponential backoff and jitter."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except TransientError:
+            if attempt == attempts:
+                raise
+            time.sleep(base_delay * 2 ** (attempt - 1) + random.uniform(0, 0.1))
+
+
+def safe_execute(name: str, raw_input: dict, registry: dict) -> tuple[str, bool]:
+    """Validate, run, and translate any failure into (content, is_error)."""
+    entry = registry.get(name)
+    if entry is None:
+        return f"Unknown tool '{name}'. Available tools: {', '.join(sorted(registry))}.", True
+    func, input_model = entry
+
+    # 1. Validate the model's input before touching any real system.
+    try:
+        args = input_model.model_validate(raw_input)
+    except ValidationError as exc:
+        fields = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+        return f"Invalid input for {name}: {fields}. Correct these fields and call again.", True
+
+    # 2. Run the tool, retrying only transient failures.
+    try:
+        result = with_retries(lambda: func(**args.model_dump()))
+    except ToolFailure as exc:
+        return str(exc), True
+    except TransientError as exc:
+        return (f"{name} is temporarily unavailable ({exc}). It was retried 3 times. "
+                "Tell the user to try again in a few minutes; do not retry now."), True
+    except Exception:
+        # Unexpected bug: log the details for engineers, give the model a safe summary.
+        logger.exception("Tool %s crashed with input %r", name, raw_input)
+        return f"{name} failed due to an internal error. Do not retry; apologize to the user.", True
+
+    return json.dumps(result), False
+```
+
+The wrapper separates failures into five categories:
+
+| Category | How it is detected | Message to the model |
+| --- | --- | --- |
+| Unknown tool | Name not in registry | Lists the available tools |
+| Invalid input | Pydantic `ValidationError` | Lists each bad field and asks for a corrected call |
+| Expected failure | Tool raises `ToolFailure` | The tool's own actionable message |
+| Transient upstream failure | Tool raises `TransientError` | Retried automatically first; then "temporarily unavailable, do not retry now" |
+| Unexpected bug | Any other exception | Generic safe message; details go to the log |
+
+### Trying It Out
+
+```python
+from pydantic import BaseModel
+
+
+class OrderInput(BaseModel):
+    order_id: str
+
+
+calls = {"n": 0}
+
+
+def lookup_order(order_id: str) -> dict:
+    if order_id == "ORD-FLAKY":  # fails twice, then works
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise TransientError("orders API timed out")
+        return {"order_id": order_id, "status": "shipped"}
+    if order_id == "ORD-DOWN":
+        raise TransientError("orders API returned 503")
+    if order_id == "ORD-BUG":
+        return 1 / 0  # a real bug
+    if order_id != "ORD-1001":
+        raise ToolFailure(
+            f"No order '{order_id}'. Order ids look like 'ORD-1001'; ask the customer to check."
+        )
+    return {"order_id": order_id, "status": "shipped"}
+
+
+REGISTRY = {"lookup_order": (lookup_order, OrderInput)}
+
+for name, tool_input in [
+    ("lookup_order", {"order_id": "ORD-1001"}),
+    ("lookup_order", {"order_id": "ORD-9"}),
+    ("lookup_order", {"order": "ORD-1001"}),
+    ("lookup_order", {"order_id": "ORD-FLAKY"}),
+    ("lookup_order", {"order_id": "ORD-DOWN"}),
+    ("lookup_order", {"order_id": "ORD-BUG"}),
+    ("refund_order", {}),
+]:
+    print(safe_execute(name, tool_input, REGISTRY))
+```
+
+Output (the `ORD-BUG` traceback goes to the log, not to the model):
+
+```text
+('{"order_id": "ORD-1001", "status": "shipped"}', False)
+("No order 'ORD-9'. Order ids look like 'ORD-1001'; ask the customer to check.", True)
+('Invalid input for lookup_order: order_id: Field required. Correct these fields and call again.', True)
+('{"order_id": "ORD-FLAKY", "status": "shipped"}', False)
+('lookup_order is temporarily unavailable (orders API returned 503). It was retried 3 times. Tell the user to try again in a few minutes; do not retry now.', True)
+('lookup_order failed due to an internal error. Do not retry; apologize to the user.', True)
+("Unknown tool 'refund_order'. Available tools: lookup_order.", True)
+```
+
+Plug it into the agent loop from [Building a Manual Agent Loop](./3-agents-manual-agent-loop.mdx) by replacing `execute_tool(block.name, block.input)` with `safe_execute(block.name, block.input, REGISTRY)`.
+
+:::tip Retry inside the tool, not through the model
+Transient errors (timeouts, 503s, rate limits) are best retried by your code with backoff. Retrying through the model costs a full model round trip and tokens each time. Only report the failure to the model after your own retries are exhausted.
+:::
+
+## Guarding Against Error Loops
+
+Sometimes the model keeps calling a failing tool with slightly different inputs. Your iteration cap eventually stops it, but you can stop it sooner and more cheaply by counting consecutive errors.
+
+```python
+MAX_CONSECUTIVE_ERRORS = 3
+
+
+def all_failed(tool_results: list[dict]) -> bool:
+    return bool(tool_results) and all(r.get("is_error") for r in tool_results)
+
+
+# Inside the agent loop, after building tool_results for one turn:
+consecutive_errors = 0  # initialize once, before the loop
+# ...
+if all_failed(tool_results):
+    consecutive_errors += 1
+else:
+    consecutive_errors = 0
+
+if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+    # Option A: stop and escalate to a human.
+    # Option B: tell the model to stop using tools and summarize, as below.
+    tool_results.append({
+        "type": "text",
+        "text": "Tools have failed several times in a row. Stop calling tools and "
+                "explain to the user what you could not do.",
+    })
+```
+
+Note that the extra text block goes **after** the `tool_result` blocks, as the API requires.
+
+## Errors You Should Not Send to the Model
+
+Some failures should stop the agent instead:
+
+- **`stop_reason == "max_tokens"` with a `tool_use` block.** The input may be truncated. Do not run it; retry with a larger `max_tokens`.
+- **`stop_reason == "refusal"`.** Do not execute any tools from that turn.
+- **Authorization failures that indicate abuse**, such as a request for another customer's data. Log a security event, return a generic error, and consider ending the session.
+- **Repeated identical calls.** If the model calls the same tool with the same input three times, something is wrong. Stop and log the transcript.
+
+## Error Handling with the SDK Tool Runner
+
+The tool runner from [Using an SDK Tool Runner](./4-agents-tool-runner.mdx) already converts exceptions into `is_error` results. In Python:
+
+- Any exception becomes an error result containing its type and message, and the SDK logs the traceback.
+- `ToolError` (from `anthropic.lib.tools`) is the intentional version: the message you pass is sent to the model, and nothing is logged as a crash. It can also carry content blocks, such as a screenshot of a failed page load.
+
+```python
+from anthropic import beta_tool
+from anthropic.lib.tools import ToolError
+
+
+@beta_tool
+def get_invoice(invoice_id: str) -> str:
+    """Fetch an invoice by id. Use when the user asks about a bill or payment.
+
+    Args:
+        invoice_id: Invoice id like 'INV-2026-0042'.
+    """
+    if not invoice_id.startswith("INV-"):
+        raise ToolError("invoice_id must look like 'INV-2026-0042'. Ask the user for it.")
+    return '{"invoice_id": "INV-2026-0042", "total_cents": 12900, "status": "paid"}'
+```
+
+Be careful with plain exceptions: their message goes to the model. An exception like `ConnectionError("postgres://admin:secret@10.0.0.5 refused")` would leak credentials. Catch low-level exceptions inside the tool and raise a `ToolError` with a safe message instead.
+
+## Preventing Errors in the First Place
+
+Good error handling is a safety net. Fewer errors is better:
+
+- **Use `strict: true`** to eliminate type mismatches and missing required fields. See [Tool Input Schemas](./2-agents-tool-input-schemas.mdx).
+- **Use enums** for categorical inputs.
+- **Write descriptions with examples** of valid inputs.
+- **Track error rates per tool** in production. A tool with many invalid-input errors usually has an unclear description.
+- **Make tools forgiving where it is safe**: trim whitespace, normalize case, accept "ord-1001" for "ORD-1001".
+
+## Real-World Scenario
+
+You run an AI assistant for a property-management company. It books maintenance visits through a vendor API that is unreliable: it times out a few percent of the time and returns cryptic codes like `E_SLOT_7`. Early transcripts show the assistant either telling tenants "Your visit is booked!" after a failed call, or retrying the booking tool ten times in a row.
+
+### The Solution
+
+1. Wrap the vendor client so timeouts and 5xx responses raise `TransientError` and are retried with backoff inside the tool (three attempts).
+2. Map vendor codes to actionable messages: `E_SLOT_7` becomes "That time slot was just taken. Call list_available_slots again and offer the tenant the next two options."
+3. Always set `is_error: true` on failures, so the model never mistakes an error for a confirmation.
+4. Add a consecutive-error guard: after three failed turns, the agent apologizes and creates a ticket for a human coordinator.
+5. Log every error with the tool name, input, vendor code, and request id.
+
+### Why This Approach
+
+Retrying inside the tool absorbs most transient failures invisibly. Translated error messages turn vendor jargon into instructions the model can follow. The error flag and guard make the two original failure modes (false confirmations and retry storms) structurally impossible.
+
+### When to Use It and When Not To
+
+Use this layered approach for any tool that talks to an external system. For pure, local tools (a unit converter, a regex matcher), a simple try/except that returns the error message is enough. For irreversible actions such as payments, be careful with automatic retries: make the operation idempotent (for example, with an idempotency key) before retrying, or a timeout could cause a double charge.
+
+### Alternatives and Trade-offs
+
+| Approach | Pros | Cons | Best for |
+| --- | --- | --- | --- |
+| Let exceptions crash the loop | Simple | Loses the conversation; terrible UX | Never in production |
+| Return raw exception text | Easy | Leaks internals; often not actionable | Local prototypes |
+| Actionable `is_error` messages | Model can self-correct | Requires mapping errors to messages | All production tools |
+| Retries inside the tool + actionable messages | Absorbs transient failures cheaply | More code; must ensure idempotency | Unreliable external APIs |
+| Escalate to a human after N failures | Safe fallback | Needs an escalation path | Customer-facing agents |
+
+## Common Mistakes
+
+- **Raising exceptions out of the agent loop** instead of returning error results.
+- **Forgetting `is_error: true`**, so the model treats an error string as data.
+- **Sending stack traces or secrets to the model.** Log them; send a summary.
+- **Retrying non-idempotent actions** blindly.
+- **Letting the model retry transient failures** that your code could retry more cheaply.
+- **No limit on consecutive failures**, leading to long, expensive error loops.
+- **Ignoring error metrics.** Repeated invalid-input errors are a signal to improve the tool description.
+
+## Summary
+
+- API errors are your code's problem; tool errors are information for the model.
+- Return failed tool calls as `tool_result` blocks with `is_error: true`.
+- Write error messages that name the problem, show the valid format, and say whether to retry.
+- Validate inputs, retry transient failures with backoff inside the tool, and log unexpected bugs without exposing details.
+- Add guards for consecutive errors, and never execute tools from truncated or refused turns.
+- The SDK tool runner wraps exceptions automatically; use `ToolError` for intentional, safe messages.
+
+## Exercises
+
+1. Add a `ToolFailure` for "permission denied" to `lookup_order` when the order belongs to a different customer id (passed from your session, not the model). Check how the model explains it.
+2. Implement the consecutive-error guard in the support agent and write a test that simulates three failing turns with a mocked client.
+3. Add an idempotency key to a fake `charge_card` tool so that retries after a timeout never double-charge. Write a test that proves it.
+
+**Next:** [Tool Design Principles](./7-agents-tool-design-principles.mdx) steps back from individual errors to the bigger question: what makes a tool easy for an agent to use well?
