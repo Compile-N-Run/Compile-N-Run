@@ -311,6 +311,14 @@ const config = {
                                 {
                                     label: 'Interview Preparation',
                                     to: "/docs/fundamental/interview"
+                                },
+                                {
+                                    label: 'Software Architecture & Design Patterns',
+                                    to: "/docs/fundamental/architecture"
+                                },
+                                {
+                                    label: 'Cybersecurity',
+                                    to: "/docs/fundamental/security"
                                 }
                             ]
                         },
@@ -605,6 +613,14 @@ const config = {
                                 {
                                     label: 'Terraform',
                                     to: "/docs/devops/terraform"
+                                },
+                                {
+                                    label: 'Jenkins',
+                                    to: "/docs/devops/jenkins"
+                                },
+                                {
+                                    label: 'Cloud Computing (AWS & Azure)',
+                                    to: "/docs/devops/cloud"
                                 }
                             ]
                         },

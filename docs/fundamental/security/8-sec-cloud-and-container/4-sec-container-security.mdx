@@ -1,0 +1,361 @@
+---
+title: "Container Image Security"
+description: "Build secure container images: minimal base images, non-root users, no baked-in secrets, vulnerability scanning with Trivy, SBOMs, signing and registry hygiene."
+---
+
+# Container Image Security
+
+## Introduction
+
+A container image is a packaged filesystem plus metadata: your application, its libraries, a language runtime, and usually a slice of a Linux distribution. Whatever you put in the image goes to production with your code, including outdated packages with known vulnerabilities, shells and debugging tools an attacker would love to find, and sometimes secrets that were copied in by accident.
+
+A useful analogy is a shipping container leaving a port. Customs (your pipeline) should check what is inside **before** it ships, seal it so nobody can tamper with it on the way, and keep a manifest of the contents. Once the container is on the ship and running, it is much harder to inspect or change.
+
+Image security sits at the start of the container lifecycle:
+
+```mermaid
+flowchart LR
+    DF["Dockerfile and source"] --> B["Build"]
+    B --> S["Scan: CVEs, secrets, misconfig"]
+    S --> SB["Generate SBOM and sign"]
+    SB --> R["Private registry"]
+    R --> AD["Admission check: signed, scanned, allowed registry"]
+    AD --> RUN["Run with least privilege"]
+    S -- "critical issue" --> F["Fail the build"]
+```
+
+This page covers the build, scan and registry steps. Runtime controls in a cluster are covered in [Kubernetes Security](./5-sec-kubernetes-security.mdx), and signing and provenance in more depth in [SBOMs, Signing and SLSA](../6-sec-appsec-and-devsecops/6-sec-sbom-and-signing.mdx). If you are new to Docker itself, start with [/docs/devops/docker](/docs/devops/docker).
+
+## What Can Go Wrong in an Image
+
+| Problem | Example | Consequence |
+| --- | --- | --- |
+| Vulnerable packages | Old OpenSSL or glibc in the base image, outdated Python libraries | Known exploits work against your container |
+| Secrets in layers | `COPY .env .` or `ENV API_KEY=...` | Anyone who can pull the image can read the secret, even if a later layer deletes the file |
+| Running as root | No `USER` instruction | A container escape or file-write bug is far more damaging |
+| Bloated base image | Full OS with compilers, package managers, curl, shells | Larger attack surface, more CVEs to triage |
+| Untrusted or typosquatted base | `FROM pyhton:latest` from an unknown publisher | Malware in your supply chain |
+| Mutable tags | `FROM python:latest` | Builds change silently; you cannot reproduce or audit them |
+
+## Vulnerable vs Fixed Dockerfile
+
+Here is a small Flask app (`app.py` and `requirements.txt` with `flask` and `gunicorn`).
+
+**Vulnerable:**
+
+```dockerfile
+FROM python:latest
+
+WORKDIR /app
+COPY . .
+
+ENV DATABASE_URL=postgresql://admin:SuperSecret123@db.internal:5432/app
+
+RUN apt-get update && apt-get install -y curl vim gcc
+RUN pip install -r requirements.txt
+
+EXPOSE 5000
+CMD ["python", "app.py"]
+```
+
+Problems, line by line:
+
+1. `python:latest` is a large, full Debian image, and `latest` changes over time.
+2. `COPY . .` copies everything, including `.git`, `.env` files and local credentials, unless a `.dockerignore` excludes them.
+3. The database password is stored in the image metadata forever. `docker history` or `docker inspect` reveals it.
+4. Debugging tools and a compiler ship to production.
+5. No `USER`, so the app runs as root.
+6. The Flask development server is used instead of a production server.
+
+**Fixed:**
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# ---- build stage: has pip and build tools, never shipped ----
+FROM python:3.14-slim AS build
+WORKDIR /app
+RUN python -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip uninstall --yes pip
+
+# ---- runtime stage: only what the app needs ----
+FROM python:3.14-slim
+# Remove pip (not needed at runtime) and create an unprivileged user
+RUN python -m pip uninstall --yes pip && \
+    groupadd --system --gid 10001 app && \
+    useradd --system --uid 10001 --gid app --no-create-home app
+WORKDIR /app
+COPY --from=build /venv /venv
+COPY --chown=app:app app.py .
+ENV PATH="/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+USER 10001
+EXPOSE 8000
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app"]
+```
+
+And a `.dockerignore` so local junk never enters the build context:
+
+```text
+.git
+.env
+*.pem
+__pycache__/
+.venv/
+tests/
+Dockerfile
+```
+
+What changed and why:
+
+- **Specific, slim base image.** `python:3.14-slim` is much smaller than the full image. In production, pin it by digest as well (shown below).
+- **Multi-stage build.** Build tools stay in the first stage. Only the virtual environment and the app are copied into the final image.
+- **No package installer at runtime.** pip is removed from both the virtual environment and the base image. The app never installs anything at runtime, and pip carries its own bundled copies of libraries that scanners report (see the scan below).
+- **No secrets.** The database URL is provided at runtime by the orchestrator, from a secrets manager.
+- **Non-root user with a numeric UID.** Kubernetes can verify a numeric UID with `runAsNonRoot`.
+- **Production server.** Gunicorn instead of the development server.
+
+Build and check the user:
+
+```bash
+docker build -t billing-api:1.4.2 .
+docker run --rm billing-api:1.4.2 id
+```
+
+Example output:
+
+```text
+uid=10001(app) gid=10001(app) groups=10001(app)
+```
+
+### Pinning by digest
+
+A tag such as `3.14-slim` moves when the maintainers publish a new build. That is good for getting patches, but it makes builds non-reproducible. A common compromise is to pin by digest and let a bot (Dependabot or Renovate) open pull requests when a new digest appears:
+
+```dockerfile
+FROM python:3.14-slim@sha256:<digest-from-your-registry>
+```
+
+Replace the placeholder with the real digest, which you can see with `docker buildx imagetools inspect python:3.14-slim`.
+
+### Secrets needed at build time
+
+Sometimes the build needs a secret, such as a token for a private package index. Never use `ARG` or `ENV` for it, because both can end up in image metadata. Use a BuildKit **secret mount**, which is available only during that one `RUN` step and is not stored in any layer:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM python:3.14-slim AS build
+COPY requirements.txt .
+RUN --mount=type=secret,id=pip_index_url \
+    PIP_INDEX_URL="$(cat /run/secrets/pip_index_url)" \
+    pip install --no-cache-dir -r requirements.txt
+```
+
+```bash
+docker build --secret id=pip_index_url,env=PIP_INDEX_URL -t billing-api:1.4.2 .
+```
+
+If a secret was ever baked into an image that was pushed anywhere, treat it as leaked: rotate it, then rebuild. Deleting the image tag does not remove copies already pulled. See [Secret Scanning](../6-sec-appsec-and-devsecops/7-sec-secret-scanning.mdx).
+
+## Choosing a Base Image
+
+| Base image type | Examples | Pros | Cons | Best for |
+| --- | --- | --- | --- | --- |
+| Full distribution | `python:3.14`, `ubuntu` | Everything works; easy debugging | Many packages and CVEs; large | Build stages, development |
+| Slim distribution | `python:3.14-slim`, `debian:*-slim` | Familiar; fewer packages | Still has shell and package manager | Most teams starting out |
+| Alpine | `python:3.14-alpine` | Very small | musl libc can break some Python wheels and native code; different behavior | Simple apps, Go binaries |
+| Distroless | Google distroless images | No shell or package manager; small | Harder to debug; version choices limited | Mature teams with good observability |
+| Hardened vendor images | Docker Hardened Images, Chainguard Images | Minimal, frequently rebuilt, signed, ship SBOMs and provenance | Some features or SLAs only in paid tiers; vendor dependency | Teams that want low CVE counts without building their own |
+| `scratch` | Empty image | Nothing to attack except your binary | Only for static binaries; no CA certificates unless you add them | Statically linked Go or Rust services |
+
+Docker's documentation describes Docker Hardened Images as free to use under the Apache 2.0 license for the core catalog, with signed SBOMs, SLSA Build Level 3 provenance, and non-root defaults, while some features (such as FIPS variants and CVE-fix SLAs) are in paid tiers. Vendor offerings change, so check the current terms before you standardize on one.
+
+## Scanning Images for Vulnerabilities
+
+Image scanners compare the packages inside an image (OS packages and language libraries) against vulnerability databases. Common open source scanners are **Trivy** and **Grype**. Registries and platforms also scan: Amazon ECR (with Amazon Inspector), Azure Defender for Containers, Google Artifact Analysis and Docker Scout.
+
+```bash
+# Show only fixable HIGH and CRITICAL issues, and fail the step if any exist
+trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 billing-api:1.4.2
+```
+
+Here is a real, shortened scan of an **earlier** version of the fixed image, before pip was removed. Your results will differ, because new advisories are published daily.
+
+```text
+Report Summary
+
+│ Target                                       │    Type    │ Vulnerabilities │
+│ billing-api:1.4.2 (debian 13.7)              │   debian   │        0        │
+│ Python                                       │ python-pkg │        4        │
+│ venv/.../flask-3.1.3.dist-info/METADATA      │ python-pkg │        0        │
+│ venv/.../gunicorn-26.2.0.dist-info/METADATA  │ python-pkg │        0        │
+
+Python (python-pkg)
+===================
+Total: 4 (HIGH: 4, CRITICAL: 0)
+
+│  Library   │    Vulnerability    │ Severity │ Installed Version │ Fixed Version │
+│ msgpack    │ GHSA-6v7p-g79w-8964 │ HIGH     │ 1.1.2             │ 1.2.1         │
+│ setuptools │ CVE-2025-47273      │ HIGH     │ 70.3.0            │ 78.1.1        │
+│ urllib3    │ CVE-2026-97687      │ HIGH     │ 2.7.0             │ 2.8.0         │
+│ urllib3    │ CVE-2026-97689      │ HIGH     │ 2.7.0             │ 2.8.0         │
+```
+
+The app does not depend on msgpack, setuptools or urllib3. These are copies **bundled inside pip itself** (listed in `pip/_vendor/vendor.txt`). Upgrading your `requirements.txt` would not fix them. Removing pip from the runtime image did, and the final image scanned clean for fixable HIGH and CRITICAL issues on the day of testing. This is typical: much of the noise in image scans comes from software the app never uses, and the cheapest fix is to stop shipping it.
+
+Useful scanner habits:
+
+- **Scan in CI and in the registry.** CI catches problems before merge. Registry or continuous scanning catches **new** CVEs disclosed after the image was built.
+- **Use `--ignore-unfixed` for the blocking gate**, but still track unfixed issues. You cannot patch what has no fix, but you may be able to switch base images.
+- **Prioritize by exploitability**, not only severity. A critical CVE in a library your code never loads may matter less than a high one in your web framework. VEX documents and reachability analysis help. See [Vulnerability Management and CVSS](../11-sec-defensive-operations/6-sec-vulnerability-management.mdx).
+- **Rebuild regularly** even when your code has not changed, so you pick up patched base layers.
+
+:::caution Your security tools are part of the supply chain
+In March 2026 attackers compromised the `aquasecurity/trivy-action` GitHub Action and force-pushed malicious code to most of its version tags. For about 12 hours, pipelines that referenced those tags ran code that stole CI secrets before running the real scan. Lessons: pin third-party actions to a full commit SHA, give scan jobs no more secrets than they need, and rotate secrets if an affected version ran. Check the vendor advisory for the current list of safe versions.
+:::
+
+### Scanning for secrets and misconfigurations too
+
+Vulnerabilities are not the only thing scanners find. Trivy can also look for secrets (keys, tokens, private keys) in image layers and for risky settings in the Dockerfile itself:
+
+```bash
+# Secrets inside the image layers
+trivy image --scanners secret billing-api:1.4.2
+
+# Dockerfile and other config files in the repository
+trivy config --severity HIGH,CRITICAL .
+```
+
+When we ran `trivy config` (Trivy 0.69.3, without the severity filter) against the vulnerable Dockerfile above, it reported:
+
+```text
+DS-0001 (MEDIUM): Specify a tag in the 'FROM' statement for image 'python'
+DS-0002 (HIGH): Specify at least 1 USER command in Dockerfile with non-root user as argument
+DS-0026 (LOW): Add HEALTHCHECK instruction in your Dockerfile
+DS-0029 (HIGH): '--no-install-recommends' flag is missed: 'apt-get update && apt-get install -y curl vim gcc'
+```
+
+Notice what it did **not** report: the database password in the `ENV` line. No single scanner catches everything, which is why secret scanning, config scanning and code review complement each other. Rule IDs and wording can change between versions. Hadolint is a popular Dockerfile-specific linter that complements it. Config scanning in general is covered in [Infrastructure as Code Security](./6-sec-infrastructure-as-code-security.mdx).
+
+| Scanner type | What it finds | When it runs |
+| --- | --- | --- |
+| Vulnerability (SCA) | Known CVEs in OS and language packages | CI, registry, continuously |
+| Secret | Keys and tokens in layers | CI before push |
+| Config / Dockerfile lint | Root user, `latest` tags, `ADD` from URLs, missing `USER` | Pull request |
+| Malware | Known malicious files | Registry, for third-party images |
+
+## SBOMs and Signatures
+
+A **Software Bill of Materials (SBOM)** lists every component in the image. When the next widely exploited library vulnerability appears, an SBOM lets you answer "which of our images contain it?" in minutes instead of days.
+
+```bash
+# Generate a CycloneDX SBOM for the image
+trivy image --format cyclonedx --output billing-api-1.4.2.cdx.json billing-api:1.4.2
+```
+
+**Signing** proves an image came from your pipeline and was not modified. With Sigstore's `cosign`, keyless signing uses your CI system's OIDC identity, so there is no private key to manage:
+
+```bash
+# In CI, sign the image by digest (never by mutable tag)
+cosign sign "registry.example.com/billing-api@sha256:${DIGEST}"
+```
+
+The cluster can then refuse to run images that are unsigned or signed by the wrong identity. Details and verification commands are in [SBOMs, Signing and SLSA](../6-sec-appsec-and-devsecops/6-sec-sbom-and-signing.mdx).
+
+## Registry Hygiene
+
+- **Private registries** for your images (ECR, Azure Container Registry, Artifact Registry, Harbor), with IAM-controlled push rights limited to CI.
+- **Immutable tags**, so `billing-api:1.4.2` can never be overwritten with different content.
+- **Pull-through caches or mirrors** for public images, so you control which upstream images enter your environment and are not affected by upstream rate limits or removals.
+- **Retention policies** to delete old, unused images that would otherwise keep showing up in vulnerability reports.
+- **Allowed registries policy** in the cluster, so workloads can only pull from approved sources.
+
+## Running Containers with Least Privilege
+
+Image hardening pairs with runtime flags. Even outside Kubernetes, `docker run` supports the key controls:
+
+```bash
+docker run --rm -d \
+  --name billing-api \
+  --read-only --tmpfs /tmp \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --user 10001:10001 \
+  --memory 256m --pids-limit 100 \
+  -p 8000:8000 \
+  billing-api:1.4.2
+```
+
+A read-only filesystem often reveals hidden writes. When we tested this command, the app served requests, but Gunicorn logged:
+
+```text
+[ERROR] Control server error: [Errno 30] Read-only file system: '/home/app'
+```
+
+Recent Gunicorn versions start a small control server that writes under the user's home directory, which does not exist in our image. You can either add `--tmpfs /home/app` or point `HOME` at a writable path. The read-only flag did its job: it showed you exactly which paths the process writes to, so you can allow only those.
+
+This gives the container a read-only filesystem (with a writable `/tmp`), no Linux capabilities, no way to gain privileges through setuid binaries, and resource limits against runaway processes. Never use `--privileged` or mount `/var/run/docker.sock` into an application container: either one effectively gives root on the host.
+
+## Real-World Scenario
+
+Your team's Python API image shows 312 vulnerabilities in the registry scan, 9 of them critical. The security team wants zero criticals before the next audit in four weeks. Developers worry about breaking the app.
+
+You look at the findings: nearly all come from the full `python:3.11` base image (OS packages the app never uses). Only two come from Python libraries.
+
+| Approach | Pros | Cons | Best for |
+| --- | --- | --- | --- |
+| Accept risk and document exceptions | No engineering work | Auditors push back; real risk remains | Short-term only, with an expiry date |
+| Upgrade libraries only | Small change | OS-level CVEs remain | When most findings are in app dependencies |
+| Switch to slim base plus multi-stage build | Large CVE reduction; familiar tooling | Some testing needed; still a shell inside | Most teams |
+| Switch to distroless or hardened vendor images | Lowest CVE counts; signed, with SBOMs | Harder debugging; possible vendor terms | Teams ready to change debugging habits |
+| Build your own minimal base images | Full control | Ongoing maintenance burden | Large platform teams |
+
+You choose **slim plus multi-stage** now, upgrade the two vulnerable libraries, and add `--ignore-unfixed --severity CRITICAL --exit-code 1` as a CI gate. You also schedule a weekly rebuild. A pilot of a hardened base image runs on one service to evaluate it for later.
+
+**Why this approach:** most findings come from packages the app never needed, so removing them is cheaper and more durable than triaging each CVE. The CI gate prevents regressions, and weekly rebuilds pick up base-image patches.
+
+**When not to:** if your app needs native libraries that are missing from slim images, add only those packages explicitly rather than going back to the full image.
+
+## Common Mistakes
+
+- **Using `latest`.** You cannot reproduce or audit what you deployed. Pin versions and digests.
+- **Deleting secrets in a later layer.** The earlier layer still contains them. Use secret mounts and rotate any secret that was ever baked in.
+- **Scanning once.** New CVEs are published every day. Scan continuously in the registry.
+- **Blocking on every finding.** A gate that fails on hundreds of unfixable low-severity issues gets disabled. Start with fixable criticals and tighten over time.
+- **Trusting any public image.** Prefer official or verified publishers, mirror them into your registry, and check signatures where available.
+- **Shipping debug tools "just in case".** Use ephemeral debug containers (`kubectl debug`) instead.
+
+## Summary
+
+- Everything in an image ships to production, so keep images small, specific and free of secrets.
+- Use multi-stage builds, slim or minimal base images, a non-root numeric `USER`, and a `.dockerignore`.
+- Pin base images, rebuild regularly, and use BuildKit secret mounts for build-time credentials.
+- Scan in CI and continuously in the registry, gate on fixable critical issues, and prioritize by exploitability.
+- Generate SBOMs and sign images by digest so the cluster can verify what it runs.
+- Treat security tooling itself as part of the supply chain: pin actions by SHA and limit their secrets.
+
+## Exercises
+
+1. Build the vulnerable and fixed Dockerfiles for a small Flask app. Compare image sizes with `docker images` and scan both with Trivy or Grype. How many findings disappear?
+2. Put a fake secret in an `ENV` line, build, and find it with `docker history --no-trunc`. Then rebuild using a secret mount and confirm it is gone.
+3. Try running the fixed image with `--read-only`. If the app fails, find which path it writes to and add a `--tmpfs` for just that path.
+4. Write a GitHub Actions job that builds the image, scans it, and fails on fixable criticals, with every third-party action pinned to a commit SHA.
+
+Related pages:
+
+- [Kubernetes Security](./5-sec-kubernetes-security.mdx)
+- [Dependency Scanning and SCA](../6-sec-appsec-and-devsecops/4-sec-dependency-scanning.mdx)
+- [Software Supply Chain Security](../6-sec-appsec-and-devsecops/5-sec-supply-chain.mdx)
+- [Securing CI/CD Pipelines](../6-sec-appsec-and-devsecops/8-sec-pipeline-security.mdx)
+
+External reading:
+
+- [Docker: Building best practices](https://docs.docker.com/build/building/best-practices/)
+- [Docker: Build secrets](https://docs.docker.com/build/building/secrets/)
+- [Trivy documentation](https://trivy.dev/latest/docs/)
+- [Docker Hardened Images](https://docs.docker.com/dhi/)
+- [Sigstore cosign: Signing containers](https://docs.sigstore.dev/cosign/signing/signing_with_containers/)

@@ -1,0 +1,480 @@
+---
+title: "Secure Error Handling and Logging"
+description: "Fail closed, roll back cleanly, show users safe error messages, and write security logs that resist injection, hide secrets and actually trigger alerts."
+---
+
+# Secure Error Handling and Logging
+
+## Introduction
+
+Errors and logs are where your application talks about itself. Done badly, they talk to the wrong audience: a stack trace tells an attacker your framework version, file paths and SQL queries, while your own log files stay silent about the 5,000 failed logins that happened overnight.
+
+Secure error handling and logging means getting both audiences right:
+
+- **Users and attackers** see short, generic, honest messages.
+- **Your team** sees detailed, structured, trustworthy records, and gets **alerted** when something suspicious happens.
+- **The system** stays in a safe state when things go wrong: it **fails closed** and does not leave half-finished work behind.
+
+Think of a bank teller. If the computer crashes in the middle of your withdrawal, the teller does not hand you the cash "to be safe", and does not read you the error code from the screen. They say "Sorry, I cannot complete this right now", the transaction is reversed, and the incident is written in the branch log for the IT team.
+
+The OWASP Top 10:2025 has two categories for this topic:
+
+- [A10:2025 Mishandling of Exceptional Conditions](https://top10.owasp.org/2025/A10_2025-Mishandling_of_Exceptional_Conditions) is **new** in 2025. It covers failing open, leaking details in error messages, and leaving transactions half-done.
+- **A09:2025 Security Logging and Alerting Failures** was renamed from "Logging and Monitoring" to stress that logs nobody acts on are of little value.
+
+## Part 1: Handling Errors Safely
+
+### Fail closed
+
+When code hits an unexpected condition in a security decision, it has two choices: **fail open** (allow the action) or **fail closed** (deny it). Security checks must fail closed.
+
+```mermaid
+flowchart TD
+    R["Request needs a permission check"] --> C{"Permission service answers?"}
+    C -- "yes: allowed" --> A["Proceed"]
+    C -- "yes: denied" --> D["403 Forbidden"]
+    C -- "error or timeout" --> F{"Fail open or closed?"}
+    F -- "fail open (vulnerable)" --> A
+    F -- "fail closed (secure)" --> E["503 or 403, log, alert if repeated"]
+```
+
+Fail-open bugs often look harmless. A common pattern is a broad `try/except` that swallows the error and carries on:
+
+```python
+# Vulnerable: any error in token verification is treated as "valid"
+def verify_token(token):
+    try:
+        claims = decode_and_check_signature(token)
+        return claims["exp"] > now()
+    except Exception:
+        pass                # error swallowed
+    return True             # ...and the default is "allow"
+```
+
+The fixed version makes "deny" the default and only returns `True` from the one path where everything succeeded:
+
+```python
+# Fixed: deny by default, allow only on the success path
+def verify_token(token):
+    try:
+        claims = decode_and_check_signature(token)
+    except InvalidTokenError:
+        return False
+    return claims["exp"] > now()
+```
+
+Note the narrower `except`: catching only the error you expect means a real bug (such as a `KeyError` from a typo) crashes loudly instead of silently changing the security answer.
+
+### Roll back incomplete work
+
+A10:2025 calls out transactions left half-done when an error interrupts them. OWASP's guidance is to roll back the whole transaction rather than trying to recover part of it. Here is the problem in a money transfer:
+
+```python
+# transfer.py
+import sqlite3
+
+def setup():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER NOT NULL)")
+    conn.executemany("INSERT INTO accounts VALUES (?, ?)", [("alice", 100), ("bob", 0)])
+    conn.commit()
+    return conn
+
+def notify_fraud_service(amount):
+    if amount > 50:
+        raise ConnectionError("fraud service timeout")
+
+def transfer_vulnerable(conn, src, dst, amount):
+    conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amount, src))
+    conn.commit()                                   # Vulnerable: commits half the work
+    notify_fraud_service(amount)                    # fails here...
+    conn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amount, dst))
+    conn.commit()
+
+def transfer_fixed(conn, src, dst, amount):
+    with conn:                                      # one transaction: commit all or roll back all
+        conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amount, src))
+        notify_fraud_service(amount)
+        conn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amount, dst))
+
+for fn in (transfer_vulnerable, transfer_fixed):
+    conn = setup()
+    try:
+        fn(conn, "alice", "bob", 80)
+    except ConnectionError as e:
+        print(f"{fn.__name__}: failed with {e!r}")
+    print("  balances:", dict(conn.execute("SELECT id, balance FROM accounts")))
+```
+
+Output:
+
+```text
+transfer_vulnerable: failed with ConnectionError('fraud service timeout')
+  balances: {'alice': 20, 'bob': 0}
+transfer_fixed: failed with ConnectionError('fraud service timeout')
+  balances: {'alice': 100, 'bob': 0}
+```
+
+In the vulnerable version, 80 units vanished. In a real system, an attacker who can trigger the failure on purpose (by sending a huge amount, a malformed field, or many parallel requests) might turn that inconsistency into money. The `with conn:` block in Python's `sqlite3` commits on success and rolls back on any exception. SQLAlchemy's `with session.begin():` and Django's `transaction.atomic()` do the same.
+
+The same idea applies to other resources: use `with` blocks (or `try/finally`) so files, locks and connections are released even on errors. Leaked resources are a denial-of-service risk, which is the first example scenario OWASP gives for A10.
+
+### Do not leak details to the client
+
+**Vulnerable:**
+
+```python
+@app.get("/vulnerable/orders/<order_id>")
+def vulnerable_order(order_id):
+    try:
+        conn = sqlite3.connect("file:/srv/data/orders.db?mode=ro", uri=True)
+        row = conn.execute("SELECT total FROM orders WHERE id = ?", (order_id,)).fetchone()
+        return jsonify(total=row[0])
+    except Exception as e:
+        # Vulnerable: internal details go straight to the client
+        return jsonify(error=f"{type(e).__name__}: {e}", query="SELECT total FROM orders ..."), 500
+```
+
+Response:
+
+```text
+{'error': 'OperationalError: unable to open database file', 'query': 'SELECT total FROM orders ...'}
+```
+
+That tells an attacker the database engine, part of the schema, and that the database is unreachable. Verbose database errors are exactly what attackers use to tune SQL injection payloads (CWE-209, Generation of Error Message Containing Sensitive Information).
+
+**Fixed:** handle expected HTTP errors with their normal message, and turn every *unexpected* error into a generic response with a correlation ID. The full details go to the server log under the same ID.
+
+```python
+# errors_app.py
+import logging
+import sqlite3
+import uuid
+
+from flask import Flask, jsonify
+from werkzeug.exceptions import HTTPException
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+log = logging.getLogger("app")
+app = Flask(__name__)
+
+@app.get("/orders/<int:order_id>")
+def order(order_id):
+    conn = sqlite3.connect("file:/srv/data/orders.db?mode=ro", uri=True)
+    row = conn.execute("SELECT total FROM orders WHERE id = ?", (order_id,)).fetchone()
+    return jsonify(total=row[0])
+
+@app.errorhandler(HTTPException)
+def handle_http_error(e):
+    # Expected errors (404, 405, 413...): safe to show the standard message
+    return jsonify(error=e.name), e.code
+
+@app.errorhandler(Exception)
+def handle_unexpected(e):
+    error_id = uuid.uuid4().hex[:12]
+    log.exception("unhandled error error_id=%s", error_id)   # full details, server side only
+    return jsonify(error="Something went wrong. Contact support with this ID.",
+                   error_id=error_id), 500
+```
+
+```python
+# try_errors.py
+from errors_app import app
+
+c = app.test_client()
+r = c.get("/orders/1");   print(r.status_code, r.get_json())
+r = c.get("/orders/abc"); print(r.status_code, r.get_json())
+```
+
+Example output (the server log line and traceback are shortened):
+
+```text
+ERROR app unhandled error error_id=f5f4a52e65ec
+Traceback (most recent call last):
+  ...
+sqlite3.OperationalError: unable to open database file
+500 {'error': 'Something went wrong. Contact support with this ID.', 'error_id': 'f5f4a52e65ec'}
+404 {'error': 'Not Found'}
+```
+
+The user gets an ID they can quote to support. Your on-call engineer searches the logs for `f5f4a52e65ec` and finds the full traceback. The attacker learns nothing.
+
+:::warning Never run the debugger in production
+Flask's and Django's debug modes show full tracebacks in the browser, and Flask's interactive debugger can even run code. Flask's docs say plainly: do not enable debug mode when deploying in production. Use `flask run --debug` only on your machine. See [Secure Defaults and Configuration](./6-sec-secure-defaults.mdx).
+:::
+
+### Error message design
+
+| Situation | Good message | Bad message | Why |
+| --- | --- | --- | --- |
+| Wrong password | "Invalid email or password." | "No account with that email." | Prevents account enumeration |
+| Resource belongs to another user | 404 Not Found | 403 "This invoice belongs to another customer" | Does not confirm the resource exists |
+| Validation failure | "age: must be at least 13" | Echoing the submitted value back | Echoed input can cause XSS |
+| Server error | "Something went wrong (ID 3f9a...)" | Stack trace, SQL, file paths | Hides internals |
+| Rate limited | 429 with `Retry-After` | Silent failure | Honest and helpful to real users |
+
+## Part 2: Logging for Security
+
+### What to log
+
+The [OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html) recommends logging at least:
+
+- Input validation failures (many in a row suggest probing)
+- Authentication successes and failures
+- Authorization (access control) failures
+- Session management failures, such as invalid or tampered tokens
+- Application errors and startup or shutdown events
+- Higher-risk actions: admin actions, permission changes, data exports, use of break-glass accounts, key changes
+
+For each event, record **when** (timestamp, ideally UTC), **where** (service, version, host, endpoint), **who** (user ID, source IP) and **what** (event type, outcome, severity). A request or correlation ID ties together events from one request across services.
+
+### What never to log
+
+The same cheat sheet lists data to keep out of logs:
+
+- Passwords, session IDs and access tokens (log a short hash if you need to correlate)
+- Encryption keys and other secrets, database connection strings
+- Payment card and bank account data
+- Sensitive personal data, unless you have a legal basis and protection in place
+
+Logs are copied to many places: log shippers, SIEMs, support tickets, laptops. A password in a log is a password in all of those places. Privacy laws such as GDPR also apply to personal data in logs (see [Privacy Engineering](../13-sec-governance/4-sec-privacy-engineering.mdx)).
+
+### Log injection (CWE-117)
+
+If you write user input into a plain-text log, an attacker can add a newline and forge an entire fake log entry:
+
+```python
+# log_injection.py  (Vulnerable)
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                    datefmt="%H:%M:%S")
+log = logging.getLogger("auth")
+
+username = "mallory\n12:00:01 INFO login succeeded user=admin ip=10.0.0.5"
+log.warning("login failed user=%s ip=%s", username, "203.0.113.9")
+```
+
+Output:
+
+```text
+04:06:10 WARNING login failed user=mallory
+12:00:01 INFO login succeeded user=admin ip=10.0.0.5 ip=203.0.113.9
+```
+
+Anyone reading that log, or a tool parsing it line by line, now sees a successful admin login that never happened. Forged entries can mislead an investigation or hide real activity.
+
+### Fixed: neutralize newlines and redact secrets
+
+```python
+# safe_logging.py
+import logging
+import re
+
+SENSITIVE_KEYS = re.compile(r"(password|passwd|secret|token|api[_-]?key|authorization)", re.I)
+BEARER = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/-]+=*", re.I)
+
+class SafeFormatter(logging.Formatter):
+    """Neutralize CR/LF in the final message so one event is always one line."""
+    def format(self, record):
+        message = super().format(record)
+        return message.replace("\r", "\\r").replace("\n", "\\n")
+
+class RedactFilter(logging.Filter):
+    """Mask secrets passed as dict arguments or embedded as bearer tokens."""
+    def filter(self, record):
+        if isinstance(record.args, dict):
+            record.args = {k: ("[REDACTED]" if SENSITIVE_KEYS.search(k) else v)
+                           for k, v in record.args.items()}
+        record.msg = BEARER.sub(r"\1[REDACTED]", str(record.msg))
+        return True
+
+handler = logging.StreamHandler()
+handler.setFormatter(SafeFormatter("%(levelname)s %(name)s %(message)s"))
+handler.addFilter(RedactFilter())
+log = logging.getLogger("auth")
+log.addHandler(handler)
+log.setLevel(logging.INFO)
+log.propagate = False
+
+username = "mallory\n12:00:01 INFO login succeeded user=admin ip=10.0.0.5"
+log.warning("login failed user=%s ip=%s", username, "203.0.113.9")
+log.info("login attempt %(user)s with %(password)s", {"user": "alice", "password": "hunter2"})
+log.info("upstream call failed, header was Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def")
+```
+
+Output:
+
+```text
+WARNING auth login failed user=mallory\n12:00:01 INFO login succeeded user=admin ip=10.0.0.5 ip=203.0.113.9
+INFO auth login attempt alice with [REDACTED]
+INFO auth upstream call failed, header was Authorization: Bearer [REDACTED]
+```
+
+The forged line is now visibly part of the username, on one line. The formatter also flattens tracebacks onto one line, which most log pipelines handle fine.
+
+:::caution Redaction is a safety net, not a plan
+Pattern-based redaction will always miss something. The primary control is to **not pass secrets to the logger in the first place**: log a user ID instead of an email where possible, and never log full request headers or bodies on authentication endpoints.
+:::
+
+### Structured (JSON) logs
+
+Plain-text logs are hard to search and easy to forge. **Structured logging** writes each event as a JSON object. JSON encoding escapes newlines and quotes automatically, and log tools can filter by field instead of by regex. In Python, [structlog](https://www.structlog.org/) is a popular choice:
+
+```python
+# security_events.py
+import structlog
+
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.JSONRenderer(),
+    ]
+)
+log = structlog.get_logger("security")
+
+def log_login(user: str, ip: str, success: bool, reason: str | None = None):
+    log.info(
+        "auth.login",
+        outcome="success" if success else "failure",
+        user=user,
+        src_ip=ip,
+        reason=reason,
+        security_relevant=True,
+    )
+
+structlog.contextvars.bind_contextvars(request_id="req-7f3a", service="billing-api")
+log_login("alice@example.com", "198.51.100.23", True)
+log_login("mallory\nINFO fake event", "203.0.113.9", False, reason="bad_password")
+```
+
+Example output:
+
+```text
+{"outcome": "success", "user": "alice@example.com", "src_ip": "198.51.100.23", "reason": null, "security_relevant": true, "event": "auth.login", "request_id": "req-7f3a", "service": "billing-api", "level": "info", "timestamp": "2026-10-11T11:06:16.728561Z"}
+{"outcome": "failure", "user": "mallory\nINFO fake event", "src_ip": "203.0.113.9", "reason": "bad_password", "security_relevant": true, "event": "auth.login", "request_id": "req-7f3a", "service": "billing-api", "level": "info", "timestamp": "2026-10-11T11:06:16.728624Z"}
+```
+
+The newline in the forged username is now the two characters `\n` inside a JSON string, so it cannot create a fake event. A consistent event name such as `auth.login` with an `outcome` field makes detection rules simple to write.
+
+### From logs to alerts
+
+A09:2025 was renamed to include **alerting** because logs that nobody reads do not stop attacks. Even a small script shows the idea of turning events into a signal:
+
+```python
+# failed_login_alert.py
+import json
+from collections import defaultdict, deque
+
+WINDOW_SECONDS = 300
+THRESHOLD = 5
+
+events = [  # one JSON event per line, as a log shipper would deliver them
+    {"ts": 1000 + i * 20, "event": "auth.login", "outcome": "failure",
+     "user": f"user{i}@example.com", "src_ip": "203.0.113.9"} for i in range(6)
+] + [{"ts": 1050, "event": "auth.login", "outcome": "failure",
+      "user": "bob@example.com", "src_ip": "198.51.100.7"}]
+events.sort(key=lambda e: e["ts"])
+
+recent = defaultdict(deque)
+alerted = set()
+for line in map(json.dumps, events):
+    e = json.loads(line)
+    if e["event"] != "auth.login" or e["outcome"] != "failure":
+        continue
+    q = recent[e["src_ip"]]
+    q.append(e["ts"])
+    while q and q[0] < e["ts"] - WINDOW_SECONDS:
+        q.popleft()
+    if len(q) >= THRESHOLD and e["src_ip"] not in alerted:
+        alerted.add(e["src_ip"])
+        print(f"ALERT: {len(q)} failed logins from {e['src_ip']} in {WINDOW_SECONDS}s "
+              f"(possible password spraying)")
+```
+
+Output:
+
+```text
+ALERT: 5 failed logins from 203.0.113.9 in 300s (possible password spraying)
+```
+
+One IP failing logins for many *different* users is a classic password-spraying signal. In production you would write this as a rule in a SIEM rather than a script; see [Security Logging and SIEM](../11-sec-defensive-operations/1-sec-logging-and-siem.mdx) and [Detection Engineering](../11-sec-defensive-operations/2-sec-detection-engineering.mdx).
+
+### Protect the logs themselves
+
+```mermaid
+flowchart LR
+    App["App writes JSON to stdout"] --> Ship["Log shipper"]
+    Ship -->|"TLS"| Store["Central log store, append-only"]
+    Store --> SIEM["SIEM rules and alerts"]
+    SIEM --> OnCall["On-call engineer"]
+    Store -.->|"retention policy"| Archive["Archive or delete"]
+```
+
+- **Ship logs off the host quickly.** An attacker with root on the server can edit local files.
+- **Restrict access** to the central store, and log who reads it.
+- **Set retention** based on investigation needs and legal limits; do not keep personal data forever.
+- **Do not let logging failures crash the app**, and do not let them fail silently either. Alert when a service stops sending logs.
+
+## Real-World Scenario
+
+**Your team runs a payments API.** During an incident review you find three problems: a partner saw a raw PostgreSQL error with a table name in an API response, a fraud investigation stalled because logs had no user IDs, and a developer found full card numbers in debug logs from a past incident. Leadership asks what to change.
+
+### The solution
+
+1. Add a **global exception handler** that returns a generic error with a correlation ID, and remove every `return str(e)` from route code.
+2. Wrap every multi-step money movement in **one database transaction** and make external calls either before the transaction or idempotent and retryable afterwards.
+3. Adopt **structured JSON logging** with a fixed schema: `event`, `outcome`, `user_id`, `src_ip`, `request_id`, `service`. Bind `request_id` and `user_id` once per request with context variables.
+4. Add a **redaction processor** and, more importantly, a code review rule: card data and tokens are never passed to the logger. Purge the old logs that contain card numbers, following your data retention process.
+5. Ship logs to a central store and write **alerts** for repeated auth failures, repeated 500s from one client, and admin actions outside business hours.
+
+### Why this approach
+
+The handler and transactions fix A10 at the framework level, so individual developers cannot forget. Structured logs with IDs make investigations fast, and alerting fixes A09. Card data in logs is also a compliance problem under PCI DSS, so prevention at the source matters more than redaction after the fact.
+
+### When to use it, and when not to
+
+Every production service needs generic client errors and transactional integrity. Full structured security logging with alerting is worth it for anything handling money, personal data or authentication. For a hobby project or internal prototype, a global error handler and basic auth-event logging are a sensible minimum.
+
+### Alternatives and trade-offs
+
+| Approach | Pros | Cons | Best for |
+| --- | --- | --- | --- |
+| Detailed errors to clients | Easy debugging | Leaks internals, aids attackers | Local development only |
+| Generic errors + correlation ID | Safe for users, traceable for staff | Support must search logs | All production services |
+| Plain-text logs on each host | Simple, no infrastructure | Easy to forge and tamper with, hard to search | Single small servers |
+| Structured logs to a central store | Searchable, harder to tamper with, alertable | Cost and setup effort | Most production systems |
+| Log everything at debug level | Nothing is ever missing | Noise, cost, sensitive data exposure | Short, controlled troubleshooting windows |
+| Targeted security events + alerts | High signal, actionable | Needs thought about what matters | Security monitoring |
+
+## Common Mistakes
+
+- **Catching `Exception` and continuing** in security checks. Catch specific errors and fail closed.
+- **Returning `str(e)` to clients.** Exception messages often contain paths, queries or data.
+- **Different error messages for "user not found" and "wrong password".** This enables account enumeration.
+- **Logging request bodies on login or payment endpoints.** They contain passwords and card numbers.
+- **Building log lines with f-strings from user input.** Use structured fields or neutralize newlines.
+- **Logging without alerting.** If nobody would notice 10,000 failed logins, logging them is not enough.
+- **Local-only logs.** An attacker with server access can delete them.
+- **Leaving debug mode or verbose error pages on** after a troubleshooting session.
+
+## Summary
+
+- Security decisions must **fail closed**: deny on errors, catch specific exceptions, and make "allow" reachable only on the success path.
+- Wrap multi-step changes in **transactions** so failures roll back completely (OWASP A10:2025).
+- Show users **generic errors with a correlation ID**; keep details in server logs.
+- Log **security events** (auth, access control failures, validation failures, admin actions) with when, where, who and what.
+- **Never log secrets**, tokens, card data or unnecessary personal data.
+- Prevent **log injection** with structured JSON logs or by neutralizing CR and LF.
+- Centralize logs, protect them, and turn them into **alerts** (OWASP A09:2025).
+
+## Exercises
+
+1. Add a global error handler with correlation IDs to a Flask or FastAPI app you own. Trigger a deliberate error and confirm the client sees no internal details.
+2. Find every `except Exception` in a codebase you know. For each one, decide whether it fails open or closed in a security-relevant way.
+3. Extend `failed_login_alert.py` to also alert when one *user* has failures from more than three different IPs in ten minutes. Which attack does that detect?
+4. Write a structlog processor that drops any key named `password`, `token` or `card_number` before rendering. Add a unit test for it.
+
+Related pages: [Security Logging and SIEM](../11-sec-defensive-operations/1-sec-logging-and-siem.mdx), [Investigating with Logs](../12-sec-incident-response/3-sec-log-analysis.mdx), [Project: Detecting Attacks from Logs](../14-sec-projects/4-sec-project-log-monitoring.mdx). Next: [Secrets Management in Code](./3-sec-secrets-in-code.mdx).

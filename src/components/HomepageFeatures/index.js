@@ -78,6 +78,10 @@ import lokiLogo from '@site/static/img/observability-logo/loki_logo.png';
 import prometheusLogo from '@site/static/img/observability-logo/prometheus_logo.png';
 import terraformLogo from '@site/static/img/devops-logo/terraform_logo.png';
 import agentsLogo from '@site/static/img/ai-logo/agents_logo.png';
+import architectureLogo from '@site/static/img/fundamentals-logo/architecture_logo.png';
+import securityLogo from '@site/static/img/fundamentals-logo/security_logo.png';
+import jenkinsLogo from '@site/static/img/devops-logo/jenkins_logo.png';
+import cloudLogo from '@site/static/img/cloud-logo/cloud_logo.png';
 
 const programmingLanguagesList = [
     {
@@ -242,6 +246,24 @@ const fundamentalsList = [
         url: "/docs/fundamental/os",
         description: <>Operating System is system software that manages computer hardware, software resources, and
             provides common services for computer programs.</>,
+    },
+    {
+        title: 'Software Architecture & Design Patterns',
+        Icon: () => {
+            return <Image img={architectureLogo} className={styles.featureImage}/>;
+        },
+        url: "/docs/fundamental/architecture",
+        description: <>Learn design principles, design patterns and architectural styles, and when each one is the
+            right trade-off for real systems.</>,
+    },
+    {
+        title: 'Cybersecurity',
+        Icon: () => {
+            return <Image img={securityLogo} className={styles.featureImage}/>;
+        },
+        url: "/docs/fundamental/security",
+        description: <>Learn how attacks work and how to build, test and run secure software, from cryptography and web
+            security to incident response.</>,
     },
 
 ];
@@ -592,6 +614,24 @@ const devopsList = [
         },
         url: "/docs/devops/terraform",
         description: <>Terraform is an open-source infrastructure as code software tool created by HashiCorp.</>,
+    },
+    {
+        title: "Jenkins",
+        Icon: (alt) => {
+            return <Image img={jenkinsLogo} className={styles.featureImage} alt={alt.alt}/>;
+        },
+        url: "/docs/devops/jenkins",
+        description: <>Jenkins is an open-source automation server for building CI/CD pipelines with Jenkinsfiles,
+            agents, plugins and shared libraries.</>,
+    },
+    {
+        title: "Cloud Computing (AWS & Azure)",
+        Icon: (alt) => {
+            return <Image img={cloudLogo} className={styles.featureImage} alt={alt.alt}/>;
+        },
+        url: "/docs/devops/cloud",
+        description: <>Learn cloud computing on AWS and Azure side by side: compute, storage, networking, serverless,
+            security and architecture.</>,
     },
 ]
 

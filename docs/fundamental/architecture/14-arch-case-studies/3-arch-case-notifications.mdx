@@ -1,0 +1,403 @@
+---
+title: "Case Study: Notification System"
+description: "Design a multi-channel notification system for email, SMS and push: queues, preferences, templates, dedup, retries, provider failover and trade-offs."
+---
+
+# Case Study: Notification System
+
+## Introduction
+
+Almost every product sends notifications: order confirmations, password resets, "someone replied to your ticket", weekly digests. It starts as a single `send_email()` call in the order code. A year later there are SMS, mobile push, in-app messages, user preferences, quiet hours, three email providers and a compliance team asking why a customer got 40 identical texts.
+
+A notification system is a good case study because it is a **pure integration problem**. There is little domain logic, but a lot of architecture:
+
+- decoupling business events from delivery
+- queues, retries and dead-letter queues
+- adapters over unreliable third-party providers
+- idempotency, rate limits and user preferences
+
+Think of a post office sorting room. Departments drop letters in one inbox. Sorters check the address book (preferences), pick the right van (channel), and if the van breaks down, they load a different one. Nobody in accounting waits at the window until the letter is delivered.
+
+## Requirements
+
+**Functional**
+
+1. Any service can request a notification for a user, by event type, not by channel.
+2. Channels: email, SMS, mobile push (iOS and Android), in-app.
+3. Users choose which channels they want for each notification type.
+4. Templates per notification type and channel, with localization.
+5. Quiet hours for non-urgent SMS and push.
+6. Track status: queued, sent, delivered, failed, opened (where the channel reports it).
+
+**Non-functional**
+
+| Quality attribute | Target | Notes |
+| --- | --- | --- |
+| Reliability | At-least-once delivery attempts; no silent drops | Failed sends go to a dead-letter queue for inspection |
+| Isolation | A slow SMS provider must not delay emails or checkout | Separate queues per channel |
+| Latency | Password resets in seconds; digests can take hours | Priority lanes |
+| No spam | No duplicate sends for the same event | Dedup by event ID |
+| Compliance | Respect opt-outs and consent rules | Opt-outs checked at send time |
+
+## The Naive Design (Before)
+
+```python
+class SmsProviderDown(Exception):
+    pass
+
+
+def send_email(to: str, body: str) -> None:
+    print(f"  email to {to}: {body}")
+
+
+def send_sms(to: str, body: str) -> None:
+    raise SmsProviderDown("SMS provider timed out after 30s")
+
+
+def send_push(device: str, body: str) -> None:
+    print(f"  push to {device}: {body}")
+
+
+def place_order(order_id: str, customer: dict) -> None:
+    """BEFORE: the order flow sends every notification inline."""
+    print(f"order {order_id} saved")
+    body = f"Order {order_id} confirmed"
+    send_email(customer["email"], body)
+    send_sms(customer["phone"], body)          # one slow provider...
+    send_push(customer["device"], body)        # ...and push never happens
+
+
+try:
+    place_order("A-1001", {"email": "ana@example.com", "phone": "+15550100",
+                           "device": "device-token-abc"})
+except SmsProviderDown as exc:
+    print("checkout returned an error to the customer:", exc)
+```
+
+Output:
+
+```text
+order A-1001 saved
+  email to ana@example.com: Order A-1001 confirmed
+checkout returned an error to the customer: SMS provider timed out after 30s
+```
+
+The order was saved, the email went out, and then the customer saw an error because an SMS vendor was slow. Worse: if they retry checkout, they may get a second email. The notification code is [tightly coupled](../0-arch-fundamentals/5-arch-coupling-and-cohesion.mdx) to the order flow in time (synchronous), in failure (one provider breaks checkout) and in knowledge (the order code decides channels).
+
+## The Architecture (After)
+
+The core idea: **business services publish what happened; the notification system decides who hears about it, how and when.**
+
+```mermaid
+flowchart LR
+    subgraph Producers
+        OS["Order service"]
+        AS["Auth service"]
+        HS["Helpdesk service"]
+    end
+    subgraph Notify["Notification system"]
+        IN["Intake queue"]
+        NS["Notification service: dedup, preferences, templates"]
+        PREF[("Preferences and contacts")]
+        LOG[("Notification log")]
+        QE["Email queue"]
+        QS["SMS queue"]
+        QP["Push queue"]
+        WE["Email workers"]
+        WS["SMS workers"]
+        WP["Push workers"]
+        DLQ["Dead-letter queue"]
+    end
+    OS -- "order.confirmed" --> IN
+    AS -- "password.reset_requested" --> IN
+    HS -- "ticket.replied" --> IN
+    IN --> NS
+    NS --> PREF
+    NS --> LOG
+    NS --> QE
+    NS --> QS
+    NS --> QP
+    QE --> WE
+    QS --> WS
+    QP --> WP
+    WE --> P1["Email providers"]
+    WS --> P2["SMS providers"]
+    WP --> P3["APNs / FCM"]
+    WE --> DLQ
+    WS --> DLQ
+    WP --> DLQ
+```
+
+Why each piece exists:
+
+- **Intake queue.** Producers publish and move on. If the notification system is down for maintenance, events wait in the queue. Producers should publish through a [transactional outbox](../9-arch-distributed-systems/6-arch-outbox.mdx) so "order saved" and "notify about order" cannot diverge.
+- **One queue per channel.** This is the [bulkhead](../9-arch-distributed-systems/9-arch-bulkhead-and-rate-limiting.mdx) pattern. A backlog of SMS does not slow down email.
+- **Workers with provider adapters.** Each provider has its own API. An [Adapter](../3-arch-structural-patterns/0-arch-adapter.mdx) per provider behind a common interface lets you fail over or switch vendors without touching the rest.
+- **Notification log.** One row per attempt gives support staff an answer to "did the customer get the email?".
+- **Dead-letter queue.** After a bounded number of retries, the message is parked for inspection rather than retried forever or dropped.
+
+### Processing one request
+
+```mermaid
+sequenceDiagram
+    participant Q as Intake queue
+    participant N as Notification service
+    participant P as Preferences
+    participant CQ as Channel queue
+    participant W as Channel worker
+    participant V as Provider
+    Q->>N: order.confirmed (event_id evt-1)
+    N->>N: seen evt-1 before? no
+    N->>P: channels for user u1 and order_confirmed
+    P-->>N: email, push
+    N->>N: quiet hours? render templates
+    N->>CQ: enqueue email job, push job
+    CQ->>W: email job
+    W->>V: send
+    alt provider error
+        W->>W: retry with backoff, then next provider
+    end
+    V-->>W: accepted (provider message id)
+    W->>N: status = sent
+```
+
+## A Working Core
+
+The model below shows the decision logic and the delivery logic in one runnable file. Each channel worker tries its providers in order and dead-letters after a few rounds.
+
+```python
+import random
+from dataclasses import dataclass, field
+from datetime import time
+from typing import Protocol
+
+
+@dataclass(frozen=True)
+class NotificationRequest:
+    event_id: str            # unique per business event, used for dedup
+    user_id: str
+    kind: str                # "order_confirmed", "password_reset", "marketing_digest", ...
+    data: dict
+    critical: bool = False   # critical messages ignore quiet hours
+
+
+@dataclass
+class UserPrefs:
+    channels: dict[str, set[str]]           # kind -> allowed channels
+    quiet_start: time = time(22, 0)
+    quiet_end: time = time(7, 0)
+
+
+TEMPLATES = {
+    ("order_confirmed", "email"): "Hi {name}, your order {order_id} is confirmed.",
+    ("order_confirmed", "push"): "Order {order_id} confirmed",
+    ("password_reset", "email"): "Hi {name}, use this link to reset your password: {link}",
+    ("password_reset", "sms"): "Your reset code is {code}",
+}
+
+
+class Sender(Protocol):
+    name: str
+    def send(self, address: str, text: str) -> None: ...
+
+
+@dataclass
+class FakeProvider:
+    name: str
+    failure_rate: float
+    sent: list[str] = field(default_factory=list)
+
+    def send(self, address: str, text: str) -> None:
+        if random.random() < self.failure_rate:
+            raise ConnectionError(f"{self.name} unavailable")
+        self.sent.append(f"{address}: {text}")
+
+
+class ChannelWorker:
+    """One per channel. Tries providers in order, retries, then dead-letters."""
+
+    def __init__(self, providers: list[Sender], attempts: int = 3) -> None:
+        self.providers, self.attempts = providers, attempts
+        self.dead_letters: list[tuple[str, str]] = []
+
+    def deliver(self, address: str, text: str) -> str:
+        for attempt in range(1, self.attempts + 1):
+            for provider in self.providers:           # failover order
+                try:
+                    provider.send(address, text)
+                    return f"sent via {provider.name} (attempt {attempt})"
+                except ConnectionError:
+                    continue
+            # real code: sleep(base * 2 ** attempt + jitter) or requeue with a delay
+        self.dead_letters.append((address, text))
+        return "dead-lettered"
+
+
+class NotificationService:
+    def __init__(self, prefs: dict[str, UserPrefs], contacts: dict[str, dict[str, str]],
+                 workers: dict[str, ChannelWorker]) -> None:
+        self.prefs, self.contacts, self.workers = prefs, contacts, workers
+        self.processed: set[str] = set()
+
+    def handle(self, req: NotificationRequest, now: time) -> list[str]:
+        if req.event_id in self.processed:                      # 1. dedup
+            return ["skipped: duplicate event"]
+        self.processed.add(req.event_id)
+        prefs = self.prefs[req.user_id]
+        quiet = now >= prefs.quiet_start or now < prefs.quiet_end
+        results = []
+        for channel in sorted(prefs.channels.get(req.kind, set())):   # 2. preferences
+            template = TEMPLATES.get((req.kind, channel))
+            if template is None:
+                continue
+            if quiet and not req.critical and channel in {"sms", "push"}:   # 3. quiet hours
+                results.append(f"{channel}: deferred until morning")
+                continue
+            text = template.format(**req.data)                   # 4. render
+            address = self.contacts[req.user_id][channel]
+            results.append(f"{channel}: {self.workers[channel].deliver(address, text)}")
+        return results
+
+
+random.seed(4)
+workers = {
+    "email": ChannelWorker([FakeProvider("mail-primary", 0.3), FakeProvider("mail-backup", 0.0)]),
+    "sms": ChannelWorker([FakeProvider("sms-a", 1.0)]),          # this provider is down
+    "push": ChannelWorker([FakeProvider("fcm", 0.0)]),
+}
+svc = NotificationService(
+    prefs={"u1": UserPrefs(channels={"order_confirmed": {"email", "push"},
+                                     "password_reset": {"email", "sms"}})},
+    contacts={"u1": {"email": "ana@example.com", "sms": "+15550100", "push": "device-abc"}},
+    workers=workers,
+)
+
+order = NotificationRequest("evt-1", "u1", "order_confirmed", {"name": "Ana", "order_id": "A-1001"})
+print("14:00", svc.handle(order, now=time(14, 0)))
+print("14:00", svc.handle(order, now=time(14, 0)))           # broker redelivered the event
+late = NotificationRequest("evt-2", "u1", "order_confirmed", {"name": "Ana", "order_id": "A-1002"})
+print("23:30", svc.handle(late, now=time(23, 30)))
+reset = NotificationRequest("evt-3", "u1", "password_reset",
+                            {"name": "Ana", "link": "https://example.com/r/x1", "code": "482913"},
+                            critical=True)
+print("23:45", svc.handle(reset, now=time(23, 45)))
+print("SMS dead letters:", workers["sms"].dead_letters)
+```
+
+Output:
+
+```text
+14:00 ['email: sent via mail-backup (attempt 1)', 'push: sent via fcm (attempt 1)']
+14:00 ['skipped: duplicate event']
+23:30 ['email: sent via mail-backup (attempt 1)', 'push: deferred until morning']
+23:45 ['email: sent via mail-primary (attempt 1)', 'sms: dead-lettered']
+SMS dead letters: [('+15550100', 'Your reset code is 482913')]
+```
+
+Points to notice:
+
+- **Dedup on `event_id`.** Message brokers deliver at least once, so the same `order.confirmed` can arrive twice. Production code stores processed IDs in a table with a unique constraint (with a retention period), not in a Python set. See [Idempotency](../9-arch-distributed-systems/7-arch-idempotency.mdx).
+- **Preferences by kind, not by channel.** Producers never say "send an SMS". They say what happened. Adding WhatsApp later changes only the notification system.
+- **Quiet hours with a critical override.** A password reset at 23:45 must go out; a "your order shipped" push can wait. In a real system, the deferred job is re-queued with a delay instead of dropped, and quiet hours use the user's own time zone.
+- **Failover is a [Strategy](../4-arch-behavioral-patterns/0-arch-strategy.mdx)-style list of providers.** The primary email provider failed, so the backup sent it.
+- **Dead letters keep the evidence.** The SMS provider is down; the reset code is parked for an operator or a later replay. For one-time codes, replaying hours later is pointless, so set an expiry on such jobs.
+
+:::caution
+Retries without backoff turn a provider's brief outage into a self-inflicted denial of service. Use exponential backoff with jitter, cap the attempts, and respect the provider's rate limits. See [Circuit Breaker, Retry and Timeout](../9-arch-distributed-systems/8-arch-circuit-breaker.mdx).
+:::
+
+## Mobile Push: Current Provider APIs
+
+Push goes through the platform services: Apple Push Notification service (APNs) for iOS and Firebase Cloud Messaging (FCM) for Android (FCM can also deliver to iOS through APNs).
+
+Something that changed recently: Google deprecated FCM's **legacy HTTP and XMPP APIs** in June 2023 and began shutting them down in July 2024. Current integrations use the **FCM HTTP v1 API**, which authenticates with short-lived OAuth 2.0 access tokens from a service account instead of a static server key. If you find old code posting to `fcm.googleapis.com/fcm/send` with a `key=` header, it needs migrating. See the official [migration guide](https://firebase.google.com/docs/cloud-messaging/migrate-v1).
+
+An HTTP v1 send request looks like this:
+
+```text
+POST https://fcm.googleapis.com/v1/projects/my-project-id/messages:send
+Authorization: Bearer ya29.short-lived-oauth-token
+Content-Type: application/json
+```
+
+```json
+{
+  "message": {
+    "token": "device-registration-token",
+    "notification": {
+      "title": "Order confirmed",
+      "body": "Order A-1001 is on its way to the warehouse"
+    },
+    "data": {
+      "order_id": "A-1001",
+      "deep_link": "bookstore://orders/A-1001"
+    }
+  }
+}
+```
+
+In practice, use the official Firebase Admin SDK, which handles token refresh and batching. APNs uses HTTP/2 with token-based (JWT) or certificate authentication; check Apple's developer documentation for the current headers and payload limits.
+
+Two operational facts shape the design:
+
+- **Device tokens go stale.** Users uninstall apps and switch phones. When a provider reports a token as invalid or unregistered, delete it, or your push success rate drifts down and providers may throttle you.
+- **"Sent" is not "seen".** Providers accept a message for delivery; the device may be off. Only in-app opens or read receipts tell you a human saw it.
+
+## Scaling Concerns
+
+- **Fan-out spikes.** A marketing digest to 2 million users should not share a lane with password resets. Use separate priority queues, and let bulk jobs run with a lower concurrency.
+- **Provider rate limits.** Every email and SMS provider limits throughput. Put a token-bucket limiter in each worker pool, sized to your contract.
+- **Per-user limits.** Cap how many notifications one user can get per hour, and collapse repeats ("5 new replies on ticket 812" instead of five pushes).
+- **Template rendering.** Keep templates in a versioned store so marketing can edit copy without a deploy, but validate them (missing variables are a common outage).
+
+## Real-World Scenario
+
+Your team runs a SaaS helpdesk. Agents get push and email when a ticket is assigned; end customers get email replies; admins get a daily digest. Last quarter, a bug in the ticket service re-published 50,000 old events, and customers received duplicate emails for tickets closed months ago.
+
+**The solution:**
+
+1. Move all sending out of the ticket service into a notification module that consumes events from the broker.
+2. Dedup on event ID with a 30-day retention table, and drop any event older than a configurable age for non-digest kinds (stale events are worse than missing ones).
+3. Per-channel queues and workers, with a backup email provider configured for failover.
+4. A per-user hourly cap with collapsing for agent push notifications.
+5. A notification log with provider message IDs, exposed in the admin UI so support can answer "was it sent?" without engineers.
+
+**Why this approach:** the problems were duplicate sends and coupling. Dedup, age limits and an async boundary fix both. The team kept the notification code as a module in the monolith at first, with its own tables and its own worker processes. It became a separate service later only when the mobile team needed to deploy push changes independently.
+
+**When not to use it:** if you send a few transactional emails a day, a single background job calling one email API with retries is enough. Do not build preference centres and failover for a prototype.
+
+**Alternatives and trade-offs:**
+
+| Approach | Pros | Cons | Best for |
+| --- | --- | --- | --- |
+| Inline sending in business code | Simplest possible | Couples failures and latency, no preferences | Prototypes |
+| Background job queue in the monolith | Async, cheap, one deployable | Shared resources with the app | Small and medium products |
+| Dedicated notification service + broker | Isolation, independent scaling and deploys | More infrastructure and operations | Many producers, many channels |
+| Third-party notification platform | Preferences, templates, multi-channel out of the box | Cost per message, vendor lock-in, data leaves your system | Teams that want to avoid building it |
+
+## Common Mistakes
+
+- **Producers choosing channels.** The order service should not know about SMS. Publish events; let the notification system decide.
+- **No dedup.** At-least-once delivery plus no idempotency equals duplicate texts, which cost money and annoy users.
+- **One queue for everything.** A bulk campaign then delays password resets.
+- **Infinite retries.** Poison messages loop forever. Cap attempts and use a dead-letter queue.
+- **Ignoring opt-outs at send time.** Check preferences when the message is sent, not only when it was queued; users may have opted out in between.
+- **Treating providers as reliable.** They have outages and rate limits. Plan for failover and backoff.
+
+## Summary
+
+- Decouple "what happened" (events from producers) from "who is told, how and when" (the notification system).
+- Use per-channel queues as bulkheads, adapters per provider, and failover lists.
+- Dedup by event ID, apply preferences and quiet hours, and render templates per channel.
+- Retry with exponential backoff and jitter, cap attempts, and keep a dead-letter queue.
+- For Android push, use the FCM HTTP v1 API; the legacy API has been shut down.
+- Log every attempt so support can answer delivery questions.
+
+## Exercises
+
+1. **Backoff.** Replace the immediate retry loop with exponential backoff plus jitter, and print the delays you would use for 5 attempts.
+2. **Time zones.** Store each user's time zone and compute quiet hours in local time using `zoneinfo`.
+3. **Collapsing.** Add a digest window: if more than 3 `ticket.replied` events for the same ticket arrive within 5 minutes, send one combined push.
+4. **Provider health.** Add a simple circuit breaker to `FakeProvider` so a failing provider is skipped for 30 seconds instead of tried on every message.
+
+Related pages: [Observer Pattern](../4-arch-behavioral-patterns/1-arch-observer.mdx), [Messaging Patterns: Queues, Pub/Sub and Streams](../10-arch-integration-and-apis/5-arch-messaging-patterns.mdx), [Webhooks and Callbacks](../10-arch-integration-and-apis/7-arch-webhooks.mdx), and the next case study, [Payment Processing](./4-arch-case-payments.mdx). For queues in practice, see the [RabbitMQ tutorial](/docs/middleware/rabbitmq).
