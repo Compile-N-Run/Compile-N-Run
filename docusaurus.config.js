@@ -51,6 +51,9 @@ const config = {
         url: 'https://www.compilenrun.com', // Set the /<baseUrl>/ pathname under which your site is served
         // For GitHub pages deployment, it is often '/<projectName>/'
         baseUrl: '/',
+        // GitHub Pages serves every page as a folder and redirects /page to /page/.
+        // Emit the slash form everywhere (canonical, sitemap, links) so Google never hits a redirect.
+        trailingSlash: true,
         themes: ['@docusaurus/theme-live-codeblock', '@docusaurus/theme-mermaid', 'docusaurus-theme-search-typesense'],
         plugins: [
             [
