@@ -22,8 +22,8 @@ STATIC = os.path.join(ROOT, 'hugo', 'static', 'docsrc')
 # Same rule as Docusaurus' default numberPrefixParser.
 NUM = re.compile(r'^(?P<n>\d+)\s*[-_.]+\s*(?P<rest>[^-_.\s].*)$')
 FM = re.compile(r'\A---\n(.*?)\n---\n?', re.S)
-ADMONITIONS = {'note': 'NOTE', 'tip': 'TIP', 'info': 'NOTE', 'important': 'IMPORTANT',
-               'warning': 'WARNING', 'caution': 'CAUTION', 'danger': 'CAUTION', 'code': 'NOTE'}
+ADMONITIONS = {'note': 'NOTE', 'tip': 'TIP', 'info': 'INFO', 'important': 'INFO',
+               'warning': 'WARNING', 'caution': 'CAUTION', 'danger': 'DANGER', 'code': 'NOTE'}
 
 
 IGNORED = re.compile(r'^\d+[-_.]\d+')
@@ -72,6 +72,9 @@ def page_url(rel_dir, stem, fm, is_index):
 def convert_body(body):
     # Docusaurus renders ```mdx-code-block fences as live MDX: unwrap them before converting.
     body = re.sub(r'^(`{3,})mdx-code-block[ \t]*\n(.*?)\n\1[ \t]*$', r'\2', body, flags=re.S | re.M)
+    body = convert_tabs(body)
+    # Docusaurus code titles (```js title="app.js") become Hugo code block attributes.
+    body = re.sub(r'^(\s*`{3,}[\w+#-]+)[ \t]+title=(["\'])(.*?)\2.*$', lambda m: f'{m.group(1)} {{title="{m.group(3)}"}}', body, flags=re.M)
     out, fence, adm = [], None, 0
     for line in body.split('\n'):
         stripped = line.lstrip()
@@ -89,15 +92,6 @@ def convert_body(body):
             if re.match(r'^import\s.+\sfrom\s+[\'"]', line) or re.match(r'^export\s', line):
                 continue
             line = re.sub(r'\{/\*.*?\*/\}', '', line)
-            if re.match(r'^\s*</?Tabs\b[^>]*>\s*$', line):
-                continue
-            tm = re.match(r'^\s*<TabItem\b[^>]*?label=["\']([^"\']+)["\'][^>]*>\s*$', line)
-            if tm:
-                out.append(('> ' * adm) + f'**{tm.group(1)}**')
-                out.append('> ' * adm)
-                continue
-            if re.match(r'^\s*</?TabItem\b[^>]*>\s*$', line):
-                continue
             am = re.match(r'^\s*:::(\w+)\s*(.*)$', line)
             if am and am.group(1).lower() in ADMONITIONS:
                 kind = ADMONITIONS[am.group(1).lower()]
@@ -110,6 +104,45 @@ def convert_body(body):
                 out.append('')
                 continue
         out.append(('> ' * adm) + line if adm else line)
+    return '\n'.join(out)
+
+
+TABS_OPEN = '<div class="theme-tabs-container tabs-container tabList__CuJ" data-tabs><ul role="tablist" aria-orientation="horizontal" class="tabs"></ul><div class="margin-top--md">'
+
+
+def convert_tabs(body):
+    """<Tabs>/<TabItem label=...> -> Docusaurus tabs markup; tab content is dedented so it stays Markdown."""
+    if '<Tabs' not in body:
+        return body
+    out, item, fence = [], None, False
+    for line in body.split('\n'):
+        if re.match(r'^\s*(```|~~~)', line):
+            fence = not fence
+        if not fence:
+            if re.match(r'^\s*<Tabs\b[^>]*>\s*$', line):
+                out.append(TABS_OPEN)
+                continue
+            if re.match(r'^\s*</Tabs>\s*$', line):
+                out.append('</div></div>')
+                continue
+            m = re.match(r'^\s*<TabItem\b(.*?)>\s*$', line)
+            if m:
+                lab = re.search(r'label=["\']([^"\']+)', m.group(1)) or re.search(r'value=["\']([^"\']+)', m.group(1))
+                item = []
+                out.append(f'<div role="tabpanel" class="tabItem_Ymn6" data-label="{lab.group(1) if lab else "Tab"}">')
+                out.append('')
+                continue
+            if re.match(r'^\s*</TabItem>\s*$', line) and item is not None:
+                lines = [l for l in item if l.strip()]
+                ind = min((len(l) - len(l.lstrip()) for l in lines), default=0)
+                out.extend(l[ind:] for l in item)
+                out.extend(['', '</div>'])
+                item = None
+                continue
+        if item is not None:
+            item.append(line)
+        else:
+            out.append(line)
     return '\n'.join(out)
 
 
@@ -160,14 +193,16 @@ def main():
             new_fm = {
                 'title': str(title),
                 'url': url,
-                'weight': fm.get('sidebar_position', w if w is not None else 999),
+                # Hugo treats weight 0 as "unset", so shift Docusaurus' 0-based positions by one.
+                'weight': (fm['sidebar_position'] if isinstance(fm.get('sidebar_position'), (int, float)) else (w if w is not None else 998)) + 1,
                 'srcdir': rel_dir,
+                'srcfile': os.path.relpath(src, ROOT).replace(os.sep, '/'),
             }
             for k in ('description', 'sidebar_label', 'keywords', 'tags'):
                 if fm.get(k):
                     new_fm[k] = fm[k]
             if is_index:
-                new_fm['weight'] = dir_weight if dir_weight is not None else cat.get('position', 999)
+                new_fm['weight'] = (dir_weight if dir_weight is not None else cat.get('position', 998)) + 1
                 if cat.get('label'):
                     new_fm['sidebar_label'] = cat['label']
             name = '_index.md' if is_index else re.sub(r'\.mdx$', '.md', f)
@@ -177,10 +212,11 @@ def main():
                 print('DUPLICATE URL', url, urls[url], src, file=sys.stderr)
             urls[url] = src
             pages += 1
-        if not index_src:
+        has_docs = any(f.endswith(('.md', '.mdx')) for _, _, fs in os.walk(dirpath) for f in fs)
+        if not index_src and has_docs:
             # Section without its own page in Docusaurus: list it in menus, render nothing.
             label = cat.get('label') or strip_num(dir_name)[0].replace('-', ' ').title()
-            new_fm = {'title': label, 'weight': dir_weight if dir_weight is not None else cat.get('position', 999),
+            new_fm = {'title': label, 'weight': (dir_weight if dir_weight is not None else cat.get('position', 998)) + 1,
                       'build': {'render': 'never', 'list': 'always'}, 'srcdir': rel_dir}
             if rel_dir == '':
                 new_fm = {'title': 'Docs', 'build': {'render': 'never', 'list': 'always'}}
