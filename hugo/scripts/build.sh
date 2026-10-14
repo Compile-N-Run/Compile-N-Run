@@ -8,12 +8,15 @@ python3 scripts/convert.py
 node scripts/site_config.mjs > data/site.json
 rm -rf public
 if [ -n "${SPLIT_SEARCH:-}" ]; then
-  "${HUGO:-hugo}" --quiet --gc --minify
+  "${HUGO:-hugo}" --gc --minify --logLevel warn
   rm -rf search-dist && mkdir -p search-dist
   ${PAGEFIND:-npx -y pagefind@1.3.0} --site public --output-path search-dist/pagefind
   printf '/*\n  Access-Control-Allow-Origin: *\n  X-Robots-Tag: noindex, nofollow\n' > search-dist/_headers
 else
-  HUGO_PARAMS_PAGEFINDBUNDLE=/pagefind/ "${HUGO:-hugo}" --quiet --gc --minify
+  HUGO_PARAMS_PAGEFINDBUNDLE=/pagefind/ "${HUGO:-hugo}" --gc --minify --logLevel warn
   ${PAGEFIND:-npx -y pagefind@1.3.0} --site public
 fi
-echo "built $(find public -name index.html | wc -l) pages"
+n=$(find public -name index.html | wc -l)
+echo "built $n pages"
+# A template error in one partial can leave public/ almost empty; never let that reach a deploy.
+if [ "$n" -lt 11000 ]; then echo "error: expected over 11000 pages" >&2; exit 1; fi

@@ -10,7 +10,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+from datetime import datetime, timezone
 
 import yaml
 
@@ -55,6 +57,88 @@ def read(path):
             fm = {}
         s = s[m.end():]
     return fm, s
+
+
+def create_excerpt(text):
+    """Port of Docusaurus' createExcerpt: the description it gives pages without one."""
+    lines = re.sub(r'^[^\r\n]*\r?\n[=]+', '', text.lstrip()).splitlines()
+    in_code = in_import = False
+    last_fence = ''
+    for line in lines:
+        if not line.strip() and in_import:
+            in_import = False
+        if not line.strip():
+            continue
+        if (re.match(r'^(?:import|export)\s.*', line) or in_import) and not in_code:
+            in_import = True
+            continue
+        if line.strip().startswith('```'):
+            fence = re.match(r'^`+', line.strip()).group(0)
+            if not in_code:
+                in_code, last_fence = True, fence
+            elif len(fence) >= len(last_fence):
+                in_code = False
+            continue
+        elif in_code:
+            continue
+        c = re.sub(r'<[^>]*>', '', line)
+        c = re.sub(r'^#[^#]+#?', '', c, flags=re.M)
+        c = re.sub(r'^#{1,6}\s*([^#]*?)\s*#{0,6}', r'\1', c, flags=re.M)
+        c = re.sub(r'([*_]{1,3})(.*?)\1', r'\2', c)
+        c = re.sub(r'~~(\S.*\S)~~', r'\1', c)
+        c = re.sub(r'!\[(.*?)\][\[(].*?[\])]', r'\1', c)
+        c = re.sub(r'\[\^.+?\](?:: .*$)?', '', c)
+        c = re.sub(r'\[(.*?)\][\[(].*?[\])]', r'\1', c)
+        c = re.sub(r'`(.+?)`', r'\1', c)
+        c = re.sub(r'^\s{0,3}>\s?', '', c)
+        c = re.sub(r':::.*', '', c, count=1)
+        c = re.sub(r'\s?:(?:::|[^:\n])+:', '', c)
+        c = re.sub(r'\{#*[\w-]+\}', '', c, count=1).strip()
+        if c:
+            return c
+    return None
+
+
+def git_dates():
+    """Last commit date (UTC, YYYY-MM-DD) of every file, like Docusaurus' sitemap lastmod."""
+    out = subprocess.run(['git', 'log', '--format=@%ct', '--name-only', '--', 'docs', 'src/pages', 'blog'],
+                         cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    dates, cur = {}, None
+    for line in out.splitlines():
+        if line.startswith('@'):
+            cur = datetime.fromtimestamp(int(line[1:]), timezone.utc).strftime('%Y-%m-%d')
+        elif line.strip() and line not in dates:
+            dates[line] = cur
+    return dates
+
+
+def write_page(path, fm, body=''):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, 'w', encoding='utf8').write('---\n' + yaml.safe_dump(fm, allow_unicode=True, sort_keys=False) + '---\n\n' + body)
+
+
+def convert_blog(dates):
+    """blog/ -> /blog/ (list), /blog/<slug>/ (posts), /blog/archive/, plus RSS and Atom feeds."""
+    src_root = os.path.join(ROOT, 'blog')
+    write_page(os.path.join(OUT, 'blog', '_index.md'), {'title': 'Blog', 'description': 'Blog',
+               'outputs': ['html', 'blogrss', 'blogatom']})
+    write_page(os.path.join(OUT, 'blog-archive.md'), {'title': 'Archive', 'description': 'Archive', 'url': '/blog/archive/', 'type': 'blogarchive'})
+    for name in sorted(os.listdir(src_root)):
+        path = os.path.join(src_root, name)
+        if os.path.isdir(path):
+            path = next((os.path.join(path, f) for f in ('index.md', 'index.mdx') if os.path.exists(os.path.join(path, f))), None)
+        if not path or not path.endswith(('.md', '.mdx')):
+            continue
+        m = re.match(r'^(\d{4}-\d{2}-\d{2})-(.*?)(?:\.mdx?)?$', name)
+        fm, body = read(path)
+        slug = str(fm.get('slug') or (m.group(2) if m else os.path.splitext(name)[0])).strip('/')
+        rel = os.path.relpath(path, ROOT).replace(os.sep, '/')
+        new_fm = {'title': str(fm.get('title', slug)), 'url': f'/blog/{slug}/', 'date': str(fm.get('date') or (m.group(1) if m else dates.get(rel))),
+                  'description': fm.get('description') or create_excerpt(body) or '', 'srcfile': rel}
+        if dates.get(rel):
+            new_fm['lastmod'] = dates[rel]
+        body = re.sub(r'<!--\s*truncate\s*-->', '<!--more-->', body)
+        write_page(os.path.join(OUT, 'blog', slug + '.md'), new_fm, convert_body(body))
 
 
 def page_url(rel_dir, stem, fm, is_index):
@@ -242,6 +326,7 @@ def main():
         shutil.rmtree(STATIC)
     pages = 0
     urls = {}
+    dates = git_dates()
     for dirpath, dirnames, filenames in os.walk(DOCS):
         rel_dir = os.path.relpath(dirpath, DOCS).replace(os.sep, '/')
         rel_dir = '' if rel_dir == '.' else rel_dir
@@ -280,6 +365,12 @@ def main():
             for k in ('description', 'sidebar_label', 'keywords', 'tags'):
                 if fm.get(k):
                     new_fm[k] = fm[k]
+            if not fm.get('description'):
+                ex = create_excerpt(body)
+                if ex:
+                    new_fm['description'] = ex
+            if dates.get(new_fm['srcfile']):
+                new_fm['lastmod'] = dates[new_fm['srcfile']]
             if is_index:
                 new_fm['weight'] = (dir_weight if dir_weight is not None else cat.get('position', 998)) + 1
                 if cat.get('label'):
@@ -301,16 +392,22 @@ def main():
                 new_fm = {'title': 'Docs', 'build': {'render': 'never', 'list': 'always'}}
             open(os.path.join(out_dir, '_index.md'), 'w', encoding='utf8').write(
                 '---\n' + yaml.safe_dump(new_fm, allow_unicode=True, sort_keys=False) + '---\n')
-    for f in ('about.md', 'contact.md', 'privacy-policy.md', 'terms.md'):
+    for f in ('about.md', 'contact.md', 'privacy-policy.md', 'terms.md', 'markdown-page.md'):
         fm, body = read(os.path.join(ROOT, 'src', 'pages', f))
         stem = f[:-3]
         new_fm = {'title': fm.get('title', stem.title()), 'url': f'/{stem}/', 'type': 'page'}
-        if fm.get('description'):
-            new_fm['description'] = fm['description']
+        desc = fm.get('description') or create_excerpt(body)
+        if desc:
+            new_fm['description'] = desc
+        if dates.get(f'src/pages/{f}'):
+            new_fm['lastmod'] = dates[f'src/pages/{f}']
         open(os.path.join(OUT, f), 'w', encoding='utf8').write(
             '---\n' + yaml.safe_dump(new_fm, allow_unicode=True, sort_keys=False) + '---\n\n' + convert_body(body))
-    open(os.path.join(OUT, 'search.md'), 'w').write('---\ntitle: Search\nurl: /search/\ntype: search\n---\n')
-    open(os.path.join(OUT, '_index.md'), 'w').write('---\ntitle: Compile N Run\n---\n')
+    open(os.path.join(OUT, 'search.md'), 'w').write('---\ntitle: Search the documentation\nurl: /search/\ntype: search\nrobots: noindex, follow\n---\n')
+    open(os.path.join(OUT, '_index.md'), 'w').write('---\ntitle: Compile N Run\n'
+                                                     'description: The best website to learn any programming language for free!\n'
+                                                     f"lastmod: {dates.get('src/pages/index.js')}\n---\n")
+    convert_blog(dates)
     tutorials = sidebar_tutorials()
     write_category_pages(tutorials, urls)
     os.makedirs(os.path.join(ROOT, 'hugo', 'data'), exist_ok=True)

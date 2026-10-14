@@ -36,6 +36,9 @@
   /* ---------- Mobile navbar sidebar ---------- */
   var navbar = document.querySelector('[data-navbar]');
   function mobileMenu(open) {
+    var slot = document.querySelector('[data-mobile-sidebar]');
+    var tree = document.querySelector('[data-doc-sidebar] .theme-doc-sidebar-menu');
+    if (open && slot && tree && !slot.firstChild) slot.appendChild(tree.cloneNode(true));
     navbar.classList.toggle('navbar-sidebar--show', open);
     root.style.overflow = open ? 'hidden' : '';
   }
