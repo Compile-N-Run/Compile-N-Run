@@ -23,7 +23,8 @@ STATIC = os.path.join(ROOT, 'hugo', 'static', 'docsrc')
 NUM = re.compile(r'^(?P<n>\d+)\s*[-_.]+\s*(?P<rest>[^-_.\s].*)$')
 FM = re.compile(r'\A---\n(.*?)\n---\n?', re.S)
 ADMONITIONS = {'note': 'NOTE', 'tip': 'TIP', 'info': 'INFO', 'important': 'INFO',
-               'warning': 'WARNING', 'caution': 'CAUTION', 'danger': 'DANGER', 'code': 'NOTE'}
+               'warning': 'WARNING', 'caution': 'CAUTION', 'danger': 'DANGER', 'code': 'NOTE',
+               'success': 'SUCCESS'}
 
 
 IGNORED = re.compile(r'^\d+[-_.]\d+')
@@ -73,6 +74,8 @@ def convert_body(body):
     # Docusaurus renders ```mdx-code-block fences as live MDX: unwrap them before converting.
     body = re.sub(r'^(`{3,})mdx-code-block[ \t]*\n(.*?)\n\1[ \t]*$', r'\2', body, flags=re.S | re.M)
     body = convert_tabs(body)
+    body = convert_jsx_attrs(body)
+    body = fix_html_blocks(body)
     # Docusaurus code titles (```js title="app.js") become Hugo code block attributes.
     body = re.sub(r'^(\s*`{3,}[\w+#-]+)[ \t]+title=(["\'])(.*?)\2.*$', lambda m: f'{m.group(1)} {{title="{m.group(3)}"}}', body, flags=re.M)
     out, fence, adm = [], None, 0
@@ -92,7 +95,9 @@ def convert_body(body):
             if re.match(r'^import\s.+\sfrom\s+[\'"]', line) or re.match(r'^export\s', line):
                 continue
             line = re.sub(r'\{/\*.*?\*/\}', '', line)
-            am = re.match(r'^\s*:::(\w+)\s*(.*)$', line)
+            if re.match(r'^\s*<TOCInline\b.*/>\s*$', line):
+                continue
+            am = re.match(r'^\s*::: ?(\w+)\s*(.*)$', line)
             if am and am.group(1).lower() in ADMONITIONS:
                 kind = ADMONITIONS[am.group(1).lower()]
                 title = am.group(2).strip()
@@ -104,6 +109,73 @@ def convert_body(body):
                 out.append('')
                 continue
         out.append(('> ' * adm) + line if adm else line)
+    return '\n'.join(out)
+
+
+def _css_prop(k):
+    k = k.strip().strip('"\'')
+    return k if '-' in k else re.sub(r'[A-Z]', lambda m: '-' + m.group(0).lower(), k)
+
+
+def _jsx_style(m):
+    props = re.findall(r'([\w"\'-]+)\s*:\s*("[^"]*"|\'[^\']*\'|[^,}]+)', m.group(1))
+    css = ';'.join(f'{_css_prop(k)}:{v.strip().strip(chr(34) + chr(39))}' for k, v in props)
+    return f'style="{css}"'
+
+
+def convert_jsx_attrs(body):
+    """JSX attributes outside code: style={{...}} -> style="...", className -> class."""
+    parts = re.split(r'(^\s*(?:`{3,}|~{3,}).*?^\s*(?:`{3,}|~{3,})\s*$)', body, flags=re.S | re.M)
+    for i in range(0, len(parts), 2):
+        t = re.sub(r'style=\{\{(.*?)\}\}', _jsx_style, parts[i], flags=re.S)
+        parts[i] = re.sub(r'(<[a-zA-Z][^>`]*?)\bclassName=', r'\1class=', t)
+    return ''.join(parts)
+
+
+BLOCK_OPEN = re.compile(r'^(\s{0,3})<(div|center|section|figure|details)\b[^>]*>\s*$')
+
+
+def _dedent(lines):
+    ind = min((len(l) - len(l.lstrip()) for l in lines if l.strip()), default=0)
+    return [l[ind:] for l in lines]
+
+
+def fix_html_blocks(body):
+    """MDX parses Markdown between JSX tags on their own lines and keeps <svg> together across blank lines;
+    CommonMark ends HTML blocks at a blank line and treats indented lines as code. Rewrite so Hugo agrees:
+    open/close tags get blank lines around dedented inner Markdown; <svg> blocks lose blank lines and indentation."""
+    lines, out, i, fence = body.split('\n'), [], 0, None
+    while i < len(lines):
+        line = lines[i]
+        fm = re.match(r'\s*(`{3,}|~{3,})', line)
+        if fm:
+            if fence is None:
+                fence = fm.group(1)
+            elif line.strip().startswith(fence) and set(line.strip()) <= set(fence[0]):
+                fence = None
+            out.append(line); i += 1; continue
+        if fence is None:
+            if re.match(r'^\s*<svg\b', line) and '</svg>' not in line:
+                j = i
+                while j < len(lines) and '</svg>' not in lines[j]:
+                    j += 1
+                out.extend(l.strip() for l in lines[i:j + 1] if l.strip())
+                i = j + 1; continue
+            m = BLOCK_OPEN.match(line)
+            if m:
+                tag, depth, j = m.group(2), 0, i
+                while j < len(lines):
+                    depth += len(re.findall(rf'<{tag}\b[^>]*(?<!/)>', lines[j])) - len(re.findall(rf'</{tag}\s*>', lines[j]))
+                    if depth <= 0:
+                        break
+                    j += 1
+                if j < len(lines) and re.match(rf'^\s*</{tag}>\s*$', lines[j]) and j > i + 1:
+                    inner = fix_html_blocks('\n'.join(_dedent(lines[i + 1:j])))
+                    pad = m.group(1)
+                    block = [line.strip(), ''] + inner.split('\n') + ['', f'</{tag}>']
+                    out.extend(pad + l if l.strip() else l for l in block)
+                    i = j + 1; continue
+        out.append(line); i += 1
     return '\n'.join(out)
 
 
@@ -133,9 +205,16 @@ def convert_tabs(body):
                 out.append('')
                 continue
             if re.match(r'^\s*</TabItem>\s*$', line) and item is not None:
-                lines = [l for l in item if l.strip()]
+                # Indent is measured outside code fences: code lines may sit left of their fence.
+                lines, inner = [], False
+                for l in item:
+                    if re.match(r'^\s*(```|~~~)', l):
+                        inner = not inner
+                        lines.append(l)
+                    elif l.strip() and not inner:
+                        lines.append(l)
                 ind = min((len(l) - len(l.lstrip()) for l in lines), default=0)
-                out.extend(l[ind:] for l in item)
+                out.extend(l[min(ind, len(l) - len(l.lstrip())):] for l in item)
                 out.extend(['', '</div>'])
                 item = None
                 continue
