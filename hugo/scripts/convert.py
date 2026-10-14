@@ -154,10 +154,12 @@ def page_url(rel_dir, stem, fm, is_index):
     return url.rstrip('/') + '/'
 
 
-def convert_body(body):
+def convert_body(body, srcdir=''):
     # Docusaurus renders ```mdx-code-block fences as live MDX: unwrap them before converting.
     body = re.sub(r'^(`{3,})mdx-code-block[ \t]*\n(.*?)\n\1[ \t]*$', r'\2', body, flags=re.S | re.M)
     body = convert_tabs(body)
+    body = convert_admonition_components(body)
+    body = convert_image_components(body, srcdir)
     body = convert_jsx_attrs(body)
     body = fix_html_blocks(body)
     # Docusaurus code titles (```js title="app.js") become Hugo code block attributes.
@@ -260,6 +262,55 @@ def fix_html_blocks(body):
                     out.extend(pad + l if l.strip() else l for l in block)
                     i = j + 1; continue
         out.append(line); i += 1
+    return '\n'.join(out)
+
+
+def _outside_fences(body, fn):
+    parts = re.split(r'(^\s*(?:`{3,}|~{3,}).*?^\s*(?:`{3,}|~{3,})\s*$)', body, flags=re.S | re.M)
+    for i in range(0, len(parts), 2):
+        parts[i] = fn(parts[i])
+    return ''.join(parts)
+
+
+def convert_image_components(body, srcdir):
+    """@theme/IdealImage <Image img={require('./x.png')} style={{...}}/> and raw <img src="./x.png">
+    -> <img> pointing at the copy under /docsrc/<source dir>/ (relative URLs would resolve against the page URL)."""
+    def asset(path):
+        return '/' + '/'.join(p for p in ('docsrc', srcdir, os.path.normpath(path).replace(os.sep, '/')) if p)
+
+    def image(m):
+        attrs = m.group(1)
+        src = re.search(r'img=\{\s*require\(\s*([\'"])(.*?)\1\s*\)(?:\.default)?\s*\}', attrs)
+        if not src:
+            return m.group(0)
+        style = re.search(r'style=\{\{(.*?)\}\}', attrs, re.S)
+        alt = re.search(r'alt=([\'"])(.*?)\1', attrs)
+        css = _jsx_style(style).replace('style=', ' style=') if style else ''
+        return f'<img src="{asset(src.group(2))}" alt="{alt.group(2) if alt else ""}"{css} loading="lazy">'
+
+    def fix(t):
+        t = re.sub(r'<Image\b((?:[^>{]|\{[^}]*\}\}?)*?)/>', image, t, flags=re.S)
+        return re.sub(r'(<img\b[^>]*?\bsrc=)(["\'])(\.{1,2}/[^"\']+)\2', lambda m: f'{m.group(1)}"{asset(m.group(3))}"', t)
+    return _outside_fences(body, fix)
+
+
+def convert_admonition_components(body):
+    """<Admonition type="tip" title="...">...</Admonition> -> :::tip blocks (dedented inside)."""
+    lines, out, i = body.split('\n'), [], 0
+    while i < len(lines):
+        m = re.match(r'^(\s*)<Admonition\b([^>]*)>\s*$', lines[i])
+        if m:
+            j = next((k for k in range(i + 1, len(lines)) if re.match(r'^\s*</Admonition>\s*$', lines[k])), None)
+            if j is not None:
+                kind = re.search(r'type=([\'"])(\w+)\1', m.group(2))
+                title = re.search(r'title=([\'"])(.*?)\1', m.group(2))
+                out.append(m.group(1) + ':::' + (kind.group(2) if kind else 'note') + (' ' + title.group(2) if title else ''))
+                out.extend(m.group(1) + l if l.strip() else l for l in _dedent(lines[i + 1:j]))
+                out.append(m.group(1) + ':::')
+                i = j + 1
+                continue
+        out.append(lines[i])
+        i += 1
     return '\n'.join(out)
 
 
@@ -376,7 +427,7 @@ def main():
                 if cat.get('label'):
                     new_fm['sidebar_label'] = cat['label']
             name = '_index.md' if is_index else re.sub(r'\.mdx$', '.md', f)
-            text = '---\n' + yaml.safe_dump(new_fm, allow_unicode=True, sort_keys=False) + '---\n\n' + convert_body(body)
+            text = '---\n' + yaml.safe_dump(new_fm, allow_unicode=True, sort_keys=False) + '---\n\n' + convert_body(body, rel_dir)
             open(os.path.join(out_dir, name), 'w', encoding='utf8').write(text)
             if url in urls:
                 print('DUPLICATE URL', url, urls[url], src, file=sys.stderr)
