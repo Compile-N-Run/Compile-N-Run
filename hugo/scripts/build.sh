@@ -10,11 +10,11 @@ rm -rf public
 if [ -n "${SPLIT_SEARCH:-}" ]; then
   "${HUGO:-hugo}" --gc --minify --logLevel warn
   rm -rf search-dist && mkdir -p search-dist
-  ${PAGEFIND:-npx -y pagefind@1.3.0} --site public --output-path search-dist/pagefind
+  ${PAGEFIND:-npx -y pagefind@1.5.2} --site public --output-path search-dist/pagefind
   printf '/*\n  Access-Control-Allow-Origin: *\n  X-Robots-Tag: noindex, nofollow\n' > search-dist/_headers
 else
   HUGO_PARAMS_PAGEFINDBUNDLE=/pagefind/ "${HUGO:-hugo}" --gc --minify --logLevel warn
-  ${PAGEFIND:-npx -y pagefind@1.3.0} --site public
+  ${PAGEFIND:-npx -y pagefind@1.5.2} --site public
 fi
 n=$(find public -name index.html | wc -l)
 echo "built $n pages"
