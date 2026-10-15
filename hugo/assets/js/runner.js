@@ -13,9 +13,69 @@
   var MAX_ROWS = 200;
   var path = location.pathname;
 
+  /* ---------- Text (English, or Chinese on pages with <html lang="zh-…">; the same file serves both sites) ---------- */
+  var STRINGS = {
+    en: {
+      run: 'Run', stop: 'Stop', preview: 'Preview', edit: 'Edit', doneEditing: 'Done editing', editTitle: 'Edit this example, then run it',
+      undo: 'Undo edits', output: 'Output', clear: 'Clear', restartPython: 'Restart Python', resetDb: 'Reset database',
+      runLabel: 'Run this example', stopLabel: 'Stop the example', stdin: 'Program input: one line per input() call', stdinLabel: 'Program input',
+      inBrowser: 'runs in your browser', mysqlLike: 'SQLite (close to MySQL)', jsHtml: 'JavaScript + the HTML example above', jsPage: 'JavaScript + page preview',
+      htmlPreview: 'HTML preview', previewTitle: 'Preview of the example', plotAlt: 'Plot produced by the example',
+      loadPython: 'Loading Python… the first run downloads about 10 MB.', loadTs: 'Loading the TypeScript compiler… the first run downloads about 3 MB.',
+      loadPhp: 'Loading PHP… the first run downloads about 3 MB.', loadPg: 'Starting PostgreSQL in your browser…', loadSqlite: 'Loading SQLite…',
+      noOutput: '(no output)', done: 'Done.', rowsAffected: function (n) { return ' ' + n + (n === 1 ? ' row' : ' rows') + ' affected.'; },
+      rows: function (n) { return n + (n === 1 ? ' row' : ' rows'); }, showingRows: function (a, b) { return 'Showing ' + a + ' of ' + b + ' rows'; },
+      cutOff: '\n… output cut off here.\n', stopped: 'Stopped.', stoppedAfter: function (s) { return 'Stopped after ' + s + ' seconds.'; },
+      stoppedPython: 'Stopped. Python was restarted, so earlier examples need to be run again.',
+      download: function (f) { return 'Could not download ' + f + '. Check your connection or ad blocker.'; },
+      startFail: function (what, why) { return 'Could not start ' + what + ' (' + why + '). Check your connection or ad blocker.'; },
+      startFailShort: function (what, why) { return 'Could not start ' + what + ': ' + why; }, downloadFailed: 'download failed',
+      tsLoadFail: function (why) { return 'Could not load the TypeScript compiler (' + why + ').'; },
+      typeErrors: 'Type errors (the code still runs, as with tsc):',
+      earlier: function (i, n) { return 'Running earlier example ' + i + ' of ' + n + '…'; },
+      runDefiner: function (name) { return 'Run the example above that defines ' + name + ' first'; },
+      runAbove: function (n) { return 'Run the ' + (n === 1 ? 'example' : n + ' examples') + ' above first, then this one'; },
+      resetAgain: 'Reset the database and run this again',
+      hintName: 'Hint: examples on this page share one Python session. Something this example uses may be defined in an earlier one.',
+      hintInput: 'Hint: this program reads input. Type it in the "Program input" box, one line per input() call.',
+      hintModule: 'Hint: this module is not available in the in-browser Python. Run the example on your computer instead.',
+      hintTable: 'Hint: all SQL examples on this page share one database in your browser. The table may be created by an earlier example.',
+      hintSqlite: function (db) { return 'Note: this runs on SQLite, so some ' + db + '-specific syntax is not supported.'; }
+    },
+    zh: {
+      run: '运行', stop: '停止', preview: '预览', edit: '编辑', doneEditing: '完成编辑', editTitle: '修改这个示例，然后运行',
+      undo: '撤销修改', output: '输出', clear: '清除', restartPython: '重启 Python', resetDb: '重置数据库',
+      runLabel: '运行这个示例', stopLabel: '停止运行', stdin: '程序输入：每次调用 input() 读取一行', stdinLabel: '程序输入',
+      inBrowser: '在浏览器中运行', mysqlLike: 'SQLite（接近 MySQL）', jsHtml: 'JavaScript + 上方的 HTML 示例', jsPage: 'JavaScript + 页面预览',
+      htmlPreview: 'HTML 预览', previewTitle: '示例预览', plotAlt: '示例生成的图表',
+      loadPython: '正在加载 Python…首次运行需要下载约 10 MB。', loadTs: '正在加载 TypeScript 编译器…首次运行需要下载约 3 MB。',
+      loadPhp: '正在加载 PHP…首次运行需要下载约 3 MB。', loadPg: '正在浏览器中启动 PostgreSQL…', loadSqlite: '正在加载 SQLite…',
+      noOutput: '（没有输出）', done: '执行完成。', rowsAffected: function (n) { return '影响了 ' + n + ' 行。'; },
+      rows: function (n) { return '共 ' + n + ' 行'; }, showingRows: function (a, b) { return '显示 ' + b + ' 行中的前 ' + a + ' 行'; },
+      cutOff: '\n…输出过长，已截断。\n', stopped: '已停止。', stoppedAfter: function (s) { return '运行超过 ' + s + ' 秒，已停止。'; },
+      stoppedPython: '已停止。Python 已重启，前面的示例需要重新运行。',
+      download: function (f) { return '无法下载 ' + f + '。请检查网络连接或广告拦截插件。'; },
+      startFail: function (what, why) { return '无法启动 ' + what + '（' + why + '）。请检查网络连接或广告拦截插件。'; },
+      startFailShort: function (what, why) { return '无法启动 ' + what + '：' + why; }, downloadFailed: '下载失败',
+      tsLoadFail: function (why) { return '无法加载 TypeScript 编译器（' + why + '）。'; },
+      typeErrors: '类型错误（和 tsc 一样，代码仍会运行）：',
+      earlier: function (i, n) { return '正在运行前面的示例（' + i + ' / ' + n + '）…'; },
+      runDefiner: function (name) { return '先运行上方定义 ' + name + ' 的示例'; },
+      runAbove: function (n) { return '先运行上方的 ' + n + ' 个示例，再运行这个'; },
+      resetAgain: '重置数据库并重新运行',
+      hintName: '提示：本页的示例共用一个 Python 会话，这个示例用到的内容可能定义在前面的示例中。',
+      hintInput: '提示：这个程序需要输入。请在“程序输入”框中输入，每次调用 input() 读取一行。',
+      hintModule: '提示：浏览器中的 Python 没有这个模块，请在自己的电脑上运行这个示例。',
+      hintTable: '提示：本页所有 SQL 示例共用浏览器中的同一个数据库，这张表可能由前面的示例创建。',
+      hintSqlite: function (db) { return '注意：这里使用 SQLite 运行，部分 ' + db + ' 特有的语法不受支持。'; }
+    }
+  };
+  var T = STRINGS[/^zh/i.test(document.documentElement.lang) ? 'zh' : 'en'];
+
   /* ---------- Which blocks get a Run button ---------- */
   var LANGS = { python: 'python', py: 'python', python3: 'python', javascript: 'js', js: 'js', sql: 'sql', typescript: 'ts', ts: 'ts', php: 'php', html: 'html' };
-  var SQL_PAGES = /^\/docs\/(language\/sql|database\/(postgresql|mysql)|fundamental\/(database|interview))\//;
+  // compilenrun.com has language/sql; echo.cool has database/sql.
+  var SQL_PAGES = /^\/docs\/(language\/sql|database\/(sql|postgresql|mysql)|fundamental\/(database|interview))\//;
   var postgres = /^\/docs\/database\/postgresql\//.test(path);
   var mysql = /^\/docs\/database\/mysql\//.test(path);
   // Things the in-browser runtimes cannot do: servers, frameworks, GPUs, sockets, threads, other processes.
@@ -46,6 +106,8 @@
       if (!SQL_PAGES.test(path) || SQL_NO.test(code)) return false;
       // Syntax templates such as "SELECT column1, ... FROM table_name WHERE condition;"
       if (/\.\.\.|…|\b(?:column_?\d|column_name|table_name|condition)\b|<\w+>|\[\s*(?:WHERE|AND|OR|ORDER|LIMIT|AS|NOT|ASC|DESC|,)/i.test(code)) return false;
+      // ...or with Chinese placeholders (表1, 列名) outside strings and comments, as on echo.cool.
+      if (/[\u3400-\u9fff]/.test(code.replace(/'[^']*'|"[^"]*"|--.*$|\/\*[\s\S]*?\*\//gm, ''))) return false;
       if (!postgres && /\$\$|\bLANGUAGE\s+plpgsql\b|\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:PROCEDURE|FUNCTION)\b/i.test(code)) return false;
       return /\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|WITH|ALTER|DROP)\b/i.test(code);
     }
@@ -82,7 +144,7 @@
       s.src = src;
       s.async = true;
       s.onload = ok;
-      s.onerror = function () { fail(new Error('Could not download ' + src.replace(/^https:\/\/[^/]+/, '') + '. Check your connection or ad blocker.')); };
+      s.onerror = function () { fail(new Error(T.download(src.replace(/^https:\/\/[^/]+/, '')))); };
       document.head.appendChild(s);
     });
   }
@@ -137,7 +199,7 @@
   function pythonRun(code, ui) {
     if (!pyWorker) { pyWorker = blobWorker(PY_WORKER_SRC); pyLoaded = false; }
     var w = pyWorker;
-    if (!pyLoaded) ui.status('Loading Python… the first run downloads about 10 MB.');
+    if (!pyLoaded) ui.status(T.loadPython);
     return new Promise(function (ok) {
       w.onmessage = function (e) {
         var d = e.data;
@@ -147,13 +209,13 @@
         else if (d.type === 'done') { (d.images || []).forEach(ui.image); ok(); }
         else if (d.type === 'error') {
           if (ui.newline) ui.newline();
-          ui.write(pyLoaded ? pythonError(d.text) : 'Could not start Python: ' + d.text, true);
+          ui.write(pyLoaded ? pythonError(d.text) : T.startFailShort('Python', d.text), true);
           if (!pyLoaded) pythonStop();
           ok({ missing: /\nNameError: /.test(d.text) });
         }
       };
-      w.onerror = function (e) { e.preventDefault(); ui.write(pyLoaded ? String(e.message) : 'Could not start Python (' + (e.message || 'download failed') + '). Check your connection or ad blocker.', true); pythonStop(); ok(); };
-      ui.onStop = function () { pythonStop(); ui.write('\nStopped. Python was restarted, so earlier examples need to be run again.', true); ok(); };
+      w.onerror = function (e) { e.preventDefault(); ui.write(pyLoaded ? String(e.message) : T.startFail('Python', e.message || T.downloadFailed), true); pythonStop(); ok(); };
+      ui.onStop = function () { pythonStop(); ui.write('\n' + T.stoppedPython, true); ok(); };
       w.postMessage({ code: code, stdin: ui.stdin() });
     });
   }
@@ -165,9 +227,9 @@
     while (i < lines.length && lines[i].indexOf('File "<example>"') < 0) i++;
     var tb = i < lines.length ? ['Traceback (most recent call last):'].concat(lines.slice(i)) : lines;
     var last = tb[tb.length - 1];
-    if (/^NameError/.test(last)) tb.push('', 'Hint: examples on this page share one Python session. Something this example uses may be defined in an earlier one.');
-    else if (/^EOFError/.test(last)) tb.push('', 'Hint: this program reads input. Type it in the "Program input" box, one line per input() call.');
-    else if (/^ModuleNotFoundError/.test(last)) tb.push('', 'Hint: this module is not available in the in-browser Python. Run the example on your computer instead.');
+    if (/^NameError/.test(last)) tb.push('', T.hintName);
+    else if (/^EOFError/.test(last)) tb.push('', T.hintInput);
+    else if (/^ModuleNotFoundError/.test(last)) tb.push('', T.hintModule);
     return tb.join('\n');
   }
 
@@ -299,8 +361,8 @@
         else if (d.type === 'done') end();
       };
       w.onerror = function (e) { e.preventDefault(); end(String(e.message)); };
-      ui.onStop = function () { end('\nStopped.'); };
-      timer = setTimeout(function () { end('\nStopped after ' + JS_TIMEOUT / 1000 + ' seconds.'); }, JS_TIMEOUT);
+      ui.onStop = function () { end('\n' + T.stopped); };
+      timer = setTimeout(function () { end('\n' + T.stoppedAfter(JS_TIMEOUT / 1000)); }, JS_TIMEOUT);
       w.postMessage({ code: code, prelude: prelude || [] });
     });
   }
@@ -365,16 +427,16 @@
   function tsRun(code, ui, prelude) {
     if (!tsWorker) { tsWorker = blobWorker(TS_WORKER_SRC); tsLoaded = false; }
     var w = tsWorker, stopped = false;
-    if (!tsLoaded) ui.status('Loading the TypeScript compiler… the first run downloads about 3 MB.');
+    if (!tsLoaded) ui.status(T.loadTs);
     ui.onStop = function () { stopped = true; w.terminate(); tsWorker = null; };
     return new Promise(function (ok) {
       w.onmessage = function (e) { tsLoaded = true; ok(e.data); };
-      w.onerror = function (e) { e.preventDefault(); w.terminate(); tsWorker = null; ok({ js: '', prelude: [], errors: ['Could not load the TypeScript compiler (' + (e.message || 'download failed') + ').'] }); };
+      w.onerror = function (e) { e.preventDefault(); w.terminate(); tsWorker = null; ok({ js: '', prelude: [], errors: [T.tsLoadFail(e.message || T.downloadFailed)] }); };
       w.postMessage({ code: tsSource(code), prelude: (prelude || []).map(tsSource) });
     }).then(function (r) {
       ui.status('');
-      if (stopped) { ui.write('Stopped.\n', true); return { names: [] }; }
-      if (r.errors.length) ui.write('Type errors (the code still runs, as with tsc):\n' + r.errors.join('\n') + '\n\n', true);
+      if (stopped) { ui.write(T.stopped + '\n', true); return { names: [] }; }
+      if (r.errors.length) ui.write(T.typeErrors + '\n' + r.errors.join('\n') + '\n\n', true);
       if (!r.js) return { names: [] };
       return jsRun(r.js, ui, r.prelude);
     });
@@ -403,7 +465,7 @@
     var w = phpWorker, text = '';
     if (!/<\?(?:php|=)/.test(code)) code = '<?php\n' + code;
     if (prelude && prelude.length) code = '<?php ob_start();\n' + prelude.map(phpBody).join('\n') + '\nob_end_clean(); ?>' + code;
-    if (!phpLoaded) ui.status('Loading PHP… the first run downloads about 3 MB.');
+    if (!phpLoaded) ui.status(T.loadPhp);
     return new Promise(function (ok) {
       var end = function (note) {
         // PHP prints errors into the output; show them in red, with "your code" for php-wasm's script name.
@@ -422,8 +484,8 @@
         else if (d.type === 'done') end();
         else if (d.type === 'fatal') end('\n' + d.text);
       };
-      w.onerror = function (e) { e.preventDefault(); w.terminate(); phpWorker = null; end('Could not start PHP (' + (e.message || 'download failed') + '). Check your connection or ad blocker.'); };
-      ui.onStop = function () { w.terminate(); phpWorker = null; end('\nStopped.'); };
+      w.onerror = function (e) { e.preventDefault(); w.terminate(); phpWorker = null; end(T.startFail('PHP', e.message || T.downloadFailed)); };
+      ui.onStop = function () { w.terminate(); phpWorker = null; end('\n' + T.stopped); };
       w.postMessage(code);
     });
   }
@@ -466,7 +528,7 @@
     return new Promise(function (ok) {
       var frame = el('iframe', 'cnr-run__frame');
       frame.setAttribute('sandbox', 'allow-scripts allow-modals allow-forms');
-      frame.setAttribute('title', 'Preview of the example');
+      frame.setAttribute('title', T.previewTitle);
       var listen = function (e) {
         if (!frame.isConnected) { window.removeEventListener('message', listen); return; }
         if (e.source !== frame.contentWindow || !e.data || !e.data.cnrRun) return;
@@ -495,7 +557,7 @@
   var sqlDb = null;
   function sqlOpen(ui) {
     if (!sqlDb) {
-      ui.status(postgres ? 'Starting PostgreSQL in your browser…' : 'Loading SQLite…');
+      ui.status(postgres ? T.loadPg : T.loadSqlite);
       sqlDb = postgres
         ? import(PGLITE).then(function (m) { var db = new m.PGlite(); return db.waitReady.then(function () { return db; }); })
         : loadScript(SQLJS + 'sql-wasm.js').then(function () { return window.initSqlJs({ locateFile: function (f) { return SQLJS + f; } }); })
@@ -533,7 +595,7 @@
             if (r.fields && r.fields.length) { ui.table(r.fields.map(function (f) { return f.name; }), r.rows); shown++; }
             else changed += r.affectedRows || 0;
           });
-          if (!shown) ui.write('Done.' + (changed ? ' ' + changed + ' row' + (changed === 1 ? '' : 's') + ' affected.' : '') + '\n');
+          if (!shown) ui.write(T.done + (changed ? T.rowsAffected(changed) : '') + '\n');
         }, function (err) { ui.write(sqlError(err), true); return { missing: missingTable(err), exists: /already exists/i.test(err.message) }; });
       }
       var shown = 0, changed = 0;
@@ -544,7 +606,7 @@
           st.free();
           if (cols.length) { ui.table(cols, rows); shown++; } else changed += db.getRowsModified();
         }
-        if (!shown) ui.write('Done.' + (changed ? ' ' + changed + ' row' + (changed === 1 ? '' : 's') + ' affected.' : '') + '\n');
+        if (!shown) ui.write(T.done + (changed ? T.rowsAffected(changed) : '') + '\n');
       } catch (err) {
         ui.write(sqlError(err), true);
         return { missing: missingTable(err), exists: /already exists/i.test(err.message) };
@@ -554,8 +616,8 @@
   function missingTable(err) { return /no such table|relation .* does not exist/i.test(String((err && err.message) || err)); }
   function sqlError(err) {
     var msg = 'Error: ' + String((err && err.message) || err);
-    if (missingTable(err)) msg += '\n\nHint: all SQL examples on this page share one database in your browser. The table may be created by an earlier example.';
-    else if (!postgres && /syntax error|no such function/i.test(msg)) msg += '\n\nNote: this runs on SQLite, so some ' + (mysql ? 'MySQL' : 'database') + '-specific syntax is not supported.';
+    if (missingTable(err)) msg += '\n\n' + T.hintTable;
+    else if (!postgres && /syntax error|no such function/i.test(msg)) msg += '\n\n' + T.hintSqlite(mysql ? 'MySQL' : 'database');
     return msg;
   }
   function sqlReset() {
@@ -567,18 +629,18 @@
 
   /* ---------- UI ---------- */
   var ENGINES = {
-    python: 'Python 3.13 · runs in your browser',
-    js: 'JavaScript · runs in your browser',
-    ts: 'TypeScript 6 · runs in your browser',
-    php: 'PHP 8.4 · runs in your browser',
-    html: 'HTML preview · runs in your browser',
-    dom: 'JavaScript + page preview · runs in your browser',
-    sql: postgres ? 'PostgreSQL · runs in your browser' : mysql ? 'SQLite (close to MySQL) · runs in your browser' : 'SQLite · runs in your browser'
+    python: 'Python 3.13 · ' + T.inBrowser,
+    js: 'JavaScript · ' + T.inBrowser,
+    ts: 'TypeScript 6 · ' + T.inBrowser,
+    php: 'PHP 8.4 · ' + T.inBrowser,
+    html: T.htmlPreview + ' · ' + T.inBrowser,
+    dom: T.jsPage + ' · ' + T.inBrowser,
+    sql: (postgres ? 'PostgreSQL' : mysql ? T.mysqlLike : 'SQLite') + ' · ' + T.inBrowser
   };
   var RUNNERS = { python: pythonRun, js: jsRun, sql: sqlRun, ts: tsRun, php: phpRun };
   // Examples whose missing names can be looked up in the examples above (the others share one session instead).
   var NAMED = { js: 1, ts: 1, php: 1 };
-  var RESTART = { python: ['Restart Python', pythonStop], sql: ['Reset database', sqlReset] };
+  var RESTART = { python: [T.restartPython, pythonStop], sql: [T.resetDb, sqlReset] };
   var icons = {
     run: '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>',
     stop: '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M6 6h12v12H6z"/></svg>'
@@ -598,36 +660,36 @@
     var tools = el('div', 'cnr-run__bar');
     var go = el('button', 'cnr-run__go');
     go.type = 'button';
-    var edit = el('button', 'cnr-run__btn', 'Edit');
+    var edit = el('button', 'cnr-run__btn', T.edit);
     edit.type = 'button';
-    edit.title = 'Edit this example, then run it';
-    var reset = el('button', 'cnr-run__btn', 'Undo edits');
+    edit.title = T.editTitle;
+    var reset = el('button', 'cnr-run__btn', T.undo);
     reset.type = 'button';
     reset.hidden = true;
     var engine = el('span', 'cnr-run__engine', ENGINES[kind]);
-    if (kind === 'dom' && page && page.html) engine.textContent = 'JavaScript + the HTML example above · runs in your browser';
+    if (kind === 'dom' && page && page.html) engine.textContent = T.jsHtml + ' · ' + T.inBrowser;
     tools.append(go, edit, reset, engine);
     bar.appendChild(tools);
     var stdinBox = null;
     if (kind === 'python' && /\binput\s*\(/.test(code.textContent)) {
       stdinBox = el('textarea', 'cnr-run__stdin');
       stdinBox.rows = 2;
-      stdinBox.placeholder = 'Program input: one line per input() call';
-      stdinBox.setAttribute('aria-label', 'Program input');
+      stdinBox.placeholder = T.stdin;
+      stdinBox.setAttribute('aria-label', T.stdinLabel);
       bar.appendChild(stdinBox);
     }
     var out = el('div', 'cnr-run__out');
     out.hidden = true;
     out.setAttribute('aria-live', 'polite');
     var head = el('div', 'cnr-run__head');
-    head.appendChild(el('span', null, 'Output'));
+    head.appendChild(el('span', null, T.output));
     if (RESTART[kind]) {
       var restart = el('button', 'cnr-run__link', RESTART[kind][0]);
       restart.type = 'button';
       restart.onclick = function () { if (!busy) { RESTART[kind][1](); clearOut(); } };
       head.appendChild(restart);
     }
-    var close = el('button', 'cnr-run__link', 'Clear');
+    var close = el('button', 'cnr-run__link', T.clear);
     close.type = 'button';
     close.onclick = function () { if (busy !== ui) clearOut(); };
     head.appendChild(close);
@@ -649,7 +711,7 @@
       write: function (text, isErr) {
         if (!text || size > MAX_OUTPUT) return;
         size += text.length;
-        if (size > MAX_OUTPUT) text = text.slice(0, Math.max(0, text.length - (size - MAX_OUTPUT))) + '\n… output cut off here.\n';
+        if (size > MAX_OUTPUT) text = text.slice(0, Math.max(0, text.length - (size - MAX_OUTPUT))) + T.cutOff;
         // Consecutive writes of the same kind share one node.
         if (!lastText || lastText.err !== !!isErr || lastText.node.parentNode !== pre) {
           var node = isErr ? el('span', 'cnr-run__err') : document.createTextNode('');
@@ -678,11 +740,11 @@
         });
         wrap.appendChild(t);
         extra.appendChild(wrap);
-        extra.appendChild(el('div', 'cnr-run__rows', rows.length > MAX_ROWS ? 'Showing ' + MAX_ROWS + ' of ' + rows.length + ' rows' : rows.length + ' row' + (rows.length === 1 ? '' : 's')));
+        extra.appendChild(el('div', 'cnr-run__rows', rows.length > MAX_ROWS ? T.showingRows(MAX_ROWS, rows.length) : T.rows(rows.length)));
       },
       image: function (b64) {
         var img = el('img');
-        img.alt = 'Plot produced by the example';
+        img.alt = T.plotAlt;
         img.src = 'data:image/png;base64,' + b64;
         extra.appendChild(img);
       },
@@ -697,9 +759,9 @@
 
     function paintGo() {
       var running = busy === ui;
-      go.innerHTML = (running ? icons.stop + '<span>Stop</span>' : icons.run + '<span>' + (kind === 'html' ? 'Preview' : 'Run') + '</span>');
+      go.innerHTML = (running ? icons.stop + '<span>' + T.stop + '</span>' : icons.run + '<span>' + (kind === 'html' ? T.preview : T.run) + '</span>');
       go.classList.toggle('cnr-run__go--stop', running);
-      go.setAttribute('aria-label', running ? 'Stop the example' : 'Run this example');
+      go.setAttribute('aria-label', running ? T.stopLabel : T.runLabel);
     }
     // withEarlier: first run the examples above this one quietly (their output is not shown).
     function run(withEarlier) {
@@ -740,14 +802,14 @@
         steps = steps.then(function () {
           if (stopped) return;
           var quiet = { onStop: null, stdin: function () { return ''; }, status: noop, write: noop, table: noop, image: noop };
-          ui.status('Running earlier example ' + (i + 1) + ' of ' + earlier.length + '…');
+          ui.status(T.earlier(i + 1, earlier.length));
           var p = RUNNERS[kind](codeText(c), quiet);
           ui.onStop = function () { stopped = true; if (quiet.onStop) quiet.onStop(); };
           return p;
         });
       });
       finish(steps.then(function () {
-        if (stopped) { ui.write('Stopped.\n', true); return; }
+        if (stopped) { ui.write(T.stopped + '\n', true); return; }
         ui.status('');
         ui.onStop = null;
         return RUNNERS[kind](codeText(code), ui);
@@ -755,15 +817,15 @@
       function finish(p) {
         p.catch(function (e) { ui.write(String((e && e.message) || e), true); }).then(function (res) {
           ui.status('');
-          if (!pre.textContent && !extra.firstChild) ui.write(kind === 'sql' ? 'Done.\n' : '(no output)\n');
+          if (!pre.textContent && !extra.firstChild) ui.write((kind === 'sql' ? T.done : T.noOutput) + '\n');
           var again = function () { run(true); };
           if (withEarlier !== true && res) {
             var n = earlier.length;
             var found = NAMED[kind] && res.names ? res.names.filter(definer) : [];
-            if (found.length) ui.action('Run the example above that defines ' + found[0] + ' first', again);
-            else if (res.missing && n && !NAMED[kind]) ui.action('Run the ' + (n === 1 ? 'example' : n + ' examples') + ' above first, then this one', again);
+            if (found.length) ui.action(T.runDefiner(found[0]), again);
+            else if (res.missing && n && !NAMED[kind]) ui.action(T.runAbove(n), again);
           }
-          if (res && res.exists) ui.action('Reset the database and run this again', function () { sqlReset(); run(withEarlier); });
+          if (res && res.exists) ui.action(T.resetAgain, function () { sqlReset(); run(withEarlier); });
           busy = null;
           document.dispatchEvent(new Event('cnr-run-busy'));
         });
@@ -788,7 +850,7 @@
         code.focus();
       } else code.removeAttribute('contenteditable');
       block.classList.toggle('cnr-editing', on);
-      edit.textContent = on ? 'Done editing' : 'Edit';
+      edit.textContent = on ? T.doneEditing : T.edit;
     };
     code.addEventListener('input', function () { reset.hidden = false; });
     code.addEventListener('keydown', function (e) {
