@@ -317,9 +317,9 @@
 
     // Turnstile: rendered (interaction-only, so usually invisible) when the panel first opens. Each question
     // spends one token; the widget is then reset to fetch the next one.
-    var ts = { id: null, token: null, waiting: [] };
-    var tsGive = function (t) { ts.token = t; if (t) { ts.waiting.splice(0).forEach(function (w) { w.ok(t); }); } };
-    var tsFail = function (msg) { ts.waiting.splice(0).forEach(function (w) { w.fail(new Error(msg)); }); };
+    var ts = { id: null, token: null, error: null, waiting: [] };
+    var tsGive = function (t) { ts.token = t; ts.error = null; if (t) { ts.waiting.splice(0).forEach(function (w) { w.ok(t); }); } };
+    var tsFail = function (msg) { ts.error = msg; ts.waiting.splice(0).forEach(function (w) { w.fail(new Error(msg)); }); };
     var tsLoad = function () {
       if (ts.loading || !askSitekey) return;
       ts.loading = true;
@@ -331,7 +331,8 @@
           action: 'ask-ai',
           callback: tsGive,
           'expired-callback': function () { ts.token = null; window.turnstile.reset(ts.id); },
-          'error-callback': function () { ts.token = null; tsFail('Human verification failed. Please reload the page and try again.'); return true; }
+          // Turnstile retries on its own after an error; tell anyone waiting now instead of after the timeout.
+          'error-callback': function () { ts.token = null; tsFail('Human verification failed. Please complete the check below, or reload the page, and ask again.'); }
         });
       };
       var sc = document.createElement('script');
@@ -344,6 +345,7 @@
       if (!askSitekey) return Promise.resolve('');
       tsLoad();
       if (ts.token) { var t = ts.token; ts.token = null; return Promise.resolve(t); }
+      if (ts.error) return Promise.reject(new Error(ts.error));
       return new Promise(function (ok, fail) {
         var w = { ok: function (t) { clearTimeout(timer); ts.token = null; ok(t); }, fail: function (e) { clearTimeout(timer); fail(e); } };
         var timer = setTimeout(function () {
