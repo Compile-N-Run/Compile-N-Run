@@ -15,6 +15,10 @@
     var frame = document.querySelector('iframe.giscus-frame');
     if (frame) frame.contentWindow.postMessage({ giscus: { setConfig: { theme: giscusTheme() } } }, 'https://giscus.app');
   }
+  // Follow the OS switching between light and dark while the page is open, unless the reader picked a mode.
+  var darkQuery = matchMedia('(prefers-color-scheme: dark)');
+  var onSystemTheme = function () { if (root.getAttribute('data-theme-choice') === 'system') setTheme('system'); };
+  if (darkQuery.addEventListener) darkQuery.addEventListener('change', onSystemTheme); else if (darkQuery.addListener) darkQuery.addListener(onSystemTheme);
   document.querySelectorAll('[data-toggle-theme]').forEach(function (b) {
     b.addEventListener('click', function () {
       var next = { system: 'light', light: 'dark', dark: 'system' };
