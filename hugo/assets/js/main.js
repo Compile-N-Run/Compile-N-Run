@@ -576,8 +576,9 @@
 
     var intro = function () {
       log.innerHTML = '<div class="cnr-ask__intro"><p>Hi! Ask me anything about <strong>' + esc(document.title.replace(/\s*\|\s*Compile N Run\s*$/, '')) + '</strong>.</p>' +
+        '<button type="button" class="cnr-ask__chip cnr-ask__chip--quiz" data-ask-quiz>🧠 Quiz me on this page</button>' +
         suggestions.map(function (s) { return '<button type="button" class="cnr-ask__chip">' + esc(s) + '</button>'; }).join('') + '</div>';
-      log.querySelectorAll('.cnr-ask__chip').forEach(function (b) { b.onclick = function () { ask(b.textContent); }; });
+      log.querySelectorAll('.cnr-ask__chip').forEach(function (b) { b.onclick = function () { if (b.hasAttribute('data-ask-quiz')) quiz(); else ask(b.textContent); }; });
     };
     var addMsg = function (role, html) {
       var intro = log.querySelector('.cnr-ask__intro');
@@ -647,6 +648,86 @@
       }).then(function () { setBusy(null); if (!panel.hidden) box.focus(); });
     };
 
+    /* "Quiz me": the Worker writes (or returns the cached) multiple-choice quiz for this page; answers are
+       checked here. Best scores are kept in this browser. */
+    var quizEndpoint = askEndpoint.replace(/\/ask$/, '/quiz');
+    var quizRound = 0;
+    var QKEY = 'cnr_quiz';
+    var quiz = function () {
+      if (busy) return;
+      addMsg('user', '🧠 Quiz me on this page');
+      var out = addMsg('ai', '<span class="cnr-ask__typing"><i></i><i></i><i></i></span><div class="cnr-ask__wait">Preparing your quiz… a brand-new one can take up to half a minute.</div>');
+      setBusy(true);
+      var round = quizRound++;
+      tsToken().then(function (token) {
+        tsNext();
+        return fetch(quizEndpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: location.pathname, round: round, turnstile: token }) });
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (j) {
+          if (!res.ok || !j.questions || !j.questions.length) throw new Error(j.error || 'Could not load a quiz. Please try again.');
+          return j;
+        });
+      }).then(function (data) {
+        playQuiz(out, data.questions);
+      }).catch(function (e) {
+        out.classList.add('cnr-ask__msg--error');
+        out.textContent = (e && e.message) || 'Could not load a quiz. Please try again.';
+      }).then(function () { setBusy(null); });
+    };
+    var playQuiz = function (out, qs) {
+      var i = 0, score = 0, picks = [];
+      out.classList.add('cnr-ask__msg--quiz');
+      var show = function () {
+        var q = qs[i];
+        out.innerHTML = '<div class="cnr-quiz"><div class="cnr-quiz__count">Question ' + (i + 1) + ' of ' + qs.length + '</div>' +
+          '<p class="cnr-quiz__q">' + inline(q.question) + '</p>' +
+          (q.code ? '<pre><code>' + esc(q.code) + '</code></pre>' : '') +
+          '<div class="cnr-quiz__opts" role="group" aria-label="Answers">' + q.options.map(function (o, k) {
+            return '<button type="button" class="cnr-quiz__opt" data-k="' + k + '"><b>' + 'ABCD'[k] + '</b><span>' + (/\n/.test(o) ? '<code class="cnr-quiz__multi">' + esc(o) + '</code>' : inline(o)) + '</span></button>';
+          }).join('') + '</div><div class="cnr-quiz__result" aria-live="polite"></div></div>';
+        out.querySelectorAll('.cnr-quiz__opt').forEach(function (b) { b.onclick = function () { pick(Number(b.getAttribute('data-k'))); }; });
+        var top = out.offsetTop - log.offsetTop - 8;
+        if (log.scrollTop > top || log.scrollTop + log.clientHeight < top + 80) log.scrollTop = top;
+      };
+      var pick = function (k) {
+        var q = qs[i], right = k === q.answer;
+        if (right) score++;
+        picks.push(k);
+        out.querySelectorAll('.cnr-quiz__opt').forEach(function (b) {
+          var n = Number(b.getAttribute('data-k'));
+          b.disabled = true;
+          if (n === q.answer) b.classList.add('cnr-quiz__opt--right');
+          else if (n === k) b.classList.add('cnr-quiz__opt--wrong');
+        });
+        var last = i === qs.length - 1;
+        out.querySelector('.cnr-quiz__result').innerHTML = '<p><strong>' + (right ? '✅ Correct!' : '❌ Not quite. The answer is ' + 'ABCD'[q.answer] + '.') + '</strong> ' + inline(q.explanation) + '</p>' +
+          '<button type="button" class="cnr-quiz__next">' + (last ? 'See my score' : 'Next question →') + '</button>';
+        var next = out.querySelector('.cnr-quiz__next');
+        next.onclick = function () { if (last) finish(); else { i++; show(); } };
+        next.focus();
+        log.scrollTop = Math.max(log.scrollTop, out.offsetTop - log.offsetTop + out.offsetHeight - log.clientHeight + 8);
+      };
+      var finish = function () {
+        var pct = score / qs.length;
+        var best = {};
+        try { best = JSON.parse(store.get(QKEY) || '{}') || {}; } catch (e) {}
+        var prev = best[location.pathname];
+        if (!prev || score / prev.total > prev.score / prev.total) { best[location.pathname] = { score: score, total: qs.length, t: Date.now() }; store.set(QKEY, JSON.stringify(best)); }
+        out.innerHTML = '<div class="cnr-quiz cnr-quiz--done"><div class="cnr-quiz__score">' + (pct === 1 ? '🏆' : pct >= 0.6 ? '🎉' : '📚') + ' ' + score + ' / ' + qs.length + '</div>' +
+          '<p>' + (pct === 1 ? 'Perfect score! You know this page well.' : pct >= 0.6 ? 'Nice work. Review the questions you missed below.' : 'Worth another read. The questions you missed point to the parts to review.') + '</p>' +
+          '<ol class="cnr-quiz__review">' + qs.map(function (q, n) {
+            return '<li class="' + (picks[n] === q.answer ? 'is-right' : 'is-wrong') + '">' + inline(q.question) + '<br><span>' + (picks[n] === q.answer ? '✅ ' : '❌ You picked ' + 'ABCD'[picks[n]] + '. ') + 'Answer: ' + 'ABCD'[q.answer] + ') ' + (/\n/.test(q.options[q.answer]) ? '' : inline(q.options[q.answer])) + '</span></li>';
+          }).join('') + '</ol><button type="button" class="cnr-quiz__next" data-again>Try another quiz</button></div>';
+        out.querySelector('[data-again]').onclick = quiz;
+        // Follow-up questions in the chat ("why is question 2 B?") can see the quiz.
+        chat.push({ role: 'user', content: 'Quiz me on this page.' }, { role: 'assistant', content: 'Quiz (score ' + score + '/' + qs.length + '):\n' + qs.map(function (q, n) {
+          return (n + 1) + '. ' + q.question + (q.code ? '\n' + q.code : '') + '\n' + q.options.map(function (o, k) { return 'ABCD'[k] + ') ' + o; }).join('\n') + '\nCorrect: ' + 'ABCD'[q.answer] + '. Reader picked: ' + 'ABCD'[picks[n]] + '.';
+        }).join('\n\n') });
+        log.scrollTop = out.offsetTop - log.offsetTop - 8;
+      };
+      show();
+    };
+
     var openAsk = function () {
       panel.hidden = false;
       askBtn.hidden = true;
@@ -665,6 +746,11 @@
       askBtn.focus();
     };
     askBtn.onclick = openAsk;
+    // "Quiz me" under the tutorial opens the chat and starts a quiz.
+    document.querySelectorAll('[data-quiz]').forEach(function (b) {
+      b.hidden = false;
+      b.onclick = function () { openAsk(); quiz(); };
+    });
     panel.querySelector('[data-ask-close]').onclick = closeAsk;
     panel.querySelector('[data-ask-reset]').onclick = function () {
       if (busy && busy.abort) busy.abort();

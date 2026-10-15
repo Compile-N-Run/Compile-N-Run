@@ -11,6 +11,18 @@ Limits, so the free 10,000 Neurons/day are not exceeded (~8–12 Neurons per ans
 - A Cloudflare Turnstile token with every question (site key in `hugo/hugo.toml`, secret in the `TURNSTILE_SECRET` Worker secret)
 - Requests only from https://www.compilenrun.com (and localhost for testing)
 
+## Quiz me
+
+`POST https://www.compilenrun.com/api/quiz` with `{path, round, turnstile}` returns a multiple-choice quiz for the page:
+`{title, round, questions: [{question, code, options[4], answer, explanation}]}`. The page checks the answers itself.
+
+- Written by `@cf/google/gemma-4-26b-a4b-it`, which reasons through each question before giving the answer letter.
+  A second call answers the quiz without the key, and questions where the two disagree are dropped (smaller models
+  such as Granite micro and Llama 3.1 8B marked wrong answers as correct in tests). About 90 Neurons per new quiz.
+- Cached in `ASK_KV` for 30 days per page and round (3 rounds, for "Try another quiz"), so most requests cost nothing.
+- `QUIZ_DAILY_LIMIT` new quizzes per UTC day; Turnstile and the `ASK_LIMIT` rate limit apply as for questions.
+- To regenerate a page's quizzes, delete its keys: `npx wrangler@4 kv key list --namespace-id f5aeb7b0e57d46bf9e5f80d816231cb5 --prefix "quiz:v1:" --remote`.
+
 ## Page feedback
 
 `POST https://www.compilenrun.com/api/feedback` with `{path, vote: 1 | -1, comment?}` stores one vote per page and

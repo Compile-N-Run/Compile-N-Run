@@ -666,6 +666,11 @@ const config = {
                         //     to: "/docs/algorithm"
                         // }
                         {
+                            label: 'Roadmap',
+                            to: '/roadmap',
+                            position: 'right',
+                        },
+                        {
                             label: 'Forum',
                             href: 'https://forum.compilenrun.com/',
                             position: 'right',
@@ -690,6 +695,10 @@ const config = {
                                 {
                                     label: 'Search',
                                     to: '/search',
+                                },
+                                {
+                                    label: 'Learning roadmaps',
+                                    to: '/roadmap',
                                 },
                                 {
                                     label: 'Feedback',

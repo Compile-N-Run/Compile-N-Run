@@ -454,6 +454,10 @@ def main():
             new_fm['lastmod'] = dates[f'src/pages/{f}']
         open(os.path.join(OUT, f), 'w', encoding='utf8').write(
             '---\n' + yaml.safe_dump(new_fm, allow_unicode=True, sort_keys=False) + '---\n\n' + convert_body(body))
+    open(os.path.join(OUT, 'roadmap.md'), 'w').write(
+        '---\ntitle: Learning Roadmaps\nurl: /roadmap/\ntype: roadmap\n'
+        'description: Step-by-step learning paths for frontend, backend, DevOps, data and AI, mobile, systems and '
+        'algorithms, built from the Compile N Run tutorials, with your progress on each step.\n---\n')
     open(os.path.join(OUT, 'search.md'), 'w').write('---\ntitle: Search the documentation\nurl: /search/\ntype: search\nrobots: noindex, follow\n---\n')
     open(os.path.join(OUT, '_index.md'), 'w').write('---\ntitle: Compile N Run\n'
                                                      'description: The best website to learn any programming language for free!\n'
