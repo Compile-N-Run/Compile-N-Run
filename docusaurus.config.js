@@ -666,6 +666,11 @@ const config = {
                         //     to: "/docs/algorithm"
                         // }
                         {
+                            label: 'Forum',
+                            href: 'https://forum.compilenrun.com/',
+                            position: 'right',
+                        },
+                        {
                             label: 'About',
                             to: '/about',
                             position: 'right',
@@ -695,6 +700,10 @@ const config = {
                         {
                             title: 'Links',
                             items: [
+                                {
+                                    label: 'Forum',
+                                    href: 'https://forum.compilenrun.com/',
+                                },
                                 {
                                     label: 'About',
                                     to: '/about',
