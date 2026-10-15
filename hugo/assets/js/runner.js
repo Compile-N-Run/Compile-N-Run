@@ -1,23 +1,36 @@
-/* Run buttons for Python, JavaScript and SQL examples. Everything runs in the reader's browser:
-   Python on Pyodide and JavaScript in Web Workers (so Stop can end an endless loop), SQL on SQLite (sql.js),
-   or on PostgreSQL (PGlite) in the PostgreSQL tutorial. Loaded only on pages with such code blocks. */
+/* Run buttons for Python, JavaScript, TypeScript, PHP, SQL and HTML examples. Everything runs in the reader's
+   browser: Python (Pyodide), JavaScript, TypeScript and PHP (php-wasm) in Web Workers, so Stop can end an endless
+   loop; SQL on SQLite (sql.js), or on PostgreSQL (PGlite) in the PostgreSQL tutorial; HTML and JavaScript that
+   uses the page in a sandboxed preview frame. Loaded only on pages with such code blocks. */
 (function () {
   var PYODIDE = 'https://cdn.jsdelivr.net/pyodide/v0.29.5/full/';
   var SQLJS = 'https://cdn.jsdelivr.net/npm/sql.js@1.14.2/dist/';
   var PGLITE = 'https://cdn.jsdelivr.net/npm/@electric-sql/pglite@0.5.8/dist/index.js';
+  var TYPESCRIPT = 'https://cdn.jsdelivr.net/npm/typescript@6.0.3/lib/';
+  var PHPWASM = 'https://cdn.jsdelivr.net/npm/php-wasm@0.1.0/PhpWeb.mjs';
   var JS_TIMEOUT = 10000;
   var MAX_OUTPUT = 100000;
   var MAX_ROWS = 200;
   var path = location.pathname;
 
   /* ---------- Which blocks get a Run button ---------- */
-  var LANGS = { python: 'python', py: 'python', python3: 'python', javascript: 'js', js: 'js', sql: 'sql' };
+  var LANGS = { python: 'python', py: 'python', python3: 'python', javascript: 'js', js: 'js', sql: 'sql', typescript: 'ts', ts: 'ts', php: 'php', html: 'html' };
   var SQL_PAGES = /^\/docs\/(language\/sql|database\/(postgresql|mysql)|fundamental\/(database|interview))\//;
   var postgres = /^\/docs\/database\/postgresql\//.test(path);
   var mysql = /^\/docs\/database\/mysql\//.test(path);
   // Things the in-browser runtimes cannot do: servers, frameworks, GPUs, sockets, threads, other processes.
   var PY_NO = /^\s*(?:from|import)\s+(?:flask|django|fastapi|starlette|uvicorn|gunicorn|celery|airflow|torch|torchvision|tensorflow|keras|transformers|langchain\w*|openai|anthropic|boto3|botocore|socket|socketserver|multiprocessing|threading|concurrent|subprocess|tkinter|turtle|pygame|selenium|playwright|scrapy|requests|httpx|aiohttp|urllib3|psycopg2?|pymysql|mysql|pymongo|redis|kafka|confluent_kafka|pika|grpc|paramiko|docker|kubernetes|streamlit|gradio|dash|discord|telegram|smtplib|ftplib|http\.server|wsgiref|asyncpg|motor|sqlalchemy|alembic|pyspark|ray|dask)\b/m;
   var JS_NO = /\brequire\s*\(|^\s*(?:import|export)\s|\b(?:document|window|process|module|localStorage|sessionStorage|navigator)\.|\b(?:alert|prompt|confirm|fetch)\s*\(|\$\(|<\/?[A-Za-z][\w.-]*[\s/>]|\baddEventListener\b|\bXMLHttpRequest\b/m;
+  // JavaScript that uses the page (document, alert, events) runs in the HTML preview instead, but not
+  // Node, modules, React/JSX or jQuery.
+  var JS_SERVER = /\brequire\s*\(|^\s*(?:import|export)\s|\b(?:process|module|exports)\.|\b__dirname\b|\$\(|\bjQuery\b|\bReact(?:DOM)?\b|\buse(?:State|Effect)\b|(?:return|=>)\s*\(?\s*<[A-Za-z]|^\s*<\/?[A-Za-z]/m;
+  var JS_DOM = /\b(?:document|window|localStorage|sessionStorage|navigator)\.|\b(?:alert|prompt|confirm)\s*\(|\baddEventListener\b/;
+  // TypeScript: like JavaScript (type arguments such as Array<string> are not HTML). Exported declarations are fine.
+  var TS_NO = /\brequire\s*\(|^\s*import\s|^\s*export\s+(?:\{|\*|default\s+(?!(?:async\s+)?(?:function|class)\b)|=)|\b(?:document|window|process|module|localStorage|sessionStorage|navigator)\.|\b(?:alert|prompt|confirm|fetch)\s*\(|\$\(|<\/[a-z]+>|\baddEventListener\b|\bXMLHttpRequest\b|^\s*@(?:Component|Injectable|NgModule|Controller|Module|Entity)\b|\bdeclare\s+module\b/m;
+  // PHP: no web servers, frameworks, databases, network, files outside the sandbox or other PHP files.
+  var PHP_NO = /\b(?:Illuminate|Laravel|Symfony|Doctrine|Route::|Schema::|DB::|Auth::|artisan|composer|namespace\s|use\s+[A-Z]\w*\\|\$_(?:GET|POST|REQUEST|SERVER|SESSION|COOKIE|FILES|ENV)\b|\bheader\s*\(|session_start|setcookie|mysqli|\bPDO\b|curl_|file_get_contents\s*\(\s*['"]https?:|fsockopen|\bmail\s*\(|(?:require|include)(?:_once)?\b|\bwp_|add_action|add_filter|get_option|apply_filters|\$wpdb|\$this->(?:db|load|input)\b)/;
+  var HTML_NO = /\{\{|\{%|<\?(?:php|=)|<%|@\{|@(?:if|foreach|section|extends|yield)\b|\bv-(?:if|for|bind|model|on)\b|\*ng(?:If|For)|\[\(ngModel\)\]|\bth:|\{#|<template\b|<slot\b|<x-|\{\$|<cfoutput|<asp:|<jsp:|<c:/i;
+  var HTML_SHOWS = /<(?:body|div|p|h[1-6]|button|form|input|ul|ol|table|img|svg|canvas|section|main|header|nav|span|a|label|select|textarea|style|script|video|audio|details|article|footer|figure|dialog|progress|meter|fieldset)\b/i;
   var SQL_NO = /^\s*(?:mysql>|postgres=?[#>]|\w+=[#>]|psql\b|\\|\+-|\||DELIMITER\b|SOURCE\b)|\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:DATABASE|SCHEMA|USER|ROLE)\b|\b(?:GRANT|REVOKE|FLUSH|SHOW|COPY)\s|^\s*USE\s+\w+|\bLOAD\s+DATA\b|\bpg_dump\b/im;
 
   // Blocks the runtime can execute at all; earlier ones may be run first to set up later ones.
@@ -25,6 +38,10 @@
     if (/^\s*(?:>>>|\$ |PS>|C:\\)/m.test(code)) return false; // shell or REPL transcripts
     if (kind === 'python') return !PY_NO.test(code);
     if (kind === 'js') return !JS_NO.test(code);
+    if (kind === 'dom') return !JS_SERVER.test(code) && JS_DOM.test(code);
+    if (kind === 'ts') return !TS_NO.test(code);
+    if (kind === 'php') return !PHP_NO.test(code) && !/^\s*\$\s/m.test(code);
+    if (kind === 'html') return !HTML_NO.test(code) && HTML_SHOWS.test(code);
     if (kind === 'sql') {
       if (!SQL_PAGES.test(path) || SQL_NO.test(code)) return false;
       // Syntax templates such as "SELECT column1, ... FROM table_name WHERE condition;"
@@ -38,9 +55,10 @@
   function runnable(kind, code) {
     if (!candidate(kind, code)) return false;
     // Output calls inside comments do not count.
-    code = kind === 'js' ? code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+    code = kind === 'js' || kind === 'ts' || kind === 'php' ? code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
       : kind === 'python' ? code.replace(/^\s*#.*$/gm, '') : code;
-    if (kind === 'js') return /\bconsole\.(?:log|info|table|error|warn)\s*\(/.test(code);
+    if (kind === 'php') return /\b(?:echo|print|printf|print_r|var_dump|var_export|vprintf)\b/.test(code);
+    if (kind === 'js' || kind === 'ts') return /\bconsole\.(?:log|info|table|error|warn)\s*\(/.test(code);
     if (kind === 'python') {
       if (/\bprint\s*\(|\bplt\.(?:show|plot|savefig)\s*\(/.test(code)) return true;
       // A bare expression on the last line (df.head(), result), shown like in a notebook.
@@ -68,7 +86,7 @@
       document.head.appendChild(s);
     });
   }
-  function blobWorker(src) { return new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))); }
+  function blobWorker(src, module) { return new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), module ? { type: 'module' } : undefined); }
 
   /* ---------- Python (one Pyodide worker per page, so examples share variables like a notebook) ---------- */
   var PY_WORKER_SRC = '(' + function (base) {
@@ -223,6 +241,8 @@
     console.count = function (l) { l = l === undefined ? 'default' : l; counts[l] = (counts[l] || 0) + 1; send('out', l + ': ' + counts[l] + '\n'); };
     console.group = console.groupCollapsed = function () { if (arguments.length) send('out', line(arguments)); };
     console.groupEnd = console.time = console.timeEnd = function () {};
+    console.dir = console.log;
+    console.assert = function (ok) { if (!ok) send('err', 'Assertion failed' + (arguments.length > 1 ? ': ' + line(Array.prototype.slice.call(arguments, 1)) : '\n')); };
     var report = function (err) { send('err', (err && err.name ? err.name + ': ' + err.message : 'Uncaught ' + fmt(err, 1, [])) + '\n'); };
     // Track timers so the run can end as soon as nothing is left to do.
     var pending = 0, finished = false, timers = {};
@@ -284,7 +304,192 @@
       w.postMessage({ code: code, prelude: prelude || [] });
     });
   }
-  function declares(src, name) { return new RegExp('(?:\\b(?:const|let|var|class)|\\bfunction\\*?)\\s+' + name + '\\b').test(src); }
+  /* ---------- TypeScript: type-checked and compiled in a worker, then run like JavaScript ---------- */
+  var TS_WORKER_SRC = '(' + function (base) {
+    importScripts(base + 'typescript.js');
+    // The examples run in a worker with the console and timers set up by the JavaScript runner.
+    var GLOBALS = 'declare var console: { log(...a: any[]): void; info(...a: any[]): void; debug(...a: any[]): void; warn(...a: any[]): void; ' +
+      'error(...a: any[]): void; trace(...a: any[]): void; dir(o: any): void; table(d: any): void; count(l?: string): void; group(...a: any[]): void; ' +
+      'groupCollapsed(...a: any[]): void; groupEnd(): void; time(l?: string): void; timeEnd(l?: string): void; assert(ok?: boolean, ...a: any[]): void };\n' +
+      'declare function setTimeout(h: (...a: any[]) => void, ms?: number, ...a: any[]): number;\ndeclare function clearTimeout(id?: number): void;\n' +
+      'declare function setInterval(h: (...a: any[]) => void, ms?: number, ...a: any[]): number;\ndeclare function clearInterval(id?: number): void;\n' +
+      'declare function queueMicrotask(cb: () => void): void;\ndeclare function structuredClone<T>(v: T): T;\n';
+    var libs = {};
+    var fetchText = function (url) { var x = new XMLHttpRequest(); x.open('GET', url, false); x.send(); return x.status === 200 ? x.responseText : null; };
+    var opts = { target: ts.ScriptTarget.ES2022, lib: ['lib.es2022.d.ts'], strict: true, skipLibCheck: true, types: [], noEmitOnError: false, removeComments: false };
+    // Declarations an earlier example also makes are fine: at run time this example has its own scope.
+    var PRELUDE_OK = [2300, 2393, 2451, 2440, 2567, 2813, 2814];
+    onmessage = function (e) {
+      var files = { '/globals.d.ts': GLOBALS }, roots = ['/globals.d.ts'], out = {};
+      (e.data.prelude || []).forEach(function (src, i) { files['/prelude' + i + '.ts'] = src; roots.push('/prelude' + i + '.ts'); });
+      files['/main.ts'] = e.data.code;
+      roots.push('/main.ts');
+      var host = {
+        getSourceFile: function (name, lang) {
+          if (files[name] != null) return ts.createSourceFile(name, files[name], lang, true);
+          if (name.indexOf('/lib/') !== 0) return undefined;
+          if (!(name in libs)) { var t = fetchText(base + name.slice(5)); libs[name] = t == null ? undefined : ts.createSourceFile(name, t, lang, true); }
+          return libs[name];
+        },
+        getDefaultLibFileName: function () { return '/lib/lib.es2022.d.ts'; },
+        getDefaultLibLocation: function () { return '/lib/'; },
+        writeFile: function (name, text) { out[name] = text; },
+        getCurrentDirectory: function () { return '/'; },
+        getDirectories: function () { return []; },
+        fileExists: function (name) { return files[name] != null || name.indexOf('/lib/') === 0; },
+        readFile: function (name) { return files[name]; },
+        getCanonicalFileName: function (name) { return name; },
+        useCaseSensitiveFileNames: function () { return true; },
+        getNewLine: function () { return '\n'; }
+      };
+      try {
+        var program = ts.createProgram(roots, opts, host);
+        var main = program.getSourceFile('/main.ts');
+        var diags = ts.getPreEmitDiagnostics(program, main).filter(function (d) {
+          return d.category === ts.DiagnosticCategory.Error && !(e.data.prelude && e.data.prelude.length && PRELUDE_OK.indexOf(d.code) >= 0);
+        }).map(function (d) {
+          var where = d.file && d.start != null ? 'Line ' + (d.file.getLineAndCharacterOfPosition(d.start).line + 1) + ': ' : '';
+          return where + ts.flattenDiagnosticMessageText(d.messageText, '\n') + ' (TS' + d.code + ')';
+        });
+        program.emit();
+        postMessage({ js: out['/main.js'] || '', prelude: (e.data.prelude || []).map(function (s, i) { return out['/prelude' + i + '.js'] || ''; }), errors: diags });
+      } catch (err) {
+        postMessage({ js: '', prelude: [], errors: ['Could not compile: ' + ((err && err.message) || err)] });
+      }
+    };
+  } + ')(' + JSON.stringify(TYPESCRIPT) + ')';
+
+  var tsWorker = null, tsLoaded = false;
+  // "export" in front of a declaration only matters across files; drop it so the example runs as a script.
+  function tsSource(code) { return code.replace(/^(\s*)export\s+(?:default\s+)?(?=(?:declare\s+|abstract\s+|async\s+)?(?:function|class|const|let|var|interface|type|enum|namespace)\b)/gm, '$1'); }
+  function tsRun(code, ui, prelude) {
+    if (!tsWorker) { tsWorker = blobWorker(TS_WORKER_SRC); tsLoaded = false; }
+    var w = tsWorker, stopped = false;
+    if (!tsLoaded) ui.status('Loading the TypeScript compiler… the first run downloads about 3 MB.');
+    ui.onStop = function () { stopped = true; w.terminate(); tsWorker = null; };
+    return new Promise(function (ok) {
+      w.onmessage = function (e) { tsLoaded = true; ok(e.data); };
+      w.onerror = function (e) { e.preventDefault(); w.terminate(); tsWorker = null; ok({ js: '', prelude: [], errors: ['Could not load the TypeScript compiler (' + (e.message || 'download failed') + ').'] }); };
+      w.postMessage({ code: tsSource(code), prelude: (prelude || []).map(tsSource) });
+    }).then(function (r) {
+      ui.status('');
+      if (stopped) { ui.write('Stopped.\n', true); return { names: [] }; }
+      if (r.errors.length) ui.write('Type errors (the code still runs, as with tsc):\n' + r.errors.join('\n') + '\n\n', true);
+      if (!r.js) return { names: [] };
+      return jsRun(r.js, ui, r.prelude);
+    });
+  }
+
+  /* ---------- PHP (php-wasm; a fresh PHP instance per run, as with php on the command line) ---------- */
+  // php-wasm expects a browser page; these stand-ins are enough for it to start inside a worker.
+  var PHP_WORKER_SRC = 'self.window = self; self.document = { currentScript: null, baseURI: location.href, querySelector: function () { return null; }, ' +
+    'getElementById: function () { return null; }, addEventListener: function () {}, removeEventListener: function () {}, body: { style: {} } };\n(' + function (url) {
+    var lib = import(url);
+    onmessage = function (e) {
+      lib.then(function (m) {
+        var php = new m.PhpWeb();
+        php.addEventListener('output', function (ev) { postMessage({ type: 'out', text: ev.detail.join('') }); });
+        php.addEventListener('error', function (ev) { postMessage({ type: 'out', text: ev.detail.join('') }); });
+        return php.binary.then(function () { postMessage({ type: 'ready' }); return php.run(e.data); });
+      }).then(function () { postMessage({ type: 'done' }); }, function (err) { postMessage({ type: 'fatal', text: String((err && err.message) || err) }); });
+    };
+  } + ')(' + JSON.stringify(PHPWASM) + ')';
+
+  var phpWorker = null, phpLoaded = false;
+  function phpBody(src) { return src.replace(/^\s*<\?php\b/, '').replace(/\?>\s*$/, ''); }
+  // Runs the example; earlier examples it builds on run first with their output thrown away.
+  function phpRun(code, ui, prelude) {
+    if (!phpWorker) { phpWorker = blobWorker(PHP_WORKER_SRC, true); phpLoaded = false; }
+    var w = phpWorker, text = '';
+    if (!/<\?(?:php|=)/.test(code)) code = '<?php\n' + code;
+    if (prelude && prelude.length) code = '<?php ob_start();\n' + prelude.map(phpBody).join('\n') + '\nob_end_clean(); ?>' + code;
+    if (!phpLoaded) ui.status('Loading PHP… the first run downloads about 3 MB.');
+    return new Promise(function (ok) {
+      var end = function (note) {
+        // PHP prints errors into the output; show them in red, with "your code" for php-wasm's script name.
+        text.replace(/php-wasm run script/g, 'your code').split(/(\n)/).forEach(function (part) {
+          ui.write(part, /^\s*(?:PHP )?(?:Fatal error|Parse error|Warning|Notice|Deprecated)\b|^Stack trace:|^#\d+ |^\s+thrown in /.test(part));
+        });
+        if (note) ui.write(note, true);
+        var names = [], m, re = /Call to undefined function (\w+)\(|Class "(\w+)" not found|Undefined variable \$(\w+)|Undefined constant "(\w+)"/g;
+        while ((m = re.exec(text))) { var n = m[1] || m[2] || (m[3] && '$' + m[3]) || m[4]; if (names.indexOf(n) < 0) names.push(n); }
+        ok({ names: names });
+      };
+      w.onmessage = function (e) {
+        var d = e.data;
+        if (d.type === 'ready') { phpLoaded = true; ui.status(''); }
+        else if (d.type === 'out') text += d.text;
+        else if (d.type === 'done') end();
+        else if (d.type === 'fatal') end('\n' + d.text);
+      };
+      w.onerror = function (e) { e.preventDefault(); w.terminate(); phpWorker = null; end('Could not start PHP (' + (e.message || 'download failed') + '). Check your connection or ad blocker.'); };
+      ui.onStop = function () { w.terminate(); phpWorker = null; end('\nStopped.'); };
+      w.postMessage(code);
+    });
+  }
+
+  /* ---------- HTML preview, and JavaScript that works with the page, in a sandboxed frame ---------- */
+  // Injected first into the preview: forwards console output, errors and the page height to the parent.
+  var PREVIEW_SHIM = '<script>(function () {' +
+    'var send = function (t, x) { parent.postMessage({ cnrRun: 1, type: t, text: x }, "*"); };' +
+    'var fmt = function (v) { if (typeof v === "string") return v; if (v instanceof Error) return v.name + ": " + v.message;' +
+    ' if (typeof Element !== "undefined" && v instanceof Element) return v.outerHTML.length > 200 ? v.outerHTML.slice(0, 200) + "…" : v.outerHTML;' +
+    ' if (typeof v === "function") return "[Function: " + (v.name || "(anonymous)") + "]";' +
+    ' try { var j = JSON.stringify(v); return j === undefined ? String(v) : j; } catch (e) { return String(v); } };' +
+    'var line = function (a) { return Array.prototype.map.call(a, fmt).join(" ") + "\\n"; };' +
+    '["log", "info", "debug", "table", "dir"].forEach(function (k) { console[k] = function () { send("out", line(arguments)); }; });' +
+    '["warn", "error"].forEach(function (k) { console[k] = function () { send("err", line(arguments)); }; });' +
+    'addEventListener("error", function (e) { send("err", (e.error && e.error.name ? e.error.name + ": " + e.error.message : e.message) + "\\n"); });' +
+    'addEventListener("unhandledrejection", function (e) { send("err", "Uncaught (in promise) " + fmt(e.reason) + "\\n"); });' +
+    'var h = function () { send("height", String(Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0))); };' +
+    'addEventListener("load", function () { h(); if (window.ResizeObserver) new ResizeObserver(h).observe(document.documentElement); });' +
+    'document.addEventListener("click", function (e) { var a = e.target.closest && e.target.closest("a[href]"); if (a && a.getAttribute("href").charAt(0) !== "#") e.preventDefault(); }, true);' +
+    '})();<\/script>';
+  function previewDoc(html, css, js) {
+    var doc = html || '<!DOCTYPE html>\n<html><body></body></html>';
+    var add = function (re, text, after) {
+      var m = re.exec(doc);
+      if (!m) return false;
+      var at = after ? m.index + m[0].length : m.index;
+      doc = doc.slice(0, at) + text + doc.slice(at);
+      return true;
+    };
+    var head = PREVIEW_SHIM + (css ? '<style>\n' + css + '\n</style>' : '');
+    add(/<head\b[^>]*>/i, head, true) || add(/<html\b[^>]*>/i, head, true) || add(/<!DOCTYPE[^>]*>/i, head, true) || (doc = head + doc);
+    if (js) {
+      var script = '<script>\n' + js.replace(/<\/script/gi, '<\\/script') + '\n<\/script>';
+      add(/<\/body>/i, script, false) || (doc += script);
+    }
+    return doc;
+  }
+  function previewRun(doc, ui) {
+    return new Promise(function (ok) {
+      var frame = el('iframe', 'cnr-run__frame');
+      frame.setAttribute('sandbox', 'allow-scripts allow-modals allow-forms');
+      frame.setAttribute('title', 'Preview of the example');
+      var listen = function (e) {
+        if (!frame.isConnected) { window.removeEventListener('message', listen); return; }
+        if (e.source !== frame.contentWindow || !e.data || !e.data.cnrRun) return;
+        if (e.data.type === 'height') frame.style.height = Math.min(Math.max(Number(e.data.text) || 0, 60), 600) + 'px';
+        else ui.write(e.data.text, e.data.type === 'err');
+      };
+      window.addEventListener('message', listen);
+      var done = false, finish = function () { if (!done) { done = true; ok(); } };
+      frame.addEventListener('load', finish);
+      setTimeout(finish, 3000);
+      ui.onStop = function () { frame.remove(); finish(); };
+      ui.frame(frame);
+      frame.srcdoc = doc;
+    });
+  }
+
+  function declares(kind, src, name) {
+    if (kind === 'php') {
+      if (name.charAt(0) === '$') return new RegExp('\\' + name + '\\s*=[^=]').test(src);
+      return new RegExp('\\b(?:function\\s+' + name + '\\s*\\(|(?:class|interface|trait|enum)\\s+' + name + '\\b|define\\s*\\(\\s*[\'"]' + name + '[\'"]|const\\s+' + name + '\\b)', 'i').test(src);
+    }
+    return new RegExp('(?:\\b(?:const|let|var|class|enum|namespace)|\\bfunction\\*?)\\s+' + name + '\\b').test(src);
+  }
 
   /* ---------- SQL (one database per page, shared by its examples) ---------- */
   var sqlDb = null;
@@ -364,9 +569,15 @@
   var ENGINES = {
     python: 'Python 3.13 · runs in your browser',
     js: 'JavaScript · runs in your browser',
+    ts: 'TypeScript 6 · runs in your browser',
+    php: 'PHP 8.4 · runs in your browser',
+    html: 'HTML preview · runs in your browser',
+    dom: 'JavaScript + page preview · runs in your browser',
     sql: postgres ? 'PostgreSQL · runs in your browser' : mysql ? 'SQLite (close to MySQL) · runs in your browser' : 'SQLite · runs in your browser'
   };
-  var RUNNERS = { python: pythonRun, js: jsRun, sql: sqlRun };
+  var RUNNERS = { python: pythonRun, js: jsRun, sql: sqlRun, ts: tsRun, php: phpRun };
+  // Examples whose missing names can be looked up in the examples above (the others share one session instead).
+  var NAMED = { js: 1, ts: 1, php: 1 };
   var RESTART = { python: ['Restart Python', pythonStop], sql: ['Reset database', sqlReset] };
   var icons = {
     run: '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>',
@@ -378,7 +589,8 @@
   function codeText(code) { return code.innerText.replace(/\u00a0/g, ' ').replace(/\n$/, ''); }
 
   // earlier: the code elements of the runnable-in-principle blocks above this one (Python and SQL share state).
-  function setup(block, kind, earlier) {
+  // page: for previews, the HTML and CSS examples above this one that a DOM example runs against.
+  function setup(block, kind, earlier, page) {
     var code = block.querySelector('pre > code');
     var original = code.innerHTML;
     var bar = el('div', 'cnr-run');
@@ -393,6 +605,7 @@
     reset.type = 'button';
     reset.hidden = true;
     var engine = el('span', 'cnr-run__engine', ENGINES[kind]);
+    if (kind === 'dom' && page && page.html) engine.textContent = 'JavaScript + the HTML example above · runs in your browser';
     tools.append(go, edit, reset, engine);
     bar.appendChild(tools);
     var stdinBox = null;
@@ -473,6 +686,7 @@
         img.src = 'data:image/png;base64,' + b64;
         extra.appendChild(img);
       },
+      frame: function (f) { extra.appendChild(f); },
       action: function (label, fn) {
         var b = el('button', 'button button--sm button--outline button--primary cnr-run__action', label);
         b.type = 'button';
@@ -483,7 +697,7 @@
 
     function paintGo() {
       var running = busy === ui;
-      go.innerHTML = (running ? icons.stop + '<span>Stop</span>' : icons.run + '<span>Run</span>');
+      go.innerHTML = (running ? icons.stop + '<span>Stop</span>' : icons.run + '<span>' + (kind === 'html' ? 'Preview' : 'Run') + '</span>');
       go.classList.toggle('cnr-run__go--stop', running);
       go.setAttribute('aria-label', running ? 'Stop the example' : 'Run this example');
     }
@@ -499,15 +713,20 @@
       ui.onStop = null;
       var stopped = false;
       var steps = Promise.resolve();
-      if (kind === 'js') {
-        // JavaScript: rerun with the examples above that define what was missing, until nothing more is found.
+      if (kind === 'html' || kind === 'dom') {
+        var doc = kind === 'html' ? previewDoc(codeText(code))
+          : previewDoc(page.html && codeText(page.html), page.css.map(codeText).join('\n'), codeText(code));
+        return finish(previewRun(doc, ui));
+      }
+      if (NAMED[kind]) {
+        // Rerun with the examples above that define what was missing, until nothing more is found.
         var prelude = [];
         var attempt = function (n) {
           extra.textContent = '';
           pre.textContent = '';
           size = 0;
           lastText = null;
-          return jsRun(codeText(code), ui, prelude.map(codeText)).then(function (res) {
+          return RUNNERS[kind](codeText(code), ui, prelude.map(codeText)).then(function (res) {
             var adds = withEarlier === true && n < 6 ? res.names.map(definer).filter(function (c, i, a) { return c && prelude.indexOf(c) < 0 && a.indexOf(c) === i; }) : [];
             if (!adds.length || stopped) return res;
             prelude = adds.concat(prelude);
@@ -536,13 +755,13 @@
       function finish(p) {
         p.catch(function (e) { ui.write(String((e && e.message) || e), true); }).then(function (res) {
           ui.status('');
-          if (!pre.textContent && !extra.firstChild) ui.write(kind === 'python' || kind === 'js' ? '(no output)\n' : 'Done.\n');
+          if (!pre.textContent && !extra.firstChild) ui.write(kind === 'sql' ? 'Done.\n' : '(no output)\n');
           var again = function () { run(true); };
           if (withEarlier !== true && res) {
             var n = earlier.length;
-            var found = kind === 'js' ? res.names.filter(definer) : [];
+            var found = NAMED[kind] && res.names ? res.names.filter(definer) : [];
             if (found.length) ui.action('Run the example above that defines ' + found[0] + ' first', again);
-            else if (res.missing && n && kind !== 'js') ui.action('Run the ' + (n === 1 ? 'example' : n + ' examples') + ' above first, then this one', again);
+            else if (res.missing && n && !NAMED[kind]) ui.action('Run the ' + (n === 1 ? 'example' : n + ' examples') + ' above first, then this one', again);
           }
           if (res && res.exists) ui.action('Reset the database and run this again', function () { sqlReset(); run(withEarlier); });
           busy = null;
@@ -550,9 +769,9 @@
         });
       }
     }
-    // The nearest example above that declares a name (JavaScript).
+    // The nearest example above that declares a name (JavaScript, TypeScript, PHP).
     function definer(name) {
-      for (var i = earlier.length - 1; i >= 0; i--) if (declares(codeText(earlier[i]), name)) return earlier[i];
+      for (var i = earlier.length - 1; i >= 0; i--) if (declares(kind, codeText(earlier[i]), name)) return earlier[i];
       return null;
     }
     document.addEventListener('cnr-run-busy', function () { paintGo(); go.disabled = !!busy && busy !== ui; });
@@ -575,7 +794,7 @@
     code.addEventListener('keydown', function (e) {
       if (code.getAttribute('contenteditable') === null) return;
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(false); }
-      else if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); document.execCommand('insertText', false, kind === 'js' ? '  ' : '    '); }
+      else if (e.key === 'Tab' && !e.shiftKey) { e.preventDefault(); document.execCommand('insertText', false, kind === 'python' || kind === 'php' ? '    ' : '  '); }
       else if (e.key === 'Escape') edit.click();
     });
     // Pasting into the editable code keeps plain text only.
@@ -591,13 +810,37 @@
     };
   }
 
-  var cells = { python: [], sql: [], js: [] };
+  // A DOM snippet that works with an element variable defined elsewhere (button.addEventListener(...) with no
+  // "const button = ..." in the snippet) cannot run on its own.
+  function usesUndeclared(src) {
+    var re = /(^|[^\w$.])([A-Za-z_$][\w$]*)\.(?:addEventListener|removeEventListener|appendChild|append|prepend|removeChild|insertBefore|replaceChildren|style|classList|textContent|innerHTML|innerText|setAttribute|getAttribute|dataset|value|checked|getContext|children|parentNode|firstChild|click|focus)\b/g, m;
+    var known = /^(?:document|window|this|event|e|evt|globalThis|self|console|navigator|location|history|screen)$/;
+    while ((m = re.exec(src))) {
+      var name = m[2];
+      if (known.test(name)) continue;
+      if (!new RegExp('(?:\\b(?:const|let|var|function|class)\\s+|[(,]\\s*|\\b(?:for\\s*\\(\\s*(?:const|let|var)\\s+))' + name.replace(/\$/g, '\\$') + '\\b|\\b' + name.replace(/\$/g, '\\$') + '\\s*=>|\\{[^}]*\\b' + name.replace(/\$/g, '\\$') + '\\b[^}]*\\}\\s*=').test(src)) return true;
+    }
+    return false;
+  }
+
+  var cells = { python: [], sql: [], js: [], ts: [], php: [] };
+  var page = { html: null, css: [] }; // the latest HTML example and the CSS examples after it
   document.querySelectorAll('.theme-code-block').forEach(function (block) {
     var m = block.className.match(/\blanguage-([\w+#-]+)/);
-    var kind = m && LANGS[m[1].toLowerCase()];
+    var lang = m && m[1].toLowerCase();
+    var kind = lang && LANGS[lang];
     var code = block.querySelector('pre > code');
-    if (!kind || !code || !candidate(kind, code.textContent)) return;
-    if (runnable(kind, code.textContent)) setup(block, kind, cells[kind] ? cells[kind].slice() : []);
+    if (!code) return;
+    if (lang === 'css') { page.css.push(code); return; }
+    if (kind === 'js' && !candidate('js', code.textContent) && candidate('dom', code.textContent)) {
+      // Snippets that look up elements need the HTML they were written for: an HTML example above them.
+      if (!page.html && /\bgetElementsBy|\bgetElementById|\bquerySelector/.test(code.textContent)) return;
+      if (usesUndeclared(code.textContent)) return;
+      kind = 'dom';
+    }
+    if (!kind || !candidate(kind, code.textContent)) return;
+    if (runnable(kind, code.textContent)) setup(block, kind, cells[kind] ? cells[kind].slice() : [], { html: page.html, css: page.css.slice() });
     if (cells[kind]) cells[kind].push(code);
+    if (kind === 'html') { page.html = code; page.css = []; }
   });
 })();
