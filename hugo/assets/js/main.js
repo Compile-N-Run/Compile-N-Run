@@ -260,8 +260,8 @@
           .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener nofollow">$1</a>');
       }).join('');
     };
-    // Small Markdown renderer for answers: fenced code, headings, lists, paragraphs, inline code/bold/italic/links.
-    var markdown = function (src) {
+    // Fallback renderer for the moment before marked/DOMPurify have loaded: fenced code, headings, flat lists, paragraphs.
+    var simpleMarkdown = function (src) {
       var out = [], para = [], list = null, code = null;
       var flushPara = function () { if (para.length) { out.push('<p>' + inline(para.join(' ')) + '</p>'); para = []; } };
       var flushList = function () { if (list) { out.push('<' + list.tag + '>' + list.items.map(function (x) { return '<li>' + inline(x) + '</li>'; }).join('') + '</' + list.tag + '>'); list = null; } };
@@ -287,6 +287,32 @@
       if (code) out.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>');
       flushPara(); flushList();
       return out.join('');
+    };
+
+    // Answers are rendered with marked (GFM) and sanitized with DOMPurify, loaded the first time the chat opens.
+    var mdLibs = null, rendered = [];
+    var loadScript = function (src) {
+      return new Promise(function (ok, fail) { var sc = document.createElement('script'); sc.src = src; sc.async = true; sc.onload = ok; sc.onerror = fail; document.head.appendChild(sc); });
+    };
+    var loadMarkdown = function () {
+      if (!mdLibs) {
+        mdLibs = Promise.all([
+          loadScript('https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js'),
+          loadScript('https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js')
+        ]).then(function () {
+          window.DOMPurify.addHook('afterSanitizeAttributes', function (node) {
+            if (node.tagName === 'A') { node.setAttribute('target', '_blank'); node.setAttribute('rel', 'noopener nofollow'); }
+          });
+          rendered.forEach(function (r) { r.el.innerHTML = markdown(r.text); });
+        }).catch(function () {});
+      }
+      return mdLibs;
+    };
+    var markdown = function (src) {
+      if (window.marked && window.DOMPurify) {
+        return window.DOMPurify.sanitize(window.marked.parse(src, { gfm: true, breaks: false }), { FORBID_TAGS: ['style', 'img', 'form', 'input'], FORBID_ATTR: ['style'] });
+      }
+      return simpleMarkdown(src);
     };
 
     var sparkle = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 2l1.9 5.6L19.5 9.5l-5.6 1.9L12 17l-1.9-5.6L4.5 9.5l5.6-1.9zM19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9zM5 15l.7 1.8 1.8.7-1.8.7L5 20l-.7-1.8-1.8-.7 1.8-.7z"/></svg>';
@@ -426,6 +452,7 @@
       }).then(function () {
         if (!text) throw new Error('No answer came back. Please try again.');
         paint();
+        rendered.push({ el: out, text: text });
         chat.push({ role: 'user', content: q }, { role: 'assistant', content: text });
       }).catch(function (e) {
         if (e && e.name === 'AbortError') { if (text) paint(); else out.remove(); return; }
@@ -441,6 +468,7 @@
       root.classList.add('cnr-ask-open');
       if (!log.children.length) intro();
       tsLoad();
+      loadMarkdown();
       box.focus();
     };
     var closeAsk = function () {
@@ -455,6 +483,7 @@
     panel.querySelector('[data-ask-reset]').onclick = function () {
       if (busy && busy.abort) busy.abort();
       chat = [];
+      rendered = [];
       intro();
       box.focus();
     };
