@@ -241,4 +241,176 @@
     var go = function (n) { idx = ((n % offers.length) + offers.length) % offers.length; render('open'); };
     setTimeout(function () { render(saved && saved.until > Date.now() ? 'collapsed' : 'open'); }, 2500);
   }
+
+  /* ---------- Ask AI (Cloudflare Worker in worker/ask-ai) ---------- */
+  var askEndpoint = {{ site.Params.askAI.endpoint | default "/api/ask" | jsonify | safeJS }};
+  if (document.querySelector('[data-pagefind-body]') && /^\/(docs|blog)\//.test(location.pathname)) {
+    var esc = function (s) { return s.replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
+    var inline = function (s) {
+      return s.split(/(`[^`\n]+`)/).map(function (part, i) {
+        if (i % 2) return '<code>' + esc(part.slice(1, -1)) + '</code>';
+        return esc(part)
+          .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+          .replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, '$1<em>$2</em>')
+          .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener nofollow">$1</a>');
+      }).join('');
+    };
+    // Small Markdown renderer for answers: fenced code, headings, lists, paragraphs, inline code/bold/italic/links.
+    var markdown = function (src) {
+      var out = [], para = [], list = null, code = null;
+      var flushPara = function () { if (para.length) { out.push('<p>' + inline(para.join(' ')) + '</p>'); para = []; } };
+      var flushList = function () { if (list) { out.push('<' + list.tag + '>' + list.items.map(function (x) { return '<li>' + inline(x) + '</li>'; }).join('') + '</' + list.tag + '>'); list = null; } };
+      src.split('\n').forEach(function (line) {
+        var fence = line.match(/^\s*```\s*([\w+#.-]*)/);
+        if (code) {
+          if (fence && !fence[1]) { out.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>'); code = null; } else code.push(line);
+          return;
+        }
+        if (fence) { flushPara(); flushList(); code = []; return; }
+        var m;
+        if (!line.trim()) { flushPara(); flushList(); }
+        else if ((m = line.match(/^#{1,6}\s+(.*)/))) { flushPara(); flushList(); out.push('<p><strong>' + inline(m[1]) + '</strong></p>'); }
+        else if ((m = line.match(/^\s*(?:([-*+])|(\d+)[.)])\s+(.*)/))) {
+          flushPara();
+          var tag = m[1] ? 'ul' : 'ol';
+          if (!list || list.tag !== tag) { flushList(); list = { tag: tag, items: [] }; }
+          list.items.push(m[3]);
+        }
+        else if (list && /^\s+\S/.test(line)) list.items[list.items.length - 1] += ' ' + line.trim();
+        else { flushList(); para.push(line.trim()); }
+      });
+      if (code) out.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>');
+      flushPara(); flushList();
+      return out.join('');
+    };
+
+    var sparkle = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 2l1.9 5.6L19.5 9.5l-5.6 1.9L12 17l-1.9-5.6L4.5 9.5l5.6-1.9zM19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9zM5 15l.7 1.8 1.8.7-1.8.7L5 20l-.7-1.8-1.8-.7 1.8-.7z"/></svg>';
+    var askBtn = document.createElement('button');
+    askBtn.type = 'button';
+    askBtn.className = 'cnr-ask-btn';
+    askBtn.setAttribute('aria-haspopup', 'dialog');
+    askBtn.setAttribute('aria-expanded', 'false');
+    askBtn.innerHTML = sparkle + '<span>Ask AI</span>';
+    var panel = document.createElement('div');
+    panel.className = 'cnr-ask';
+    panel.hidden = true;
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', 'Ask AI about this page');
+    panel.innerHTML =
+      '<div class="cnr-ask__head">' + sparkle + '<div class="cnr-ask__title"><strong>Ask AI</strong><span>about this page</span></div>' +
+      '<button type="button" class="cnr-ask__icon" data-ask-reset title="New chat" aria-label="Start a new chat"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4z"/></svg></button>' +
+      '<button type="button" class="cnr-ask__icon" data-ask-close title="Close" aria-label="Close Ask AI"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button></div>' +
+      '<div class="cnr-ask__log" aria-live="polite"></div>' +
+      '<form class="cnr-ask__form"><textarea rows="1" maxlength="1000" placeholder="Ask a question about this page…" aria-label="Your question"></textarea>' +
+      '<button type="submit" class="cnr-ask__send" aria-label="Send"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2z"/></svg></button></form>' +
+      '<div class="cnr-ask__note">AI answers can be wrong — double-check against the tutorial.</div>';
+    document.body.appendChild(askBtn);
+    document.body.appendChild(panel);
+
+    var log = panel.querySelector('.cnr-ask__log');
+    var form = panel.querySelector('form');
+    var box = panel.querySelector('textarea');
+    var send = panel.querySelector('.cnr-ask__send');
+    var chat = [], busy = null;
+    var suggestions = ['Summarize this page in a few bullet points', 'Explain the first code example line by line', 'What should I practice after this tutorial?'];
+
+    var intro = function () {
+      log.innerHTML = '<div class="cnr-ask__intro"><p>Hi! Ask me anything about <strong>' + esc(document.title.replace(/\s*\|\s*Compile N Run\s*$/, '')) + '</strong>.</p>' +
+        suggestions.map(function (s) { return '<button type="button" class="cnr-ask__chip">' + esc(s) + '</button>'; }).join('') + '</div>';
+      log.querySelectorAll('.cnr-ask__chip').forEach(function (b) { b.onclick = function () { ask(b.textContent); }; });
+    };
+    var addMsg = function (role, html) {
+      var intro = log.querySelector('.cnr-ask__intro');
+      if (intro) intro.remove();
+      var d = document.createElement('div');
+      d.className = 'cnr-ask__msg cnr-ask__msg--' + role;
+      d.innerHTML = html;
+      log.appendChild(d);
+      log.scrollTop = log.scrollHeight;
+      return d;
+    };
+    var grow = function () { box.style.height = 'auto'; box.style.height = Math.min(box.scrollHeight, 140) + 'px'; };
+    var setBusy = function (b) { busy = b; send.disabled = !!b; box.disabled = !!b; };
+
+    var ask = function (q) {
+      q = q.trim();
+      if (!q || busy) return;
+      addMsg('user', esc(q).replace(/\n/g, '<br>'));
+      box.value = '';
+      grow();
+      var out = addMsg('ai', '<span class="cnr-ask__typing"><i></i><i></i><i></i></span>');
+      var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+      setBusy(ctrl || true);
+      var text = '', frame = 0;
+      var paint = function () { frame = 0; var stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40; out.innerHTML = markdown(text); if (stick) log.scrollTop = log.scrollHeight; };
+      fetch(askEndpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: location.pathname, question: q, history: chat.slice(-6) }),
+        signal: ctrl ? ctrl.signal : undefined
+      }).then(function (res) {
+        if (!res.ok) return res.json().catch(function () { return {}; }).then(function (j) { throw new Error(j.error || 'Something went wrong. Please try again.'); });
+        var reader = res.body.getReader(), dec = new TextDecoder(), buf = '';
+        var pump = function () {
+          return reader.read().then(function (r) {
+            if (r.done) return;
+            buf += dec.decode(r.value, { stream: true });
+            var lines = buf.split('\n');
+            buf = lines.pop();
+            lines.forEach(function (l) {
+              l = l.trim();
+              if (l.indexOf('data:') !== 0) return;
+              var data = l.slice(5).trim();
+              if (data === '[DONE]') return;
+              try {
+                var j = JSON.parse(data), c = j.choices && j.choices[0] && j.choices[0].delta;
+                text += (c && c.content) || j.response || '';
+              } catch (e) {}
+            });
+            if (text && !frame) frame = requestAnimationFrame(paint);
+            return pump();
+          });
+        };
+        return pump();
+      }).then(function () {
+        if (!text) throw new Error('No answer came back. Please try again.');
+        paint();
+        chat.push({ role: 'user', content: q }, { role: 'assistant', content: text });
+      }).catch(function (e) {
+        if (e && e.name === 'AbortError') { if (text) paint(); else out.remove(); return; }
+        out.classList.add('cnr-ask__msg--error');
+        out.textContent = (e && e.message) || 'Something went wrong. Please try again.';
+      }).then(function () { setBusy(null); if (!panel.hidden) box.focus(); });
+    };
+
+    var openAsk = function () {
+      panel.hidden = false;
+      askBtn.hidden = true;
+      askBtn.setAttribute('aria-expanded', 'true');
+      root.classList.add('cnr-ask-open');
+      if (!log.children.length) intro();
+      box.focus();
+    };
+    var closeAsk = function () {
+      panel.hidden = true;
+      askBtn.hidden = false;
+      askBtn.setAttribute('aria-expanded', 'false');
+      root.classList.remove('cnr-ask-open');
+      askBtn.focus();
+    };
+    askBtn.onclick = openAsk;
+    panel.querySelector('[data-ask-close]').onclick = closeAsk;
+    panel.querySelector('[data-ask-reset]').onclick = function () {
+      if (busy && busy.abort) busy.abort();
+      chat = [];
+      intro();
+      box.focus();
+    };
+    panel.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeAsk(); });
+    box.addEventListener('input', grow);
+    box.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask(box.value); }
+    });
+    form.addEventListener('submit', function (e) { e.preventDefault(); ask(box.value); });
+  }
 })();
