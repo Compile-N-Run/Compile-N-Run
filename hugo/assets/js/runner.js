@@ -87,9 +87,12 @@
       '    for n in plt.get_fignums():\n        buf = io.BytesIO()\n        plt.figure(n).savefig(buf, format="png", bbox_inches="tight", dpi=96)\n' +
       '        imgs.append(base64.b64encode(buf.getvalue()).decode())\n    plt.close("all")\nimgs';
     // Like a notebook cell: the value of a trailing expression is printed (but not the objects plotting calls return).
-    var RUN = 'from pyodide.code import eval_code_async as _cnr_eval\n_cnr_r = await _cnr_eval(_cnr_src, globals(), filename="<example>")\n' +
-      'if _cnr_r is not None and not type(_cnr_r[0] if isinstance(_cnr_r, list) and _cnr_r else _cnr_r).__module__.startswith("matplotlib"):\n' +
-      '    print(repr(_cnr_r))\ndel _cnr_r';
+    // Output is flushed at the end, also after an error: print(..., end=' ') would otherwise stay buffered
+    // and show up at the start of the next run.
+    var RUN = 'from pyodide.code import eval_code_async as _cnr_eval\nimport sys as _cnr_sys\ntry:\n' +
+      '    _cnr_r = await _cnr_eval(_cnr_src, globals(), filename="<example>")\n' +
+      '    if _cnr_r is not None and not type(_cnr_r[0] if isinstance(_cnr_r, list) and _cnr_r else _cnr_r).__module__.startswith("matplotlib"):\n' +
+      '        print(repr(_cnr_r))\n    del _cnr_r\nfinally:\n    _cnr_sys.stdout.flush()\n    _cnr_sys.stderr.flush()';
     onmessage = function (e) {
       var py;
       ready.then(function (p) {
@@ -125,6 +128,7 @@
         else if (d.type === 'out' || d.type === 'err') ui.write(d.text, d.type === 'err');
         else if (d.type === 'done') { (d.images || []).forEach(ui.image); ok(); }
         else if (d.type === 'error') {
+          if (ui.newline) ui.newline();
           ui.write(pyLoaded ? pythonError(d.text) : 'Could not start Python: ' + d.text, true);
           if (!pyLoaded) pythonStop();
           ok({ missing: /\nNameError: /.test(d.text) });
@@ -442,6 +446,8 @@
         lastText.node.textContent += text;
         pre.hidden = false;
       },
+      // Start a new line if the output so far ends mid-line (before a traceback).
+      newline: function () { if (pre.textContent && !/\n$/.test(pre.textContent)) ui.write('\n'); },
       table: function (cols, rows) {
         var wrap = el('div', 'cnr-run__table');
         var t = el('table');
