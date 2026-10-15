@@ -1,8 +1,9 @@
 // Ask AI: answers a reader's question about the Compile N Run page they are on, using Workers AI.
-// POST /api/ask {path, question, history} -> text/event-stream (OpenAI-style chat.completion.chunk events).
+// POST /api/ask {path, question, history, turnstile} -> text/event-stream (OpenAI-style chat.completion.chunk events).
 
 const SITE = 'https://www.compilenrun.com';
-const MODEL = '@cf/google/gemma-4-26b-a4b-it';
+// Small and cheap: ~8 Neurons for an answer with a full tutorial as context (Gemma 4 26B was ~50).
+const MODEL = '@cf/ibm-granite/granite-4.0-h-micro';
 const MAX_QUESTION = 1000;
 const MAX_HISTORY_TURNS = 6;
 const MAX_HISTORY_CHARS = 2000; // per message
@@ -66,6 +67,18 @@ export function pageText(html) {
   return { title, text: clean.length > MAX_PAGE_CHARS ? clean.slice(0, MAX_PAGE_CHARS) + '\n\n[…page truncated…]' : clean };
 }
 
+// Turnstile tokens are single-use; the widget fetches a fresh one for every question.
+async function humanCheck(token, ip, secret) {
+  if (typeof token !== 'string' || !token || token.length > 2048) return false;
+  const form = new FormData();
+  form.append('secret', secret);
+  form.append('response', token);
+  form.append('remoteip', ip);
+  const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
+  const out = await res.json().catch(() => ({}));
+  return out.success === true;
+}
+
 async function getPage(path, ctx) {
   const cache = caches.default;
   const key = new Request(`${SITE}/__ask_ai_page${path}`);
@@ -105,6 +118,10 @@ export default {
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
       .slice(-MAX_HISTORY_TURNS)
       .map((m) => ({ role: m.role, content: m.content.slice(0, MAX_HISTORY_CHARS) }));
+
+    if (!(await humanCheck(input.turnstile, ip, env.TURNSTILE_SECRET))) {
+      return json(403, { error: 'Could not verify that you are human. Please reload the page and try again.', turnstile: true }, cors);
+    }
 
     // Site-wide daily cap so the free Workers AI allocation is not exhausted (or billed) by a few heavy users.
     const day = new Date().toISOString().slice(0, 10);

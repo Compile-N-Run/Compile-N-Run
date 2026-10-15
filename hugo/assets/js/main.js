@@ -244,6 +244,7 @@
 
   /* ---------- Ask AI (Cloudflare Worker in worker/ask-ai) ---------- */
   var askEndpoint = {{ site.Params.askAI.endpoint | default "/api/ask" | jsonify | safeJS }};
+  var askSitekey = {{ site.Params.askAI.turnstileSitekey | jsonify | safeJS }};
   if (document.querySelector('[data-pagefind-body]') && /^\/(docs|blog)\//.test(location.pathname)) {
     var esc = function (s) { return s.replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
     var inline = function (s) {
@@ -301,6 +302,7 @@
       '<button type="button" class="cnr-ask__icon" data-ask-reset title="New chat" aria-label="Start a new chat"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4z"/></svg></button>' +
       '<button type="button" class="cnr-ask__icon" data-ask-close title="Close" aria-label="Close Ask AI"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button></div>' +
       '<div class="cnr-ask__log" aria-live="polite"></div>' +
+      '<div class="cnr-ask__ts"></div>' +
       '<form class="cnr-ask__form"><textarea rows="1" maxlength="1000" placeholder="Ask a question about this page…" aria-label="Your question"></textarea>' +
       '<button type="submit" class="cnr-ask__send" aria-label="Send"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2z"/></svg></button></form>' +
       '<div class="cnr-ask__note">AI answers can be wrong — double-check against the tutorial.</div>';
@@ -312,6 +314,46 @@
     var box = panel.querySelector('textarea');
     var send = panel.querySelector('.cnr-ask__send');
     var chat = [], busy = null;
+
+    // Turnstile: rendered (interaction-only, so usually invisible) when the panel first opens. Each question
+    // spends one token; the widget is then reset to fetch the next one.
+    var ts = { id: null, token: null, waiting: [] };
+    var tsGive = function (t) { ts.token = t; if (t) { ts.waiting.splice(0).forEach(function (w) { w.ok(t); }); } };
+    var tsFail = function (msg) { ts.waiting.splice(0).forEach(function (w) { w.fail(new Error(msg)); }); };
+    var tsLoad = function () {
+      if (ts.loading || !askSitekey) return;
+      ts.loading = true;
+      window.cnrAskTurnstile = function () {
+        ts.id = window.turnstile.render(panel.querySelector('.cnr-ask__ts'), {
+          sitekey: askSitekey,
+          appearance: 'interaction-only',
+          theme: root.getAttribute('data-theme') === 'dark' ? 'dark' : 'light',
+          action: 'ask-ai',
+          callback: tsGive,
+          'expired-callback': function () { ts.token = null; window.turnstile.reset(ts.id); },
+          'error-callback': function () { ts.token = null; tsFail('Human verification failed. Please reload the page and try again.'); return true; }
+        });
+      };
+      var sc = document.createElement('script');
+      sc.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=cnrAskTurnstile';
+      sc.async = true;
+      sc.onerror = function () { tsFail('Could not load the human check. Please disable blockers for this site and try again.'); };
+      document.head.appendChild(sc);
+    };
+    var tsToken = function () {
+      if (!askSitekey) return Promise.resolve('');
+      tsLoad();
+      if (ts.token) { var t = ts.token; ts.token = null; return Promise.resolve(t); }
+      return new Promise(function (ok, fail) {
+        var w = { ok: function (t) { clearTimeout(timer); ts.token = null; ok(t); }, fail: function (e) { clearTimeout(timer); fail(e); } };
+        var timer = setTimeout(function () {
+          ts.waiting = ts.waiting.filter(function (x) { return x !== w; });
+          fail(new Error('The human check did not finish. Please complete it below and ask again.'));
+        }, 45000);
+        ts.waiting.push(w);
+      });
+    };
+    var tsNext = function () { if (window.turnstile && ts.id !== null) window.turnstile.reset(ts.id); };
     var suggestions = ['Summarize this page in a few bullet points', 'Explain the first code example line by line', 'What should I practice after this tutorial?'];
 
     var intro = function () {
@@ -343,11 +385,14 @@
       setBusy(ctrl || true);
       var text = '', frame = 0;
       var paint = function () { frame = 0; var stick = log.scrollHeight - log.scrollTop - log.clientHeight < 40; out.innerHTML = markdown(text); if (stick) log.scrollTop = log.scrollHeight; };
-      fetch(askEndpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path: location.pathname, question: q, history: chat.slice(-6) }),
-        signal: ctrl ? ctrl.signal : undefined
+      tsToken().then(function (token) {
+        tsNext();
+        return fetch(askEndpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ path: location.pathname, question: q, history: chat.slice(-6), turnstile: token }),
+          signal: ctrl ? ctrl.signal : undefined
+        });
       }).then(function (res) {
         if (!res.ok) return res.json().catch(function () { return {}; }).then(function (j) { throw new Error(j.error || 'Something went wrong. Please try again.'); });
         var reader = res.body.getReader(), dec = new TextDecoder(), buf = '';
@@ -389,6 +434,7 @@
       askBtn.setAttribute('aria-expanded', 'true');
       root.classList.add('cnr-ask-open');
       if (!log.children.length) intro();
+      tsLoad();
       box.focus();
     };
     var closeAsk = function () {
