@@ -1,5 +1,7 @@
 // Ask AI: answers a reader's question about the Compile N Run page they are on, using Workers AI.
 // POST /api/ask {path, question, history, turnstile} -> text/event-stream (OpenAI-style chat.completion.chunk events).
+// Also takes the "Was this page helpful?" votes:
+// POST /api/feedback {path, vote: 1 | -1, comment?} -> {ok: true} (stored in the D1 database, see schema.sql).
 
 const SITE = 'https://www.compilenrun.com';
 // Small and cheap: ~8 Neurons for an answer with a full tutorial as context (Gemma 4 26B was ~50).
@@ -9,6 +11,7 @@ const MAX_HISTORY_TURNS = 6;
 const MAX_HISTORY_CHARS = 2000; // per message
 const MAX_PAGE_CHARS = 14000; // ~3.5k tokens of tutorial text
 const MAX_ANSWER_TOKENS = 700;
+const MAX_COMMENT = 1000;
 
 const SYSTEM = `You are "Ask AI", the assistant on Compile N Run (compilenrun.com), a free programming tutorial site for beginners.
 The reader is on the tutorial page below and is asking about it. Answer their question:
@@ -92,6 +95,38 @@ async function getPage(path, ctx) {
   return page;
 }
 
+const validPath = (p) => typeof p === 'string' && /^\/(docs|blog)\/[\w\-./%]*$/.test(p) && !p.includes('..') && p.length <= 300;
+
+async function voterId(ip, salt) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${salt}|${ip}`));
+  return [...new Uint8Array(digest).slice(0, 12)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function feedback(request, env, ctx, cors, ip) {
+  const { success } = await env.FEEDBACK_LIMIT.limit({ key: ip });
+  if (!success) return json(429, { error: 'Too many votes. Please wait a minute.' }, cors);
+  let input;
+  try {
+    input = await request.json();
+  } catch {
+    return json(400, { error: 'Invalid request.' }, cors);
+  }
+  const { path, vote } = input;
+  if (!validPath(path) || !path.startsWith('/docs/')) return json(400, { error: 'Unknown page.' }, cors);
+  if (vote !== 1 && vote !== -1) return json(400, { error: 'Invalid vote.' }, cors);
+  const comment = typeof input.comment === 'string' ? input.comment.trim().slice(0, MAX_COMMENT) || null : null;
+  // Only real pages get rows (the page text is cached for Ask AI anyway).
+  if (!(await getPage(path, ctx))) return json(404, { error: 'Unknown page.' }, cors);
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO votes (path, voter, vote, comment, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+     ON CONFLICT (path, voter) DO UPDATE SET vote = excluded.vote, comment = COALESCE(excluded.comment, votes.comment), updated_at = excluded.updated_at`
+  )
+    .bind(path, await voterId(ip, env.IP_SALT || ''), vote, comment, now)
+    .run();
+  return json(200, { ok: true }, cors);
+}
+
 export default {
   async fetch(request, env, ctx) {
     const cors = corsFor(request.headers.get('Origin') || '');
@@ -100,6 +135,7 @@ export default {
     if (!cors) return json(403, { error: 'Not allowed from this origin.' }, {});
 
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    if (new URL(request.url).pathname === '/api/feedback') return feedback(request, env, ctx, cors, ip);
     const { success } = await env.ASK_LIMIT.limit({ key: ip });
     if (!success) return json(429, { error: 'You are asking too quickly. Please wait a minute and try again.' }, cors);
 
@@ -111,7 +147,7 @@ export default {
     }
     const path = typeof input.path === 'string' ? input.path : '';
     const question = typeof input.question === 'string' ? input.question.trim() : '';
-    if (!/^\/(docs|blog)\/[\w\-./%]*$/.test(path) || path.includes('..') || path.length > 300) return json(400, { error: 'Ask AI only works on tutorial pages.' }, cors);
+    if (!validPath(path)) return json(400, { error: 'Ask AI only works on tutorial pages.' }, cors);
     if (!question) return json(400, { error: 'Please type a question.' }, cors);
     if (question.length > MAX_QUESTION) return json(400, { error: `Please keep your question under ${MAX_QUESTION} characters.` }, cors);
     const history = (Array.isArray(input.history) ? input.history : [])

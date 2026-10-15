@@ -246,6 +246,192 @@
     setTimeout(function () { render(saved && saved.until > Date.now() ? 'collapsed' : 'open'); }, 2500);
   }
 
+  /* ---------- Learning progress: pages read, per-tutorial counts, "Continue learning" (this browser only) ---------- */
+  var escHtml = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
+  var PKEY = 'cnr_progress';
+  var loadProgress = function () {
+    var p = null;
+    try { p = JSON.parse(store.get(PKEY) || 'null'); } catch (e) {}
+    return p && p.v === 1 && p.done && p.tuts ? p : { v: 1, done: {}, tuts: {} };
+  };
+  var progress = loadProgress();
+  var saveProgress = function () { store.set(PKEY, JSON.stringify(progress)); };
+  var pageTitle = document.title.replace(/\s*\|\s*Compile N Run\s*$/, '');
+  // Doc pages listed in a sidebar tree; generated category indexes (/docs/category/...) are not pages to read.
+  var sidebarPages = function (scope) {
+    var seen = {};
+    scope.querySelectorAll('a.menu__link[href]').forEach(function (a) {
+      var h = a.getAttribute('href');
+      if (h.charAt(0) === '/' && h.indexOf('/docs/category/') !== 0) seen[h] = true;
+    });
+    return Object.keys(seen);
+  };
+  var sideNav = document.querySelector('[data-doc-sidebar][data-tut]');
+  var tutBar = null;
+  var markRead = function (a, on) {
+    var check = a.querySelector(':scope > .cnr-check');
+    if (on && !check) a.insertAdjacentHTML('beforeend', '<span class="cnr-check" title="Completed" aria-label="(completed)">✓</span>');
+    else if (!on && check) check.remove();
+  };
+  var paintProgress = function () {
+    if (!sideNav) return;
+    var pages = sidebarPages(sideNav.querySelector('.theme-doc-sidebar-menu'));
+    var n = pages.filter(function (h) { return progress.done[h]; }).length;
+    // Both the desktop sidebar and the copy in the mobile menu.
+    document.querySelectorAll('.theme-doc-sidebar-menu').forEach(function (menu) {
+      menu.querySelectorAll('.theme-doc-sidebar-item-link > a.menu__link[href]').forEach(function (a) { markRead(a, !!progress.done[a.getAttribute('href')]); });
+      menu.querySelectorAll('.theme-doc-sidebar-item-category').forEach(function (li) {
+        var own = li.querySelector(':scope > .menu__list-item-collapsible > .menu__link');
+        var sub = li.querySelector(':scope > .menu__list');
+        var all = sub ? sidebarPages(sub) : [];
+        var href = own.getAttribute('href');
+        if (href && href.charAt(0) === '/' && href.indexOf('/docs/category/') !== 0) all.push(href);
+        markRead(own, all.length > 0 && all.every(function (h) { return progress.done[h]; }));
+      });
+    });
+    if (!tutBar) {
+      tutBar = document.createElement('div');
+      tutBar.className = 'cnr-progress';
+      sideNav.insertBefore(tutBar, sideNav.firstChild);
+    }
+    var pct = pages.length ? Math.round(100 * n / pages.length) : 0;
+    tutBar.hidden = !n;
+    tutBar.innerHTML = '<div class="cnr-progress__text"><span>' + n + ' of ' + pages.length + ' pages done</span><span>' + pct + '%</span></div>' +
+      '<div class="cnr-progress__bar" role="progressbar" aria-label="Tutorial progress" aria-valuenow="' + pct + '" aria-valuemin="0" aria-valuemax="100"><i style="width:' + pct + '%"></i></div>';
+    var dir = sideNav.getAttribute('data-tut');
+    var t = progress.tuts[dir] || (progress.tuts[dir] = {});
+    t.label = sideNav.getAttribute('data-tut-label');
+    t.url = sideNav.getAttribute('data-tut-url');
+    t.total = pages.length;
+    t.done = n;
+  };
+  // Generated category pages list pages and sections as cards; sections show how many of their pages are done.
+  var paintCards = function () {
+    var cats = {};
+    if (sideNav) sideNav.querySelectorAll('.theme-doc-sidebar-item-category').forEach(function (li) {
+      var own = li.querySelector(':scope > .menu__list-item-collapsible > .menu__link');
+      var sub = li.querySelector(':scope > .menu__list');
+      var href = own.getAttribute('href');
+      if (!sub || !href || href.charAt(0) !== '/') return;
+      var all = sidebarPages(sub);
+      if (href.indexOf('/docs/category/') !== 0 && all.indexOf(href) < 0) all.push(href);
+      cats[href] = all;
+    });
+    document.querySelectorAll('.generatedIndexPage_vN6x a.theme-doc-card-container[href]').forEach(function (a) {
+      var href = a.getAttribute('href'), all = cats[href];
+      var n = all ? all.filter(function (h) { return progress.done[h]; }).length : 0;
+      a.classList.toggle('cnr-card-read', all ? n === all.length : !!progress.done[href]);
+      var desc = a.querySelector('.cardDescription_L2fP');
+      if (all && n && desc) desc.textContent = all.length + ' pages · ' + n + ' done';
+    });
+  };
+  paintProgress();
+  paintCards();
+
+  var learn = document.querySelector('[data-learn]');
+  if (learn) {
+    learn.hidden = false;
+    if (sideNav) {
+      var cur = progress.tuts[sideNav.getAttribute('data-tut')];
+      cur.last = { path: here, title: pageTitle };
+      cur.t = Date.now();
+    }
+    saveProgress();
+    var doneBtn = learn.querySelector('[data-mark-done]');
+    var paintDone = function () {
+      var d = !!progress.done[here];
+      doneBtn.setAttribute('aria-pressed', String(d));
+      doneBtn.innerHTML = d ? '<span aria-hidden="true">✓</span> Completed' : 'Mark as complete';
+      doneBtn.title = d ? 'Click to mark this page as not completed' : 'Pages are also marked complete when you reach the end';
+    };
+    var setDone = function (d) {
+      progress = loadProgress(); // another tab may have saved since this page loaded
+      if (d) progress.done[here] = Date.now(); else delete progress.done[here];
+      paintProgress();
+      saveProgress();
+      paintDone();
+    };
+    var touched = false;
+    doneBtn.onclick = function () { touched = true; setDone(!progress.done[here]); };
+    paintDone();
+    // Reaching the end of the page counts as reading it, once the reader has spent a little time here.
+    var started = Date.now();
+    if (!progress.done[here] && 'IntersectionObserver' in window) {
+      var seenEnd = new IntersectionObserver(function (entries) {
+        if (!entries.some(function (e) { return e.isIntersecting; })) return;
+        seenEnd.disconnect();
+        setTimeout(function () { if (!touched && !progress.done[here]) setDone(true); }, Math.max(0, 20000 - (Date.now() - started)));
+      });
+      seenEnd.observe(learn);
+    }
+
+    /* "Was this page helpful?" -> worker/ask-ai (/api/feedback), one vote per page and reader. */
+    var feedbackEndpoint = {{ site.Params.feedback.endpoint | default "/api/feedback" | jsonify | safeJS }};
+    var VKEY = 'cnr_votes';
+    var votes = {};
+    try { votes = JSON.parse(store.get(VKEY) || '{}') || {}; } catch (e) {}
+    var voteBtns = learn.querySelectorAll('[data-vote]');
+    var commentForm = learn.querySelector('[data-vote-comment]');
+    var thanks = learn.querySelector('[data-vote-thanks]');
+    var paintVote = function (v) { voteBtns.forEach(function (b) { b.setAttribute('aria-pressed', String(Number(b.getAttribute('data-vote')) === v)); }); };
+    var say = function (msg) { thanks.textContent = msg; thanks.hidden = !msg; };
+    var sendVote = function (body) {
+      return fetch(feedbackEndpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+        .then(function (r) { if (!r.ok) throw new Error(); });
+    };
+    paintVote(votes[here]);
+    voteBtns.forEach(function (b) {
+      b.onclick = function () {
+        var v = Number(b.getAttribute('data-vote'));
+        paintVote(v);
+        commentForm.hidden = v !== -1;
+        say(v === 1 ? 'Thanks! Glad it helped.' : 'Sorry about that. What should we fix?');
+        if (v === -1) commentForm.querySelector('textarea').focus();
+        sendVote({ path: here, vote: v }).then(function () {
+          votes[here] = v;
+          store.set(VKEY, JSON.stringify(votes));
+        }).catch(function () { paintVote(votes[here]); commentForm.hidden = true; say('Your vote could not be sent. Please try again later.'); });
+      };
+    });
+    commentForm.onsubmit = function (e) {
+      e.preventDefault();
+      var text = commentForm.querySelector('textarea').value.trim();
+      if (!text) return;
+      var send = commentForm.querySelector('button');
+      send.disabled = true;
+      sendVote({ path: here, vote: -1, comment: text }).then(function () {
+        commentForm.hidden = true;
+        say('Thank you! Your note helps us improve this page.');
+      }).catch(function () { say('Your note could not be sent. Please try again later.'); })
+        .then(function () { send.disabled = false; });
+    };
+  }
+
+  // Home page: the tutorials this reader has been working through.
+  var cont = document.querySelector('[data-continue]');
+  if (cont) {
+    var recent = Object.keys(progress.tuts).map(function (k) { return progress.tuts[k]; })
+      .filter(function (t) { return t.last && /^\/docs\//.test(t.last.path); })
+      .sort(function (a, b) { return (b.t || 0) - (a.t || 0); }).slice(0, 4);
+    if (recent.length) {
+      cont.innerHTML = '<div class="container"><div class="cnr-continue__head"><h2>Continue learning</h2>' +
+        '<button type="button" class="clean-btn cnr-continue__clear">Clear progress</button></div><div class="row">' +
+        recent.map(function (t) {
+          var pct = t.total ? Math.round(100 * t.done / t.total) : 0;
+          return '<div class="col col--3"><a class="card cnr-continue__card" href="' + escHtml(t.last.path) + '">' +
+            '<strong>' + escHtml(t.label) + '</strong><span class="cnr-continue__last">Continue: ' + escHtml(t.last.title) + ' →</span>' +
+            '<span class="cnr-progress__bar"><i style="width:' + pct + '%"></i></span>' +
+            '<span class="cnr-continue__count">' + (t.done || 0) + ' of ' + (t.total || 0) + ' pages done</span></a></div>';
+        }).join('') + '</div><p class="cnr-continue__note">Your progress is saved in this browser only.</p></div>';
+      cont.hidden = false;
+      cont.querySelector('.cnr-continue__clear').onclick = function () {
+        if (!confirm('Clear your reading progress in this browser?')) return;
+        try { localStorage.removeItem(PKEY); } catch (e) {}
+        cont.hidden = true;
+      };
+    }
+  }
+
   /* ---------- Ask AI (Cloudflare Worker in worker/ask-ai) ---------- */
   var askEndpoint = {{ site.Params.askAI.endpoint | default "/api/ask" | jsonify | safeJS }};
   var askSitekey = {{ site.Params.askAI.turnstileSitekey | jsonify | safeJS }};
