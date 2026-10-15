@@ -320,6 +320,10 @@ const config = {
                                     to: "/docs/fundamental/architecture"
                                 },
                                 {
+                                    label: 'Web Accessibility',
+                                    to: "/docs/fundamental/web-accessibility"
+                                },
+                                {
                                     label: 'Cybersecurity',
                                     to: "/docs/fundamental/security"
                                 }
@@ -336,6 +340,14 @@ const config = {
                                 {
                                     label: 'Java',
                                     to: "/docs/language/java"
+                                },
+                                {
+                                    label: 'HTML',
+                                    to: "/docs/language/html"
+                                },
+                                {
+                                    label: 'CSS',
+                                    to: "/docs/language/css"
                                 },
                                 {
                                     label: 'JavaScript',
@@ -394,6 +406,22 @@ const config = {
                             label: "Web",
                             items: [
                                 {
+                                    label: 'Frontend - HTML',
+                                    to: "/docs/language/html"
+                                },
+                                {
+                                    label: 'Frontend - CSS',
+                                    to: "/docs/language/css"
+                                },
+                                {
+                                    label: 'Frontend - Tailwind CSS',
+                                    to: "/docs/framework/tailwind"
+                                },
+                                {
+                                    label: 'Frontend - Web Accessibility',
+                                    to: "/docs/fundamental/web-accessibility"
+                                },
+                                {
                                     label: 'Frontend - JavaScript',
                                     to: "/docs/language/javascript"
                                 },
@@ -428,6 +456,10 @@ const config = {
                                 {
                                     label: 'Backend - Spring',
                                     to: "/docs/framework/spring"
+                                },
+                                {
+                                    label: 'Backend - Node.js',
+                                    to: "/docs/framework/nodejs"
                                 },
                                 {
                                     label: 'Backend - Express',
@@ -497,6 +529,10 @@ const config = {
                                 {
                                     label: 'Python - Pandas',
                                     to: "/docs/library/pandas"
+                                },
+                                {
+                                    label: 'Python - scikit-learn',
+                                    to: "/docs/library/scikit-learn"
                                 },
                                 {
                                     label: 'Python - PyTorch',
@@ -593,6 +629,10 @@ const config = {
                             type: "dropdown",
                             label: "DevOps",
                             items: [
+                                {
+                                    label: 'GitHub Actions',
+                                    to: "/docs/devops/github-actions"
+                                },
                                 {
                                     label: "CI/CD",
                                     to: "/docs/devops/cicd"

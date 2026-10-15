@@ -57,6 +57,7 @@ import dbaLogo from '@site/static/img/fundamentals-logo/database_logo.png';
 import stm32Logo from '@site/static/img/iot-logo/stm32_logo.png';
 import iot51Logo from '@site/static/img/iot-logo/51_logo.png';
 import htmlLogo from '@site/static/img/web-logo/html_logo.png';
+import cssLogo from '@site/static/img/web-logo/css_logo.png';
 import osLogo from '@site/static/img/fundamentals-logo/os_logo.png';
 import rabbitmqLogo from '@site/static/img/middleware-logo/rabbitmq_logo.png';
 import zookeeperLogo from '@site/static/img/middleware-logo/zookeeper_logo.png';
@@ -97,6 +98,20 @@ const programmingLanguagesList = [
         },
         url: "/docs/language/java",
         description: <>Java is a object-oriented programming language designed to be platform-independent.</>,
+    }, {
+        title: 'HTML',
+        Icon: (alt) => {
+            return <Image img={htmlLogo} className={styles.featureImage} alt={alt.alt}/>;
+        },
+        url: "/docs/language/html",
+        description: <>Build well-structured web pages with semantic HTML, accessible forms, images, and practical projects.</>,
+    }, {
+        title: 'CSS',
+        Icon: (alt) => {
+            return <Image img={cssLogo} className={styles.featureImage} alt={alt.alt}/>;
+        },
+        url: "/docs/language/css",
+        description: <>Style responsive websites with the cascade, box model, Flexbox, Grid, and accessible components.</>,
     }, {
         title: 'JavaScript',
         Icon: (alt) => {
@@ -204,6 +219,12 @@ const programmingLanguagesList = [
 
 const fundamentalsList = [
     {
+        title: 'Web Accessibility',
+        Icon: (alt) => <img src="/img/tutorial-topics/web-accessibility.svg" className={styles.featureImage} alt={alt.alt}/>,
+        url: "/docs/fundamental/web-accessibility",
+        description: <>Create accessible content and interactions, then verify keyboard access, error recovery, and user preferences.</>,
+    },
+    {
         title: 'Interview Preparation',
         Icon: () => {
             return <Image img={interviewLogo} className={styles.featureImage}/>;
@@ -269,6 +290,18 @@ const fundamentalsList = [
 ];
 
 const frameworkList = [
+    {
+        title: 'Tailwind CSS',
+        Icon: (alt) => <img src="/img/tutorial-topics/tailwind.svg" className={styles.featureImage} alt={alt.alt}/>,
+        url: "/docs/framework/tailwind",
+        description: <>Build responsive interfaces with Tailwind CSS utilities, themes, states, and production workflows.</>,
+    },
+    {
+        title: 'Node.js',
+        Icon: (alt) => <img src="/img/tutorial-topics/nodejs.svg" className={styles.featureImage} alt={alt.alt}/>,
+        url: "/docs/framework/nodejs",
+        description: <>Learn the Node.js runtime, modules, asynchronous code, files, streams, HTTP, and testing.</>,
+    },
     {
         title: "Spring",
         Icon: (alt) => {
@@ -445,6 +478,12 @@ const observabilityList = [
 
 const libraryList = [
     {
+        title: 'scikit-learn',
+        Icon: (alt) => <img src="/img/tutorial-topics/scikit-learn.svg" className={styles.featureImage} alt={alt.alt}/>,
+        url: "/docs/library/scikit-learn",
+        description: <>Build reproducible machine-learning workflows with preprocessing, pipelines, model evaluation, and tuning.</>,
+    },
+    {
         title: "Pandas",
         Icon: (alt) => {
             return <Image img={pandasLogo} className={styles.featureImage} alt={alt.alt}/>;
@@ -561,6 +600,12 @@ const aiList = [
 ];
 
 const devopsList = [
+    {
+        title: 'GitHub Actions',
+        Icon: (alt) => <img src="/img/tutorial-topics/github-actions.svg" className={styles.featureImage} alt={alt.alt}/>,
+        url: "/docs/devops/github-actions",
+        description: <>Automate tests and delivery with workflows, matrices, reusable jobs, artifacts, and secure permissions.</>,
+    },
     {
         title: "CI/CD",
         Icon: (alt) => {
