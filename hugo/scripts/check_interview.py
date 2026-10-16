@@ -103,18 +103,24 @@ def read(*parts):
     return open(os.path.join(*parts), encoding='utf-8').read()
 
 
+def extra(tests, name):
+    """Optional per-problem prelude (types LeetCode provides for this problem only, e.g. a Node with `random`)."""
+    path = os.path.join(tests, name)
+    return read(path) + '\n' if os.path.isfile(path) else ''
+
+
 def run_language(slug, lang, code):
     tests = os.path.join(TESTS, slug)
     with tempfile.TemporaryDirectory(prefix=f'cnr-{slug}-{lang}-') as work:
         if lang == 'python':
-            open(os.path.join(work, 'solution.py'), 'w').write(read(PRELUDE, 'prelude.py') + '\n\n' + code)
+            open(os.path.join(work, 'solution.py'), 'w').write(read(PRELUDE, 'prelude.py') + '\n\n' + extra(tests, 'prelude.py') + code)
             shutil.copy(os.path.join(tests, 'test.py'), work)
             run([sys.executable, 'test.py'], work)
         elif lang == 'javascript':
-            open(os.path.join(work, 'main.js'), 'w').write('"use strict";\n' + read(PRELUDE, 'prelude.js') + '\n' + code + '\n' + read(tests, 'test.js'))
+            open(os.path.join(work, 'main.js'), 'w').write('"use strict";\n' + read(PRELUDE, 'prelude.js') + '\n' + extra(tests, 'prelude.js') + code + '\n' + read(tests, 'test.js'))
             run(['node', 'main.js'], work)
         elif lang == 'cpp':
-            open(os.path.join(work, 'main.cpp'), 'w').write(read(PRELUDE, 'prelude.hpp') + '\n' + code + '\n' + read(tests, 'test.cpp'))
+            open(os.path.join(work, 'main.cpp'), 'w').write(read(PRELUDE, 'prelude.hpp') + '\n' + extra(tests, 'prelude.hpp') + code + '\n' + read(tests, 'test.cpp'))
             run(['g++', '-std=c++17', '-O1', '-Wall', '-Werror=return-type', '-o', 'main', 'main.cpp'], work, 120)
             run(['./main'], work)
         elif lang == 'go':
@@ -122,13 +128,17 @@ def run_language(slug, lang, code):
             open(os.path.join(work, 'solution.go'), 'w').write('package main\n\n' + code)
             shutil.copy(os.path.join(PRELUDE, 'prelude.go'), work)
             shutil.copy(os.path.join(tests, 'test.go'), os.path.join(work, 'main.go'))
+            if os.path.isfile(os.path.join(tests, 'prelude.go')):
+                shutil.copy(os.path.join(tests, 'prelude.go'), os.path.join(work, 'extra.go'))
             run(['go', 'run', '.'], work, 180)
         elif lang == 'java':
             imports = '' if re.search(r'^import java\.util\.\*;', code, re.M) else 'import java.util.*;\n'
             open(os.path.join(work, 'Solution.java'), 'w').write(imports + code)
             for name in ('ListNode.java', 'TreeNode.java', 'Check.java'):
                 shutil.copy(os.path.join(PRELUDE, name), work)
-            shutil.copy(os.path.join(tests, 'Main.java'), work)
+            for name in os.listdir(tests):  # Main.java plus any per-problem types (e.g. Node.java)
+                if name.endswith('.java'):
+                    shutil.copy(os.path.join(tests, name), work)
             run(['javac', '-encoding', 'UTF-8', '-d', 'out'] + sorted(f for f in os.listdir(work) if f.endswith('.java')), work, 120)
             run(['java', '-cp', 'out', 'Main'], work)
 

@@ -70,6 +70,11 @@ single element, duplicates, negatives, limits) and one larger case. It must exit
 | `test.go` | `package main` with `func main()`; `os.Exit(1)` on failure | `buildList`, `listValues`, `buildTree` (`NUL`) |
 | `Main.java` | `class Main` with `main`, ends with `Check.done()` | `Check.eq`, `Check.list`, `Check.values`, `Check.tree` |
 
+**Problem-specific types.** If LeetCode provides a type only for this problem (for example `Node` with a `random`
+pointer), put it in the test folder: `prelude.py`, `prelude.js`, `prelude.hpp` and `prelude.go` are inserted before the
+solution, and any extra `*.java` file (e.g. `Node.java`) is compiled with it. Never add such types to `_prelude/`, where
+names like `Node` would clash between problems.
+
 When several answers are valid (any order, any valid index pair), normalise before comparing (sort, or verify the
 property instead of the exact value).
 

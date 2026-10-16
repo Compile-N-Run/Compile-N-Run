@@ -80,7 +80,9 @@ test('reading is explicit; bookmark, note, dashboard, and roadmap agree', async 
 test('learning backup downloads, previews and merges in a clean browser', async ({ page, browser }) => {
   await page.goto(cssLesson);
   await page.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
-  await page.evaluate(path => window.CNRLearning.setBookmark(path, true), cssLesson);
+  // Writes are briefly refused (with a notice) while the session check re-activates the guest workspace just
+  // after load, so retry until the bookmark is accepted, as a reader would after seeing the notice.
+  await expect.poll(() => page.evaluate(path => window.CNRLearning.setBookmark(path, true), cssLesson)).toBe(true);
   await page.locator('[data-mark-done]').click();
   await expect(page.locator('[data-mark-done]')).toHaveAttribute('aria-pressed', 'true');
   await page.goto('/learn/');

@@ -55,7 +55,7 @@ The brute force checks every one of the O(n²) substrings for being a palindrome
 
 ## Related problems
 
-- Palindromic Substrings: count every palindromic substring instead of finding the longest.
+- [Palindromic Substrings](/interview/problems/palindromic-substrings/): count every palindromic substring instead of finding the longest.
 - Longest Palindromic Subsequence: characters may be skipped, which calls for dynamic programming.
 
 ## Solutions
