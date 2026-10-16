@@ -55,10 +55,11 @@ def main():
                               'rank': rank, 'count': len(s['companies']), 'score': round(s['all'], 2),
                               'recent': round(s['recent'], 2), 'written': slug in written,
                               'companies': [c[0] for c in s['companies']]}
+    logos = set(json.load(open(os.path.join(SRC, 'data', 'company-logos.json'), encoding='utf-8')))
     companies = []
     for c in snapshot['companies']:
         windows = {w: sum(1 for _, f in c['problems'] if w in f) for w in WINDOWS}
-        companies.append({'name': c['name'], 'slug': c['slug'], 'count': len(c['problems']), 'windows': windows,
+        companies.append({'name': c['name'], 'slug': c['slug'], 'logo': c['slug'] in logos, 'count': len(c['problems']), 'windows': windows,
                           'written': sum(1 for slug, _ in c['problems'] if slug in written),
                           'problems': c['problems']})
     companies.sort(key=lambda c: c['name'].lower())
@@ -72,7 +73,7 @@ def main():
         c['json'] = table(c['problems'])
     ranking = [[slug, {'all': out_problems[slug]['score'], **({'m6': out_problems[slug]['recent']} if out_problems[slug]['recent'] else {})}]
                for slug in order]
-    data = {'source': snapshot['source'], 'order': order, 'ranking': ranking, 'rankingJson': table(ranking), 'recentCount': sum(1 for r in ranking if 'm6' in r[1]), 'names': names, 'problems': out_problems, 'companies': companies,
+    data = {'source': snapshot['source'], 'order': order, 'ranking': ranking, 'rankingJson': table(ranking), 'recentCount': sum(1 for r in ranking if 'm6' in r[1]), 'names': names, 'logos': sorted(logos), 'problems': out_problems, 'companies': companies,
             'popular': [c['slug'] for c in sorted(companies, key=lambda c: -c['count'])[:12]],
             'writtenCount': len(written)}
     with open(DATA, 'w', encoding='utf-8') as f:

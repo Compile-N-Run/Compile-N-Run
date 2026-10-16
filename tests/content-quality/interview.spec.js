@@ -18,6 +18,30 @@ test('company directory search narrows the list and Enter opens the first match'
   await expect(page).toHaveURL(/\/interview\/company\/google\/$/);
 });
 
+test('company cards show a logo or initial and keep one size at every width', async ({ page }) => {
+  for (const width of [1280, 820, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto('/interview/');
+    const result = await page.evaluate(async () => {
+      const cards = [...document.querySelectorAll('[data-iv-companies] li a')];
+      const images = [...document.querySelectorAll('[data-iv-companies] img')];
+      images.forEach(img => { img.loading = 'eager'; });
+      await Promise.all(images.map(img => img.complete ? null : new Promise(done => { img.onload = img.onerror = done; })));
+      return {
+        heights: [...new Set(cards.map(a => Math.round(a.getBoundingClientRect().height)))],
+        withoutBadge: cards.filter(a => !a.querySelector('.cnr-iv-logo')).length,
+        broken: images.filter(img => !img.naturalWidth).map(img => img.src),
+        initials: document.querySelectorAll('[data-iv-companies] .cnr-iv-logo--initial').length,
+      };
+    });
+    expect(result.heights, `card heights at ${width}px`).toHaveLength(1);
+    expect(result.withoutBadge).toBe(0);
+    expect(result.broken).toEqual([]);
+    expect(result.initials).toBeGreaterThan(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  }
+});
+
 test('company table switches time windows, filters, pages and links each problem', async ({ page }) => {
   await page.goto('/interview/company/google/');
   const rows = page.locator('[data-iv-rows] tr');

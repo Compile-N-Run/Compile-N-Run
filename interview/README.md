@@ -88,7 +88,12 @@ python3 hugo/scripts/check_interview.py              # everything (CI runs this)
 ```bash
 git clone --depth 1 https://github.com/liquidslr/leetcode-company-wise-problems /tmp/lc
 python3 hugo/scripts/import_leetcode.py /tmp/lc
+python3 hugo/scripts/fetch_company_logos.py   # logos for new companies (add their domain first)
 ```
+
+Company logos live in `static/img/companies/<slug>.png` (64×64, committed) and are downloaded once by
+`fetch_company_logos.py` from the domains in `data/company-domains.json`. A `null` domain shows a coloured initial
+instead; use it for ambiguous names or when the fetched icon is wrong. Check new logos by eye before committing.
 
 The source repository has no license; we keep only factual fields (title, difficulty, topics, link, per-company
 frequency) and credit it on every page.
