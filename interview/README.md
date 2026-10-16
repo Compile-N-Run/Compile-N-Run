@@ -9,6 +9,7 @@ interview/
   problems/<slug>.md             one write-up per LeetCode problem
   tests/<slug>/                  test.py, Main.java, test.cpp, test.js, test.go
   tests/_prelude/                ListNode, TreeNode and test helpers for each language
+  topics/<topic-slug>.md         one guide per LeetCode topic tag (Sliding Window, Heap, ...)
 ```
 
 ## Rules
@@ -83,6 +84,45 @@ python3 hugo/scripts/check_interview.py two-sum      # one problem
 python3 hugo/scripts/check_interview.py              # everything (CI runs this)
 ```
 
+## Topic guides
+
+`/interview/topics/` groups every company-tagged problem by its LeetCode topic tags (Two Pointers, Sliding Window,
+Heap, Stack, ...). Each topic gets a page with its problems sorted by how often companies ask them; a guide in
+`topics/<topic-slug>.md` adds the lesson above that list so readers learn the technique first, then practice.
+Topics without a guide still get a page with just the list.
+
+The file name is the topic's slug: lower-case, accents removed, apostrophes dropped, every other run of
+non-alphanumerics becomes one `-` (`Heap (Priority Queue)` → `heap-priority-queue`, `Dijkstra's Algorithm` →
+`dijkstras-algorithm`, `Knuth–Morris–Pratt Algorithm` → `knuth-morris-pratt-algorithm`). The checker rejects a guide
+whose `topic` is not a tag in the data or whose file name is not that tag's slug.
+
+```markdown
+---
+title: Sliding Window          # display name; normally the tag itself
+topic: Sliding Window          # the exact LeetCode tag (see the Topics column of any problem table)
+group: patterns                # patterns | structures | graphs | math  (section on /interview/topics/)
+description: "One sentence for the topic card and search results: what the technique is and when it applies."
+---
+
+## What it is          the idea in plain words, for someone meeting it for the first time
+## When to use it      the signals in a problem statement that point to this technique (bullet list)
+## How it works        the mechanics step by step, with one small worked example traced by hand
+## Template            exactly five fenced blocks in order python, java, cpp, javascript, go: a generic,
+                       complete, compilable skeleton of the technique with comments where the problem-specific
+                       parts go (a function, not a class Solution; it must compile and run as written)
+## Variations          optional: the common sub-patterns (fixed vs. variable window, ...)
+## Common mistakes     optional bullet list
+## Complexity          optional: what the technique usually costs and why
+## Where to start      an ordered list of 5-8 problems to practice in, easiest first, one line each on what it
+                       teaches; link written ones as [N. Title](/interview/problems/<slug>/), name the others
+                       in plain text (the full list follows the guide automatically, so do not repeat it)
+```
+
+Guides use the same voice as the write-ups: our own words, no copied text, examples of our own. Verify every
+template block compiles and runs (`python3`, `node`, `g++ -std=c++17`, `go run`, `javac`) before committing;
+the checker validates the structure (`python3 hugo/scripts/check_interview.py --no-run` covers guides too) but
+does not execute templates.
+
 ## Problem numbers and the full catalog
 
 `data/leetcode-problems.json` is a snapshot of LeetCode's public problem list (number, title, slug, difficulty,
@@ -91,6 +131,17 @@ company lists are a subset of it, and every write-up must be in it. Page titles 
 (the write-up's own `title` stays LeetCode's title). Readers mark problems as solved from a problem page or any
 table; the mark is a learning-store practice record on `/interview/problems/<slug>/`, so it syncs and backs up with
 the rest of their learning.
+
+## The editor on problem pages
+
+Each problem page shows the write-up on the left and an editor on the right (`hugo/assets/js/interview-workspace.js`).
+The editor starts from a stub that `hugo/scripts/interview_stubs.py` derives from the solution at build time (the
+class and the public method signatures the tests call, bodies removed), so write solutions in LeetCode's shape:
+`class Solution` / the design class in Python, Java and C++; `var name = function (...)` and `Name.prototype.method`
+in JavaScript; `func name(...)` / `type Name struct` + `Constructor` in Go. Python and JavaScript run in the browser
+(Pyodide and a Worker, via `runner.js`) against `tests/<slug>/test.py` and `test.js`, which is why those two test
+files must only use the prelude helpers and `check`; the tests are shipped to the page, so keep them free of
+anything that should not be public. Java, C++ and Go can be written in the editor and pasted into LeetCode.
 
 ## Updating the company data
 

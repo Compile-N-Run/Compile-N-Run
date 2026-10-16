@@ -77,19 +77,68 @@ test('global ranking lists every problem, most asked first, with a recent view',
   expect(recent).toBeLessThan(total);
 });
 
-test('problem write-up shows one solution tab at a time and remembers the language', async ({ page }) => {
+test('problem page puts the write-up beside an editor that runs the tests in the browser', async ({ page }) => {
   await page.goto('/interview/problems/two-sum/');
+  const workspace = page.locator('[data-iv-workspace]');
+  await expect(workspace).toBeVisible();
+  await expect(page.locator('[data-iv-body] h2#solutions')).toHaveCount(0); // moved into the editor's Solution view
+  const tabs = workspace.locator('[role=tab]');
+  await expect(tabs).toHaveText(['Python', 'JavaScript', 'Java', 'C++', 'Go']);
+  const article = await page.locator('.cnr-iv-split__text').boundingBox();
+  const aside = await workspace.boundingBox();
+  expect(aside.x).toBeGreaterThan(article.x + article.width - 1); // two columns at desktop width
+  const editor = workspace.locator('textarea');
+  await expect(editor).toHaveValue(/class Solution:\n    def twoSum\(self, nums: List\[int\], target: int\) -> List\[int\]:/);
+  await tabs.nth(1).click();
+  await expect(editor).toHaveValue(/^var twoSum = function \(nums, target\) \{/);
+  await editor.fill('var twoSum = function (nums, target) {\n  return [0, 0];\n};');
+  await workspace.locator('.cnr-iv-ws__run--tests').click();
+  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('Some tests failed');
+  await expect(workspace.locator('.cnr-iv-ws__err')).toContainText('expected');
+  await workspace.locator('[aria-pressed]:has-text("Solution")').click();
+  await expect(workspace.locator('.cnr-iv-ws__solution-body .theme-code-block.language-javascript')).toBeVisible();
+  page.once('dialog', dialog => dialog.accept());
+  await workspace.locator('button:has-text("Load into editor")').click();
+  await expect(editor).toHaveValue(/const seen = new Map\(\)|new Map\(\)/);
+  await workspace.locator('.cnr-iv-ws__run--tests').click();
+  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('All tests passed');
+  await page.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
+  await workspace.locator('.cnr-iv-ws__verdict button:has-text("Mark as solved")').click();
+  await expect(page.locator('[data-iv-solve-toggle]')).toHaveAttribute('aria-pressed', 'true');
+  await page.reload();
+  await expect(workspace.locator('[role=tab][aria-selected=true]')).toHaveText('JavaScript'); // remembered
+  await expect(editor).toHaveValue(/new Map\(\)/); // the draft survives a reload
+  await expect(page.locator('[data-iv-chips] a').first()).toHaveAttribute('href', /^\/interview\/company\//);
+  await expect(page.locator('.cnr-iv-meta__topics a').first()).toHaveAttribute('href', /^\/interview\/topics\//);
+  await page.setViewportSize({ width: 820, height: 900 });
+  const narrowArticle = await page.locator('.cnr-iv-split__text').boundingBox();
+  const narrowAside = await workspace.boundingBox();
+  expect(narrowAside.y).toBeGreaterThan(narrowArticle.y + narrowArticle.height - 1); // stacked on narrow screens
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('topics directory groups the guides, searches, and a topic page teaches then lists its problems', async ({ page }) => {
+  await page.goto('/interview/topics/');
+  expect(await page.locator('[data-iv-topic-group]').count()).toBeGreaterThan(3);
+  expect(await page.locator('.cnr-iv-topic-card').count()).toBeGreaterThan(30);
+  await page.locator('[data-iv-topic-search]').fill('sliding');
+  await expect(page.locator('[data-iv-topics] li:visible')).toHaveCount(1);
+  await page.locator('[data-iv-topic-search]').press('Enter');
+  await expect(page).toHaveURL(/\/interview\/topics\/sliding-window\/$/);
+  await expect(page.locator('h1')).toHaveText('Sliding Window');
+  await expect(page.locator('[data-iv-body] h2').first()).toHaveText('What it is');
   const tabs = page.locator('.cnr-iv-solutions [role=tab]');
   await expect(tabs).toHaveText(['Python', 'Java', 'C++', 'JavaScript', 'Go']);
   await expect(page.locator('.cnr-iv-solutions [role=tabpanel]:visible')).toHaveCount(1);
-  await tabs.nth(3).click();
-  await expect(page.locator('#iv-solution-javascript')).toBeVisible();
-  await page.keyboard.press('ArrowRight');
-  await expect(page.locator('#iv-solution-go')).toBeVisible();
-  await page.reload();
-  await expect(page.locator('#iv-solution-go')).toBeVisible();
-  await expect(page.locator('[data-iv-chips] a').first()).toHaveAttribute('href', /^\/interview\/company\//);
-  await expect(page.locator('a.cnr-iv-button')).toHaveAttribute('href', 'https://leetcode.com/problems/two-sum/');
+  const total = Number((await page.locator('[data-iv-count]').innerText()).split(' ')[0]);
+  expect(total).toBeGreaterThan(100);
+  await expect(page.locator('[data-iv-rows] tr').first().locator('.cnr-iv-title a').first()).toHaveText(/^\d+\. /);
+  await expect(page.locator('.cnr-iv-table thead')).toContainText('Score');
+  await page.goto('/interview/topics/segment-tree/');
+  await expect(page.locator('h1')).toHaveText('Segment Tree');
+  await page.goto('/interview/topics/eulerian-circuit/'); // a topic without a guide still lists its problems
+  await expect(page.locator('[data-iv-rows] tr').first()).toBeVisible();
+  await expect(page.locator('main')).toContainText('no guide for this topic yet');
 });
 
 test('catalog lists every LeetCode problem by number, finds one by number, and solved marks reach the dashboard', async ({ page }) => {

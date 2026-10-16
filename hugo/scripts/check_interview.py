@@ -9,6 +9,7 @@ Layout (one write-up per LeetCode problem, never duplicated):
   interview/problems/<leetcode-slug>.md   front matter + sections + one code block per language
   interview/tests/<leetcode-slug>/         test.py, test.js, test.cpp, test.go, Main.java
   interview/tests/_prelude/                ListNode/TreeNode and helpers per language
+  interview/topics/<topic-slug>.md         optional guide per LeetCode topic tag (structure is validated here)
 """
 import argparse
 import concurrent.futures
@@ -19,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 
 import yaml
 
@@ -27,6 +29,7 @@ INTERVIEW = os.path.join(ROOT, 'interview')
 PROBLEMS = os.path.join(INTERVIEW, 'problems')
 TESTS = os.path.join(INTERVIEW, 'tests')
 PRELUDE = os.path.join(TESTS, '_prelude')
+TOPICS = os.path.join(INTERVIEW, 'topics')
 DATA = os.path.join(INTERVIEW, 'data', 'leetcode-companies.json')
 
 SECTIONS = ['Problem', 'Examples', 'Key idea', 'Approach', 'Complexity', 'Solutions']
@@ -34,6 +37,15 @@ OPTIONAL = {'Common mistakes', 'Follow-up questions', 'Related problems'}
 LANGUAGES = ['python', 'java', 'cpp', 'javascript', 'go']
 TEST_FILES = {'python': 'test.py', 'java': 'Main.java', 'cpp': 'test.cpp', 'javascript': 'test.js', 'go': 'test.go'}
 FENCE = re.compile(r'^```([a-z+#]*)[^\n]*\n(.*?)^```\s*$', re.S | re.M)
+TOPIC_SECTIONS = ['What it is', 'When to use it', 'How it works', 'Template', 'Where to start']
+TOPIC_OPTIONAL = {'Variations', 'Common mistakes', 'Complexity'}
+TOPIC_GROUPS = {'patterns', 'structures', 'graphs', 'math'}
+
+
+def topic_slug(name):
+    """'Heap (Priority Queue)' -> 'heap-priority-queue'; must match interview.py."""
+    text = ''.join(c for c in unicodedata.normalize('NFKD', name) if not unicodedata.combining(c)).lower()
+    return re.sub(r'[^a-z0-9]+', '-', text.replace("'", '')).strip('-')
 
 
 def parse(path):
@@ -93,6 +105,39 @@ def validate(slug, problems):
     return errors
 
 
+def validate_topic(slug, tags):
+    errors = []
+    try:
+        fm, body = parse(os.path.join(TOPICS, slug + '.md'))
+    except (ValueError, yaml.YAMLError) as e:
+        return [f'topics/{slug}: {e}']
+    for key in ('title', 'topic', 'description'):
+        if not isinstance(fm.get(key), str) or not fm[key].strip():
+            errors.append(f'topics/{slug}: front matter needs a {key}')
+    if fm.get('topic') not in tags:
+        errors.append(f'topics/{slug}: topic {fm.get("topic")!r} is not a tag in the company data')
+    elif topic_slug(fm['topic']) != slug:
+        errors.append(f'topics/{slug}: file name must be {topic_slug(fm["topic"])}.md for topic {fm["topic"]!r}')
+    if fm.get('group') not in TOPIC_GROUPS:
+        errors.append(f'topics/{slug}: group must be one of {sorted(TOPIC_GROUPS)}')
+    found, names = sections(body)
+    if [n for n in names if n in TOPIC_SECTIONS] != TOPIC_SECTIONS:
+        errors.append(f'topics/{slug}: sections must be ## {" / ## ".join(TOPIC_SECTIONS)} in that order (found {names})')
+    for name in names:
+        if name not in TOPIC_SECTIONS and name not in TOPIC_OPTIONAL:
+            errors.append(f'topics/{slug}: unexpected section "## {name}"')
+    order = [lang for lang, _ in FENCE.findall(found.get('Template', ''))]
+    if order != LANGUAGES:
+        errors.append(f'topics/{slug}: Template must contain exactly one block each, in order: {", ".join(LANGUAGES)} (found {order})')
+    for target in re.findall(r'\]\(/interview/problems/([a-z0-9-]+)/\)', body):
+        if not os.path.isfile(os.path.join(PROBLEMS, target + '.md')):
+            errors.append(f'topics/{slug}: links to /interview/problems/{target}/, which has no write-up yet')
+    for target in re.findall(r'\]\(/interview/topics/([a-z0-9-]+)/\)', body):
+        if target not in {topic_slug(t) for t in tags}:
+            errors.append(f'topics/{slug}: links to /interview/topics/{target}/, which is not a topic')
+    return errors
+
+
 def run(cmd, cwd, timeout=60):
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
@@ -147,12 +192,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('slugs', nargs='*')
     parser.add_argument('--no-run', action='store_true', help='validate structure without compiling')
+    parser.add_argument('--topics', nargs='*', metavar='TOPIC', help='validate these topic guides only (all when no names)')
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     args = parser.parse_args()
     problems = json.load(open(DATA, encoding='utf-8'))['problems']
     files = sorted(f[:-3] for f in os.listdir(PROBLEMS) if f.endswith('.md'))
     slugs = args.slugs or files
     errors = []
+    tags = {t for p in problems.values() for t in p['topics']}
+    guides = sorted(f[:-3] for f in os.listdir(TOPICS) if f.endswith('.md')) if os.path.isdir(TOPICS) else []
+    if args.topics is not None:  # guide-only run
+        for name in args.topics or guides:
+            errors += validate_topic(name, tags) if name in guides else [f'topics/{name}: no interview/topics/{name}.md']
+        print('\n'.join(errors) or f'{len(args.topics or guides)} topic guides valid')
+        return 1 if errors else 0
+    if not args.slugs:
+        for name in guides:
+            errors += validate_topic(name, tags)
     # One write-up per problem: titles must be unique too (catches the same problem saved under a second slug).
     titles = {}
     for slug in files:

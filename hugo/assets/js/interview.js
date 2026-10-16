@@ -31,6 +31,30 @@
     filter();
   }
 
+  // Topic directory: the same search over guide cards and plain chips.
+  const topicSearch = document.querySelector('[data-iv-topic-search]');
+  if (topicSearch) {
+    const items = Array.from(document.querySelectorAll('[data-iv-topics] li'));
+    const groups = Array.from(document.querySelectorAll('[data-iv-topic-group]'));
+    const count = document.querySelector('[data-iv-topic-count]');
+    const empty = document.querySelector('[data-iv-topics-empty]');
+    const filter = () => {
+      const q = norm(topicSearch.value);
+      let shown = 0;
+      items.forEach(li => { const hit = !q || norm(li.dataset.name).includes(q); li.hidden = !hit; if (hit) shown++; });
+      groups.forEach(group => { group.hidden = !group.querySelector('li:not([hidden])'); });
+      count.textContent = q ? `${shown} of ${items.length} topics` : '';
+      empty.hidden = shown > 0;
+    };
+    topicSearch.addEventListener('input', debounce(filter, 80));
+    topicSearch.addEventListener('keydown', event => {
+      if (event.key !== 'Enter') return;
+      const first = items.find(li => !li.hidden);
+      if (first) location.href = first.querySelector('a').href;
+    });
+    filter();
+  }
+
   // Learning integration: "solved" marks live in the learning store (assets/js/learning.js), for guests and
   // signed-in readers alike. Everything below degrades to plain links when the store is unavailable.
   const learning = () => window.CNRLearning;
@@ -69,7 +93,7 @@
     button.title = solved ? 'Solved. Click to unmark.' : 'Mark as solved';
   }
   document.querySelectorAll('[data-iv-list]').forEach(list => {
-    const mode = list.dataset.ivMode, ranking = mode === 'ranking', catalog = mode === 'catalog';
+    const mode = list.dataset.ivMode, ranking = mode === 'ranking' || mode === 'topic', catalog = mode === 'catalog';
     const table = list.querySelector('table');
     const body = list.querySelector('[data-iv-rows]');
     let data;
@@ -250,10 +274,11 @@
     render();
   }
 
-  // Solution tabs: the code blocks after "## Solutions" become one tabbed panel.
+  // Solution tabs: the code blocks after "## Solutions" (write-ups) or "## Template" (topic guides) become one
+  // tabbed panel. On problem pages with a workspace, interview-workspace.js moves the solutions into the editor instead.
   const LABELS = { python: 'Python', java: 'Java', cpp: 'C++', javascript: 'JavaScript', go: 'Go' };
   const articleBody = document.querySelector('[data-iv-body]');
-  const heading = articleBody && articleBody.querySelector('h2#solutions');
+  const heading = articleBody && !document.querySelector('[data-iv-workspace]') && (articleBody.querySelector('h2#solutions') || articleBody.querySelector('h2#template'));
   if (heading) {
     const blocks = [];
     for (let node = heading.nextElementSibling; node && node.tagName !== 'H2'; node = node.nextElementSibling) {
