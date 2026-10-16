@@ -1,0 +1,43 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+)
+
+func main() {
+	cases := []struct {
+		num      string
+		k        int
+		expected string
+	}{
+		{"5329174", 3, "2174"},
+		{"20300", 1, "300"},
+		{"12345", 2, "123"},
+		{"7", 1, "0"},
+		{"1432219", 3, "1219"},
+		{"10", 2, "0"},
+		{"112", 1, "11"},
+		{"54321", 2, "321"},
+		{"10001", 1, "1"},
+		{"100", 1, "0"},
+		{"9871", 3, "1"},
+		{"5337", 2, "33"},
+		{"1173", 2, "11"},
+		{"0", 0, "0"},
+		{"123", 0, "123"},
+		{strings.Repeat("9", 5000) + "1", 5000, "1"},
+		{strings.Repeat("1", 10000) + "0", 1, strings.Repeat("1", 9999) + "0"},
+	}
+	failed := false
+	for _, c := range cases {
+		if got := removeKdigits(c.num, c.k); got != c.expected {
+			fmt.Printf("removeKdigits(%.12s, %d): expected %.20s, got %.20s\n", c.num, c.k, c.expected, got)
+			failed = true
+		}
+	}
+	if failed {
+		os.Exit(1)
+	}
+}
