@@ -77,7 +77,7 @@ The flow uses a random state nonce bound to a separate HttpOnly cookie, S256 PKC
    npx wrangler@4 d1 execute compilenrun-feedback --remote --file accounts-email-schema.sql
    ```
 
-4. Deploy with Wrangler 4 after validating the migration, secret, and Worker changes. The configuration adds only the auth, learning, and exact Google callback routes plus the `AUTH_LIMIT` binding (60 account requests per minute per IP). It preserves existing AI/quiz/feedback routes and bindings.
+4. Deploy with Wrangler 4 after validating the migration, secret, and Worker changes. The configuration adds only the auth, learning, and Google callback routes (patterns end in `*`: Cloudflare skips the Worker for a wildcard-less pattern once a query string is present) plus the `AUTH_LIMIT` binding (60 account requests per minute per IP). It preserves existing AI/quiz/feedback routes and bindings.
 
 Google and email/password availability are evaluated independently. Session discovery includes `providers: {google, email}`, `googleConfigured`, and `emailConfigured`; `configured` is true if either method is available. Missing Google credentials disable Google without disabling a configured email method. Missing all provider prerequisites disables account operations. Missing database tables return a safe service-unavailable response. Use `node --test tests/accounts-worker.test.mjs tests/auth-security.test.mjs` from the repository root for local validation with real SQLite and mocked Google/Brevo endpoints. These tests do not authenticate a real person or prove the deployed OAuth consent or mail-delivery configuration works. Account endpoints intentionally accept only the production site origin; they do not inherit the AI widget's localhost CORS exception.
 
