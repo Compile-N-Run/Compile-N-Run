@@ -28,11 +28,11 @@
     const user = value.user;
     if (!value.configured || !plain(user.id,200) || !plain(user.name,100,true) ||
         !(user.email === undefined || user.email === null || plain(user.email,254)) ||
-        typeof user.emailVerified !== 'boolean' || typeof user.hasPassword !== 'boolean' || typeof user.googleLinked !== 'boolean' || !plain(value.csrfToken,500)) {
+        typeof user.emailVerified !== 'boolean' || typeof user.hasPassword !== 'boolean' || typeof user.googleLinked !== 'boolean' || !(user.googleEmail === undefined || user.googleEmail === null || plain(user.googleEmail,254)) || !plain(value.csrfToken,500)) {
       throw fault('invalid_response','Sign-in details could not be verified. Please try again.');
     }
     return { configured: value.configured, providers, user: { id: user.id, name: user.name, email: user.email || null,
-      emailVerified: user.emailVerified, hasPassword: user.hasPassword, googleLinked: user.googleLinked }, csrfToken: value.csrfToken };
+      emailVerified: user.emailVerified, hasPassword: user.hasPassword, googleLinked: user.googleLinked, googleEmail: user.googleLinked && user.googleEmail || null }, csrfToken: value.csrfToken };
   }
   function clearPasswords() { dialog?.querySelectorAll('input[type="password"]').forEach(input=>{input.value='';}); }
   function say(text, error = false) { if(message){message.textContent=text;message.dataset.error=String(error);} }

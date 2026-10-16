@@ -44,8 +44,9 @@
     if (typeof u.id !== 'string' || !u.id || u.id.length > 200 || typeof u.name !== 'string' || u.name.length > 100 ||
         !(u.email === null || typeof u.email === 'string' && u.email.length <= 254) ||
         typeof u.emailVerified !== 'boolean' || typeof u.hasPassword !== 'boolean' || typeof u.googleLinked !== 'boolean' ||
+        !(u.googleEmail === undefined || u.googleEmail === null || typeof u.googleEmail === 'string' && u.googleEmail.length <= 254) ||
         typeof value.csrfToken !== 'string' || !value.csrfToken || value.csrfToken.length > 500) throw error('Account details could not be read safely. Refresh your connection before making changes.', 'invalid_response');
-    return { configured: value.configured, providers: providers, user: { id: u.id, name: u.name, email: u.email, emailVerified: u.emailVerified, hasPassword: u.hasPassword, googleLinked: u.googleLinked }, csrfToken: value.csrfToken };
+    return { configured: value.configured, providers: providers, user: { id: u.id, name: u.name, email: u.email, emailVerified: u.emailVerified, hasPassword: u.hasPassword, googleLinked: u.googleLinked, googleEmail: u.googleLinked && u.googleEmail || null }, csrfToken: value.csrfToken };
   }
   function accept(value, fill) {
     var next = validateSession(value), previousID = session && session.user && session.user.id;
@@ -78,9 +79,10 @@
     root.querySelector('[data-profile-password-form]').hidden = !user || !email || !user.hasPassword;
     if (user) {
       root.querySelector('[data-profile-name]').textContent = user.name;
-      root.querySelector('[data-profile-email]').textContent = user.email ? 'Email: ' + user.email : 'No email sign-in has been added.';
-      root.querySelector('[data-profile-verified]').textContent = user.emailVerified ? 'Email verified.' : 'Email has not been verified for email sign-in.';
-      root.querySelector('[data-profile-google-status]').textContent = user.googleLinked ? 'A Google account is linked to this account.' : 'No Google account is linked.';
+      root.querySelector('[data-profile-email]').textContent = user.email ? 'Email: ' + user.email : user.googleEmail ? 'Google email: ' + user.googleEmail : 'No email sign-in has been added.';
+      var verified = root.querySelector('[data-profile-verified]');
+      verified.hidden = !user.email; verified.textContent = user.emailVerified ? 'Email verified.' : 'Email has not been verified for email sign-in.';
+      root.querySelector('[data-profile-google-status]').textContent = !user.googleLinked ? 'No Google account is linked.' : user.googleEmail ? 'Google account linked: ' + user.googleEmail : 'A Google account is linked to this account. Its email appears here after your next Google sign-in.';
       root.querySelector('[data-profile-unlink-help]').textContent = user.googleLinked && !(user.hasPassword && user.emailVerified && email) ? 'Keep Google linked until you have a verified email and password you can use to sign in.' : 'Linking Google adds a sign-in method to this same account; it does not combine different accounts or upload browser learning.';
       if (fill) { formNamed('name').elements.name.value = user.name; formNamed('enroll').elements.email.value = user.email || pendingEmail; formNamed('resend-member').elements.email.value = user.email || pendingEmail; }
     }

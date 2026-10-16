@@ -206,6 +206,8 @@ test('Google sign-in requests the email scope and stores the reported email and 
   assert.equal(new URL(result.headers.get('location')).pathname, '/learn/');
   const row = db.sqlite.prepare('SELECT p.email, p.email_verified, p.name, g.user_id FROM cnr_account_google_profiles p JOIN cnr_account_google_identities g USING (google_sub) WHERE google_sub=?').get('google-new-learner');
   assert.equal(row.email, 'ada@example.test'); assert.equal(row.email_verified, 1); assert.equal(row.name, 'Ada Lovelace');
+  const sessionBody = await (await handleAccounts(authRequest('/api/auth/session', 'GET', cookiePair(result, '__Host-cnr_session')), env)).json();
+  assert.equal(sessionBody.user.googleEmail, 'ada@example.test'); assert.equal(sessionBody.user.email, null);
   // The Google email is informational: it never creates or matches a password credential.
   assert.equal(db.sqlite.prepare('SELECT count(*) AS count FROM cnr_account_password_credentials WHERE email=?').get('ada@example.test').count, 0);
   // A later sign-in refreshes the stored values; a malformed email is dropped.

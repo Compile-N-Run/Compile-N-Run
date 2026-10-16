@@ -135,13 +135,15 @@ async function session(request, db) {
   // Direct DB calls intentionally use the primary. Do not replace with a
   // first-unconstrained D1 Session: revoked logins must not reappear on replicas.
   const row = await db.prepare(`SELECT u.id, u.display_name, c.email, c.email_verified_at,
-    CASE WHEN c.email_verified_at IS NOT NULL THEN 1 ELSE 0 END AS has_password, g.google_sub AS google_identity
+    CASE WHEN c.email_verified_at IS NOT NULL THEN 1 ELSE 0 END AS has_password, g.google_sub AS google_identity, gp.email AS google_email
     FROM cnr_account_sessions s JOIN cnr_account_users u ON u.id = s.user_id
     LEFT JOIN cnr_account_password_credentials c ON c.user_id = u.id
     LEFT JOIN cnr_account_google_identities g ON g.user_id = u.id
+    LEFT JOIN cnr_account_google_profiles gp ON gp.google_sub = g.google_sub
     WHERE s.token_hash = ?1 AND s.expires_at > ?2`).bind(tokenHash, now()).first();
   return row ? { user: { id: row.id, name: row.display_name, email: row.email || null,
-    emailVerified: !!row.email_verified_at, hasPassword: !!row.has_password, googleLinked: !!row.google_identity },
+    emailVerified: !!row.email_verified_at, hasPassword: !!row.has_password, googleLinked: !!row.google_identity,
+    googleEmail: row.google_identity && row.google_email || null },
     tokenHash, csrfToken: await hash('csrf:' + token) } : null;
 }
 

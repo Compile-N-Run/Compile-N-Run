@@ -113,6 +113,13 @@ test('Google-only accounts can enroll and resend a pending email without signing
   await page.goto(origin + '/profile/#verify=' + VERIFY); await idle(page); await submit(page, 'verify', { password: PASSWORD }); assert.equal(account.user, null); await signInFromPopup(page, account, user({ googleLinked: true })); assert.equal(account.user.emailVerified, true); assert.equal(account.user.hasPassword, true); assert.equal(account.user.googleLinked, true); assert.equal(await page.locator('[data-profile-unlink-google]').isDisabled(), false);
 });
 
+test('the Google email is shown for Google sign-ins', async t => {
+  const a = model(); a.user = user({ email: null, emailVerified: false, hasPassword: false, googleLinked: true, googleEmail: 'alex.google@example.test' }); const { page } = await setup(t, a);
+  assert.equal(await page.locator('[data-profile-email]').innerText(), 'Google email: alex.google@example.test');
+  assert.equal(await page.locator('[data-profile-verified]').isVisible(), false);
+  assert.match(await page.locator('[data-profile-google-status]').innerText(), /Google account linked: alex\.google@example\.test/);
+});
+
 test('Google linking uses an authenticated explicit request and a restricted navigation destination', async t => {
   const a = model(); a.user = user(); a.linkURL = 'https://evil.example/'; const { page, account } = await setup(t, a);
   await page.locator('[data-profile-link-google]').click(); await idle(page); assert.equal(page.url(), origin + '/profile/'); assert.match(await page.locator('[data-profile-status]').innerText(), /No navigation/);
