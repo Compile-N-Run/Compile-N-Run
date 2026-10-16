@@ -6,9 +6,9 @@ test.beforeEach(async ({ context }) => {
   await context.route('**/api/auth/session', route => route.fulfill({ json: { configured: false, providers: { google: false, email: false }, user: null } }));
 });
 
-const categories = ['Fundamentals', 'Languages', 'Web', 'Data & AI', 'DevOps & Systems', 'Mobile & IoT'];
-for (const width of [997, 1024, 1100, 1200, 1280, 1440]) {
-  test(`six category menus fit ${width}px without losing course links`, async ({ page }) => {
+const categories = ['Fundamentals', 'Interview', 'Languages', 'Web', 'Data & AI', 'DevOps & Systems', 'Mobile & IoT'];
+for (const width of [997, 1024, 1100, 1200, 1280, 1320, 1440, 1480]) {
+  test(`seven category menus fit ${width}px without losing course links`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await page.route('**/api/auth/session', route => route.fulfill({ json: { configured: true, providers: { google: true, email: true }, user: null } }));
     await page.goto('/learn/');
@@ -41,10 +41,10 @@ for (const width of [997, 1024, 1100, 1200, 1280, 1440]) {
       await expect(panel).not.toBeVisible();
       await expect(toggle).toBeFocused();
     }
-    expect(courseLinks).toBe(80);
-    await categoryToggles.nth(3).click();
-    await expect(nav.locator('[data-tutorial-browse][open]')).toContainText('Databases');
+    expect(courseLinks).toBe(92); // 80 course links + 12 interview links
     await categoryToggles.nth(4).click();
+    await expect(nav.locator('[data-tutorial-browse][open]')).toContainText('Databases');
+    await categoryToggles.nth(5).click();
     await expect(nav.locator('[data-tutorial-browse][open]')).toHaveCount(1);
     for (const group of ['DevOps', 'Observability', 'Middleware', 'Linux']) {
       await expect(nav.locator('[data-tutorial-browse][open] h3').filter({ hasText: group })).toBeVisible();
@@ -78,7 +78,7 @@ test('mobile navigation switches between course contents and global links and re
   await expect(nav.locator('[data-nav-primary] a[href="/playground/"]')).toBeVisible();
   const categoryButtons = nav.locator('[data-nav-primary] [data-collapse]');
   expect(await categoryButtons.allTextContents()).toEqual(categories);
-  await categoryButtons.nth(4).click();
+  await categoryButtons.nth(5).click();
   await expect(nav.locator('[data-nav-primary] a[href="/docs/devops/docker/"]')).toBeVisible();
   await nav.locator('[data-navbar-course]').click();
   await expect(nav.locator('[data-navbar-back]')).toBeVisible();

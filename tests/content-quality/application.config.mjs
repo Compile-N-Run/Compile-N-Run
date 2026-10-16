@@ -2,7 +2,7 @@ import { defineConfig } from '@playwright/test';
 import path from 'node:path';
 export default defineConfig({
   testDir: '.',
-  testMatch: ['application.spec.js', 'navigation.spec.js'],
+  testMatch: ['application.spec.js', 'navigation.spec.js', 'interview.spec.js'],
   workers: 1,
   timeout: 45_000,
   reporter: 'list',

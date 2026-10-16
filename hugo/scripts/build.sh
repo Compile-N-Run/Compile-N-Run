@@ -5,6 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 python3 scripts/convert.py
+python3 scripts/interview.py
 node scripts/site_config.mjs > data/site.json
 rm -rf public
 if [ -n "${SPLIT_SEARCH:-}" ]; then
