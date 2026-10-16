@@ -579,6 +579,8 @@
         '<button type="button" class="cnr-ask__chip cnr-ask__chip--quiz" data-ask-quiz>🧠 Quiz me on this page</button>' +
         suggestions.map(function (s) { return '<button type="button" class="cnr-ask__chip">' + esc(s) + '</button>'; }).join('') + '</div>';
       log.querySelectorAll('.cnr-ask__chip').forEach(function (b) { b.onclick = function () { if (b.hasAttribute('data-ask-quiz')) quiz(); else ask(b.textContent); }; });
+      var chip = log.querySelector('[data-ask-quiz]');
+      if (chip) chip.addEventListener('mouseenter', prefetchQuiz);
     };
     var addMsg = function (role, html) {
       var intro = log.querySelector('.cnr-ask__intro');
@@ -648,38 +650,87 @@
       }).then(function () { setBusy(null); if (!panel.hidden) box.focus(); });
     };
 
-    /* "Quiz me": the Worker writes (or returns the cached) multiple-choice quiz for this page; answers are
-       checked here. Best scores are kept in this browser. */
+    /* "Quiz me": the Worker returns a cached quiz as JSON, or streams a new one (one checked question per line,
+       NDJSON), so the reader starts on question 1 while the rest are still being written. Answers are checked
+       here; best scores are kept in this browser. */
     var quizEndpoint = askEndpoint.replace(/\/ask$/, '/quiz');
-    var quizRound = 0;
+    var quizRound = 0, quizNext = null;
     var QKEY = 'cnr_quiz';
+    // A "feed" of questions that fills in as they arrive: {qs, done, error, onChange}.
+    var fetchQuiz = function (round) {
+      var feed = { round: round, qs: [], done: false, error: null, onChange: null };
+      var changed = function () { if (feed.onChange) feed.onChange(); };
+      var fail = function (msg) { feed.error = msg || 'Could not load a quiz. Please try again.'; feed.done = true; changed(); };
+      tsToken().then(function (token) {
+        tsNext();
+        return fetch(quizEndpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: location.pathname, round: round, turnstile: token, stream: true }) });
+      }).then(function (res) {
+        if (!/ndjson/.test(res.headers.get('content-type') || '')) {
+          return res.json().catch(function () { return {}; }).then(function (j) {
+            if (!res.ok || !j.questions || !j.questions.length) return fail(j.error);
+            feed.qs = j.questions;
+            feed.done = true;
+            changed();
+          });
+        }
+        var reader = res.body.getReader(), dec = new TextDecoder(), buf = '';
+        var pump = function () {
+          return reader.read().then(function (r) {
+            if (r.done) { if (!feed.done) { if (feed.qs.length) { feed.done = true; changed(); } else fail(); } return; }
+            buf += dec.decode(r.value, { stream: true });
+            var lines = buf.split('\n');
+            buf = lines.pop();
+            lines.forEach(function (l) {
+              if (!l.trim()) return;
+              var m;
+              try { m = JSON.parse(l); } catch (e) { return; }
+              if (m.question) { feed.qs.push(m.question); changed(); }
+              else if (m.done) { feed.done = true; changed(); }
+              else if (m.error) { if (feed.qs.length) { feed.done = true; changed(); } else fail(m.error); }
+            });
+            return pump();
+          });
+        };
+        return pump();
+      }).catch(function (e) { fail(e && e.message); });
+      return feed;
+    };
+    // Hovering or focusing "Quiz me" starts the request, so a new quiz is a few seconds further along on click.
+    var prefetchQuiz = function () { if (!quizNext && askSitekey !== undefined) { tsLoad(); quizNext = fetchQuiz(quizRound); } };
     var quiz = function () {
       if (busy) return;
       addMsg('user', '🧠 Quiz me on this page');
-      var out = addMsg('ai', '<span class="cnr-ask__typing"><i></i><i></i><i></i></span><div class="cnr-ask__wait">Preparing your quiz… a brand-new one can take up to half a minute.</div>');
+      var out = addMsg('ai', '<span class="cnr-ask__typing"><i></i><i></i><i></i></span><div class="cnr-ask__wait">Writing your quiz…</div>');
+      var feed = quizNext && quizNext.round === quizRound ? quizNext : fetchQuiz(quizRound);
+      quizNext = null;
+      quizRound++;
       setBusy(true);
-      var round = quizRound++;
-      tsToken().then(function (token) {
-        tsNext();
-        return fetch(quizEndpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: location.pathname, round: round, turnstile: token }) });
-      }).then(function (res) {
-        return res.json().catch(function () { return {}; }).then(function (j) {
-          if (!res.ok || !j.questions || !j.questions.length) throw new Error(j.error || 'Could not load a quiz. Please try again.');
-          return j;
-        });
-      }).then(function (data) {
-        playQuiz(out, data.questions);
-      }).catch(function (e) {
-        out.classList.add('cnr-ask__msg--error');
-        out.textContent = (e && e.message) || 'Could not load a quiz. Please try again.';
-      }).then(function () { setBusy(null); });
+      var start = function () {
+        if (feed.qs.length) { feed.onChange = null; setBusy(null); playQuiz(out, feed); }
+        else if (feed.error) {
+          feed.onChange = null;
+          setBusy(null);
+          out.classList.add('cnr-ask__msg--error');
+          out.textContent = feed.error;
+        }
+      };
+      feed.onChange = start;
+      start();
     };
-    var playQuiz = function (out, qs) {
-      var i = 0, score = 0, picks = [];
+    var playQuiz = function (out, feed) {
+      var qs = feed.qs, i = 0, score = 0, picks = [], waiting = false;
       out.classList.add('cnr-ask__msg--quiz');
+      var count = function () { return 'Question ' + (i + 1) + (feed.done ? ' of ' + qs.length : ''); };
+      feed.onChange = function () {
+        var label = out.querySelector('.cnr-quiz__count');
+        if (label) label.textContent = count();
+        var next = out.querySelector('.cnr-quiz__next');
+        if (next && !waiting && feed.done && i === qs.length - 1) next.textContent = 'See my score';
+        if (waiting && (i < qs.length || feed.done)) { waiting = false; if (i < qs.length) show(); else finish(); }
+      };
       var show = function () {
         var q = qs[i];
-        out.innerHTML = '<div class="cnr-quiz"><div class="cnr-quiz__count">Question ' + (i + 1) + ' of ' + qs.length + '</div>' +
+        out.innerHTML = '<div class="cnr-quiz"><div class="cnr-quiz__count">' + count() + '</div>' +
           '<p class="cnr-quiz__q">' + inline(q.question) + '</p>' +
           (q.code ? '<pre><code>' + esc(q.code) + '</code></pre>' : '') +
           '<div class="cnr-quiz__opts" role="group" aria-label="Answers">' + q.options.map(function (o, k) {
@@ -699,15 +750,25 @@
           if (n === q.answer) b.classList.add('cnr-quiz__opt--right');
           else if (n === k) b.classList.add('cnr-quiz__opt--wrong');
         });
-        var last = i === qs.length - 1;
         out.querySelector('.cnr-quiz__result').innerHTML = '<p><strong>' + (right ? '✅ Correct!' : '❌ Not quite. The answer is ' + 'ABCD'[q.answer] + '.') + '</strong> ' + inline(q.explanation) + '</p>' +
-          '<button type="button" class="cnr-quiz__next">' + (last ? 'See my score' : 'Next question →') + '</button>';
+          '<button type="button" class="cnr-quiz__next">' + (feed.done && i === qs.length - 1 ? 'See my score' : 'Next question →') + '</button>';
         var next = out.querySelector('.cnr-quiz__next');
-        next.onclick = function () { if (last) finish(); else { i++; show(); } };
+        next.onclick = function () {
+          i++;
+          if (i < qs.length) show();
+          else if (feed.done) finish();
+          else {
+            // The next question is still being written or checked.
+            waiting = true;
+            next.disabled = true;
+            next.innerHTML = '<span class="cnr-ask__typing"><i></i><i></i><i></i></span> Checking the next question…';
+          }
+        };
         next.focus();
         log.scrollTop = Math.max(log.scrollTop, out.offsetTop - log.offsetTop + out.offsetHeight - log.clientHeight + 8);
       };
       var finish = function () {
+        feed.onChange = null;
         var pct = score / qs.length;
         var best = {};
         try { best = JSON.parse(store.get(QKEY) || '{}') || {}; } catch (e) {}
@@ -719,6 +780,7 @@
             return '<li class="' + (picks[n] === q.answer ? 'is-right' : 'is-wrong') + '">' + inline(q.question) + '<br><span>' + (picks[n] === q.answer ? '✅ ' : '❌ You picked ' + 'ABCD'[picks[n]] + '. ') + 'Answer: ' + 'ABCD'[q.answer] + ') ' + (/\n/.test(q.options[q.answer]) ? '' : inline(q.options[q.answer])) + '</span></li>';
           }).join('') + '</ol><button type="button" class="cnr-quiz__next" data-again>Try another quiz</button></div>';
         out.querySelector('[data-again]').onclick = quiz;
+        out.querySelector('[data-again]').onmouseenter = prefetchQuiz;
         // Follow-up questions in the chat ("why is question 2 B?") can see the quiz.
         chat.push({ role: 'user', content: 'Quiz me on this page.' }, { role: 'assistant', content: 'Quiz (score ' + score + '/' + qs.length + '):\n' + qs.map(function (q, n) {
           return (n + 1) + '. ' + q.question + (q.code ? '\n' + q.code : '') + '\n' + q.options.map(function (o, k) { return 'ABCD'[k] + ') ' + o; }).join('\n') + '\nCorrect: ' + 'ABCD'[q.answer] + '. Reader picked: ' + 'ABCD'[picks[n]] + '.';
@@ -750,6 +812,8 @@
     document.querySelectorAll('[data-quiz]').forEach(function (b) {
       b.hidden = false;
       b.onclick = function () { openAsk(); quiz(); };
+      b.addEventListener('mouseenter', prefetchQuiz);
+      b.addEventListener('focus', prefetchQuiz);
     });
     panel.querySelector('[data-ask-close]').onclick = closeAsk;
     panel.querySelector('[data-ask-reset]').onclick = function () {
