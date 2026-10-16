@@ -282,3 +282,32 @@ test('an account switch detected during the final sync aborts logout without upl
  assert.equal(account.user.id,'user-b');assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-b');
  assert.equal(account.cloud['user-b'].data.progress.done['/docs/language/css/'],undefined);
 });
+
+test('guests are invited to sign in after a second page, once, and snoozed after dismissing',async t=>{
+ const init=()=>{window.CNR_INVITE_DELAY_MS=200;};
+ const{page,errors}=await setup(t,state(),init,'/docs/python/intro/');
+ await page.waitForTimeout(600);assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false,'no invite on the first page');
+ await page.goto(page.url().replace('/intro/','/next/'));await page.evaluate(()=>CNRAuth.ready());
+ await page.locator('[data-auth-dialog]').waitFor({state:'visible'});
+ assert.match(await page.locator('[data-auth-message]').innerText(),/free account/);
+ await page.keyboard.press('Escape');assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false);
+ const snooze=await page.evaluate(()=>JSON.parse(localStorage.getItem('cnr-auth-invite')));assert.equal(snooze.dismissed,1);assert.ok(snooze.until>Date.now()+13*86400000);
+ await page.goto(page.url().replace('/next/','/third/'));await page.evaluate(()=>CNRAuth.ready());await page.waitForTimeout(600);
+ assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false,'snoozed after a dismissal');
+ assert.deepEqual(errors,[]);
+});
+
+test('a guest who saves progress is invited right away; signed-in and unconfigured visitors never are',async t=>{
+ const{page}=await setup(t,state(),undefined,'/docs/python/intro/');
+ await page.evaluate(()=>window.dispatchEvent(new CustomEvent('cnr:learning-updated',{detail:{persistent:true}})));
+ await page.locator('[data-auth-dialog]').waitFor({state:'visible'});assert.match(await page.locator('[data-auth-message]').innerText(),/Saved on this device/);
+ await page.locator('[data-auth-close]').click();
+ await page.evaluate(()=>window.dispatchEvent(new CustomEvent('cnr:learning-updated',{detail:{persistent:true}})));await page.waitForTimeout(2000);
+ assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false,'at most once per visit');
+ const signedIn=state();signedIn.user=user();const second=await setup(t,signedIn,()=>{window.CNR_INVITE_DELAY_MS=100;},'/docs/python/intro/');
+ await second.page.goto(second.page.url().replace('/intro/','/next/'));await second.page.evaluate(()=>CNRAuth.ready());await second.page.waitForTimeout(500);
+ assert.equal(await second.page.locator('[data-auth-dialog]').isVisible(),false,'signed-in readers are not invited');
+ const off=state();off.configured=false;off.providers={google:false,github:false,email:false};const third=await setup(t,off,()=>{window.CNR_INVITE_DELAY_MS=100;},'/docs/python/intro/');
+ await third.page.goto(third.page.url().replace('/intro/','/next/'));await third.page.evaluate(()=>CNRAuth.ready());await third.page.waitForTimeout(500);
+ assert.equal(await third.page.locator('[data-auth-dialog]').isVisible(),false,'nothing to invite to when sign-in is unavailable');
+});

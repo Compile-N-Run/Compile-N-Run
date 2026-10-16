@@ -291,6 +291,33 @@
     window.addEventListener('resize',positionMenu,{passive:true});window.addEventListener('scroll',()=>closeMenu(),{passive:true});
     render();
   }
+  // Invite guests to sign in, without nagging: once per visit at most, only after they have read a couple of
+  // pages (or right after they save something as a guest that an account would keep across devices), never on
+  // the home, profile or auth pages, and snoozed for two weeks after a dismissal (three months after the third).
+  (function invite(){
+    if(!dialog||!widget||/^\/(profile|auth|reset-password|verify-email)\//.test(location.pathname)||location.pathname==='/')return;
+    const KEY='cnr-auth-invite',DAY=86400000;
+    const local={get(){try{return JSON.parse(localStorage.getItem(KEY))||{};}catch(_){return{};}},set(v){try{localStorage.setItem(KEY,JSON.stringify(v));}catch(_){}}};
+    const session={get(k){try{return sessionStorage.getItem(KEY+':'+k);}catch(_){return null;}},set(k,v){try{sessionStorage.setItem(KEY+':'+k,v);}catch(_){}}};
+    const pages=Number(session.get('pages')||0)+1;session.set('pages',String(pages));
+    const delay=typeof window.CNR_INVITE_DELAY_MS==='number'?window.CNR_INVITE_DELAY_MS:25000;
+    let invited=false,timer=null;
+    const eligible=()=>!session.get('shown')&&!(local.get().until>Date.now())&&known&&!current?.user&&!transitionFailed&&!busy&&!dialog.open&&document.visibilityState==='visible'&&(capabilities.google||capabilities.github||capabilities.email);
+    function show(text){
+      if(!eligible())return;
+      session.set('shown','1');invited=true;
+      openDialog('login',document.activeElement);say(text);
+    }
+    function later(ms,text){clearTimeout(timer);timer=setTimeout(()=>{if(document.visibilityState!=='visible'){document.addEventListener('visibilitychange',()=>later(1500,text),{once:true});return;}initial.then(()=>show(text)).catch(()=>{});},ms);}
+    if(pages>=2)later(delay,'Create a free account to keep your progress, bookmarks and solved problems on every device. You can keep learning without one.');
+    window.addEventListener('cnr:learning-updated',event=>{if(event.detail?.persistent&&!current?.user)later(1500,'Saved on this device. Sign in to keep your progress on every device, or close this to keep going as a guest.');});
+    dialog.addEventListener('close',()=>{
+      if(!invited)return;invited=false;
+      if(current?.user)return;
+      const state=local.get(),dismissed=(state.dismissed||0)+1;
+      local.set({dismissed,until:Date.now()+(dismissed>=3?90:14)*DAY});
+    });
+  })();
   window.addEventListener('cnr:auth-changing',()=>{actionPending=true;invalidateRefresh();});
   window.addEventListener('cnr:sync-status',event=>{if(typeof event.detail?.message==='string'){syncNotice=event.detail.message.slice(0,400);if(menuStatus&&!busy&&!transitionFailed)menuStatus.textContent=syncNotice;}});
   function checkCurrentSession(){if(document.visibilityState==='visible'&&!mutation&&!actionPending)refresh({force:false}).catch(()=>{});}
