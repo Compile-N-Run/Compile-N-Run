@@ -2,7 +2,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
-import { handleAccounts, ACCOUNT_SITE as SITE, OAUTH_CALLBACK, SNAPSHOT_MAX_BYTES } from '../worker/compilenrun-worker/src/accounts.js';
+import { handleAccounts, ACCOUNT_SITE as SITE, OAUTH_CALLBACK, GITHUB_CALLBACK, SNAPSHOT_MAX_BYTES } from '../worker/compilenrun-worker/src/accounts.js';
 import worker from '../worker/compilenrun-worker/src/index.js';
 
 class D1 {
@@ -12,6 +12,7 @@ class D1 {
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-email-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-google-profile-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-github-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -74,7 +75,7 @@ async function login(subject = 'google-user-1', existingCookie = '') {
 }
 beforeEach(() => {
   db = new D1();
-  env = { DB: db, AUTH_LIMIT: { limit: async () => ({ success: true }) }, GOOGLE_CLIENT_ID: 'test.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'test-secret-not-real' };
+  env = { DB: db, AUTH_LIMIT: { limit: async () => ({ success: true }) }, GOOGLE_CLIENT_ID: 'test.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'test-secret-not-real', GITHUB_CLIENT_ID: 'Iv1.test', GITHUB_CLIENT_SECRET: 'github-secret-not-real' };
   upstream = []; mail = []; pendingMail = []; selectedSubject = 'google-user-1'; selectedName = 'Practice Learner'; tokenFailure = false;
   originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
@@ -92,6 +93,23 @@ beforeEach(() => {
       assert.equal(fields.get('grant_type'), 'authorization_code');
       assert.match(fields.get('code_verifier'), /^[A-Za-z0-9_-]{43}$/);
       return Response.json(tokenFailure ? { error: 'invalid_grant' } : { access_token: 'mock-token-do-not-store', token_type: 'Bearer', id_token: 'unverified-and-ignored' }, { status: tokenFailure ? 400 : 200 });
+    }
+    if (url === 'https://github.com/login/oauth/access_token') {
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers.accept, 'application/json');
+      const fields = new URLSearchParams(options.body);
+      assert.equal(fields.get('redirect_uri'), SITE + GITHUB_CALLBACK);
+      assert.equal(fields.get('client_id'), 'Iv1.test');
+      assert.match(fields.get('code_verifier'), /^[A-Za-z0-9_-]{43}$/);
+      return Response.json(tokenFailure ? { error: 'bad_verification_code' } : { access_token: 'gho_mock-token', token_type: 'bearer', scope: 'read:user,user:email' }, { status: tokenFailure ? 400 : 200 });
+    }
+    if (url === 'https://api.github.com/user') {
+      assert.equal(options.headers.authorization, 'Bearer gho_mock-token');
+      assert.ok(options.headers['user-agent']);
+      return Response.json({ id: 4242, login: 'octocat', name: 'Mona Octocat', email: null });
+    }
+    if (url === 'https://api.github.com/user/emails') {
+      return Response.json([{ email: 'old@example.invalid', primary: false, verified: true }, { email: 'Mona@Example.invalid', primary: true, verified: true }, { email: 'unverified@example.invalid', primary: false, verified: false }]);
     }
     assert.equal(url, 'https://openidconnect.googleapis.com/v1/userinfo');
     assert.equal(options.headers.authorization, 'Bearer mock-token-do-not-store');
@@ -126,7 +144,7 @@ async function passwordLogin(email, password = PASSWORD) {
 test('disabled accounts expose configured:false without querying D1 or affecting AI paths', async () => {
   const disabled = { DB: { prepare() { throw new Error('Must not query'); } } };
   const response = await handleAccounts(request('/api/auth/session'), disabled);
-  assert.deepEqual(await response.json(), { configured: false, providers: { google: false, email: false }, googleConfigured: false, emailConfigured: false, user: null });
+  assert.deepEqual(await response.json(), { configured: false, providers: { google: false, github: false, email: false }, googleConfigured: false, emailConfigured: false, user: null });
   assert.match(response.headers.get('cache-control'), /no-store/);
   assert.equal(await handleAccounts(request('/api/ask'), disabled), null);
   assert.equal(await handleAccounts(request('/api/feedback'), disabled), null);
@@ -408,4 +426,71 @@ test('provider redirects are returned for rejection and never followed with cred
   const { sendAccountEmail } = await import('../worker/compilenrun-worker/src/email.js');
   await assert.rejects(sendAccountEmail({ BREVO_API_KEY: 'test-only', BREVO_SENDER_EMAIL: 'no-reply@compilenrun.com' }, 'test@example.invalid', 'verify', 'A'.repeat(43)), error => error.status === 302);
   assert.equal(calls, 2);
+});
+
+async function beginGithub(cookie = '', headers = {}) {
+  const response = await handleAccounts(request(cookie ? '/api/auth/github/link' : '/api/auth/github', cookie ? { method: 'POST', cookie, headers } : {}), env);
+  const location = cookie ? (await response.json()).url : response.headers.get('location');
+  return { response, url: new URL(location), cookie: cookiePair(response, '__Host-cnr_oauth') };
+}
+async function callbackGithub(challenge, extraCookie = '') {
+  return handleAccounts(request(GITHUB_CALLBACK + '?state=' + challenge.url.searchParams.get('state') + '&code=gh-code', { cookie: [challenge.cookie, extraCookie].filter(Boolean).join('; ') }), env);
+}
+async function sessionOf(cookie) { return (await (await handleAccounts(request('/api/auth/session', { cookie }), env)).json()); }
+
+test('GitHub sign-in creates an account with the login and primary verified email, and signs the same account in next time', async () => {
+  const challenge = await beginGithub();
+  assert.equal(challenge.url.origin + challenge.url.pathname, 'https://github.com/login/oauth/authorize');
+  assert.equal(challenge.url.searchParams.get('scope'), 'read:user user:email');
+  assert.equal(challenge.url.searchParams.get('code_challenge_method'), 'S256');
+  const done = await callbackGithub(challenge);
+  assert.equal(done.headers.get('location'), SITE + '/learn/');
+  const cookie = cookiePair(done, '__Host-cnr_session');
+  const first = await sessionOf(cookie);
+  assert.equal(first.providers.github, true);
+  assert.deepEqual([first.user.name, first.user.githubLinked, first.user.githubLogin, first.user.googleLinked, first.user.email], ['Mona Octocat', true, 'octocat', false, null]);
+  const profile = db.sqlite.prepare('SELECT login, email, email_verified FROM cnr_account_github_profiles WHERE github_id = ?').get('4242');
+  assert.deepEqual({ ...profile }, { login: 'octocat', email: 'mona@example.invalid', email_verified: 1 });
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_password_credentials').get().n, 0);
+  const again = await callbackGithub(await beginGithub());
+  const second = await sessionOf(cookiePair(again, '__Host-cnr_session'));
+  assert.equal(second.user.id, first.user.id);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_users').get().n, 1);
+});
+
+test('a Google challenge cannot be redeemed at the GitHub callback, and a failed GitHub exchange signs nobody in', async () => {
+  const google = await begin();
+  const crossed = await handleAccounts(request(GITHUB_CALLBACK + '?state=' + google.url.searchParams.get('state') + '&code=gh-code', { cookie: google.cookie }), env);
+  assert.equal(crossed.headers.get('location'), SITE + '/learn/?auth=error');
+  assert.equal(upstream.some(call => call.url.startsWith('https://github.com/')), false);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_oauth_challenges').get().n, 1, 'the Google challenge is untouched');
+  tokenFailure = true;
+  const failed = await callbackGithub(await beginGithub());
+  assert.equal(failed.headers.get('location'), SITE + '/learn/?auth=error');
+  assert.equal(cookiePair(failed, '__Host-cnr_session'), undefined);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_users').get().n, 0);
+});
+
+test('linking GitHub to a Google account makes Google unlinkable; the last sign-in method cannot be unlinked', async () => {
+  const current = await login('google-user-1');
+  const challenge = await beginGithub(current.cookie, authHeaders(current));
+  const linked = await callbackGithub(challenge, current.cookie);
+  assert.equal(linked.headers.get('location'), SITE + '/profile/?auth=linked');
+  const both = await sessionOf(current.cookie);
+  assert.deepEqual([both.user.googleLinked, both.user.githubLinked, both.user.githubLogin], [true, true, 'octocat']);
+  assert.equal(both.user.id, current.user.id);
+  const unlinked = await handleAccounts(request('/api/auth/google/link', { method: 'DELETE', cookie: current.cookie, headers: authHeaders(current) }), env);
+  assert.equal(unlinked.status, 200, 'Google can go because GitHub remains');
+  assert.equal((await sessionOf(current.cookie)).user, null, 'unlinking signs the account out everywhere');
+  const viaGithub = await sessionOf(cookiePair(await callbackGithub(await beginGithub()), '__Host-cnr_session'));
+  assert.equal(viaGithub.user.id, current.user.id);
+  assert.deepEqual([viaGithub.user.googleLinked, viaGithub.user.githubLinked], [false, true]);
+  const ghCookie = cookiePair(await callbackGithub(await beginGithub()), '__Host-cnr_session');
+  const ghLogin = await sessionOf(ghCookie);
+  const refused = await handleAccounts(request('/api/auth/github/link', { method: 'DELETE', cookie: ghCookie, headers: authHeaders({ user: ghLogin.user, csrfToken: ghLogin.csrfToken }) }), env);
+  assert.equal(refused.status, 409);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_github_identities').get().n, 1);
+  const existing = await login('google-user-2');
+  const taken = await callbackGithub(await beginGithub(existing.cookie, authHeaders(existing)), existing.cookie);
+  assert.equal(taken.headers.get('location'), SITE + '/profile/?auth=error', 'a GitHub identity already attached to another account cannot be moved');
 });

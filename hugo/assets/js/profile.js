@@ -38,15 +38,16 @@
   function formNamed(name) { return forms.find(function (form) { return form.getAttribute('data-profile-form') === name; }); }
   function validateSession(value) {
     if (!object(value) || typeof value.configured !== 'boolean' || (value.user !== null && !object(value.user))) throw error('Your account connection could not be verified. Refresh it and try again.', 'invalid_response');
-    var providers = object(value.providers) ? { google: value.providers.google === true, email: value.providers.email === true } : { google: value.configured, email: false };
+    var providers = object(value.providers) ? { google: value.providers.google === true, github: value.providers.github === true, email: value.providers.email === true } : { google: value.configured, github: false, email: false };
     if (value.user === null) return { configured: value.configured, providers: providers, user: null };
     var u = value.user;
     if (typeof u.id !== 'string' || !u.id || u.id.length > 200 || typeof u.name !== 'string' || u.name.length > 100 ||
         !(u.email === null || typeof u.email === 'string' && u.email.length <= 254) ||
         typeof u.emailVerified !== 'boolean' || typeof u.hasPassword !== 'boolean' || typeof u.googleLinked !== 'boolean' ||
         !(u.googleEmail === undefined || u.googleEmail === null || typeof u.googleEmail === 'string' && u.googleEmail.length <= 254) ||
+        !(u.githubLinked === undefined || typeof u.githubLinked === 'boolean') || !(u.githubLogin === undefined || u.githubLogin === null || typeof u.githubLogin === 'string' && u.githubLogin.length <= 39) ||
         typeof value.csrfToken !== 'string' || !value.csrfToken || value.csrfToken.length > 500) throw error('Account details could not be read safely. Refresh your connection before making changes.', 'invalid_response');
-    return { configured: value.configured, providers: providers, user: { id: u.id, name: u.name, email: u.email, emailVerified: u.emailVerified, hasPassword: u.hasPassword, googleLinked: u.googleLinked, googleEmail: u.googleLinked && u.googleEmail || null }, csrfToken: value.csrfToken };
+    return { configured: value.configured, providers: providers, user: { id: u.id, name: u.name, email: u.email, emailVerified: u.emailVerified, hasPassword: u.hasPassword, googleLinked: u.googleLinked, googleEmail: u.googleLinked && u.googleEmail || null, githubLinked: u.githubLinked === true, githubLogin: u.githubLinked === true && u.githubLogin || null }, csrfToken: value.csrfToken };
   }
   function accept(value, fill) {
     var next = validateSession(value), previousID = session && session.user && session.user.id;
@@ -54,7 +55,10 @@
     session = next; render(fill || previousID !== (next.user && next.user.id));
   }
   function render(fill) {
-    var user = session && session.user, ready = !!(session && session.configured), email = !!(session && session.providers.email), google = !!(session && session.providers.google);
+    var user = session && session.user, ready = !!(session && session.configured), email = !!(session && session.providers.email), google = !!(session && session.providers.google), github = !!(session && session.providers.github);
+    // Unlinking a provider needs another way back in: a verified password, or the other provider.
+    var otherThanGoogle = !!user && ((user.hasPassword && user.emailVerified && email) || (user.githubLinked && github));
+    var otherThanGithub = !!user && ((user.hasPassword && user.emailVerified && email) || (user.googleLinked && google));
     root.setAttribute('aria-busy', String(busy));
     root.querySelector('[data-profile-guest]').hidden = !ready || !!user;
     root.querySelector('[data-profile-member]').hidden = !user;
@@ -69,21 +73,27 @@
     });
     var link = root.querySelector('[data-profile-link-google]'), unlink = root.querySelector('[data-profile-unlink-google]');
     link.hidden = !user || !google || !!user.googleLinked; link.disabled = busy || !user || !google;
-    unlink.hidden = !user || !user.googleLinked; unlink.disabled = busy || !user || !(user.hasPassword && user.emailVerified && email);
+    unlink.hidden = !user || !user.googleLinked; unlink.disabled = busy || !user || !otherThanGoogle;
+    var linkGithub = root.querySelector('[data-profile-link-github]'), unlinkGithub = root.querySelector('[data-profile-unlink-github]');
+    linkGithub.hidden = !user || !github || !!user.githubLinked; linkGithub.disabled = busy || !user || !github;
+    unlinkGithub.hidden = !user || !user.githubLinked; unlinkGithub.disabled = busy || !user || !otherThanGithub;
+    root.querySelector('[data-profile-github-status]').hidden = !github && !(user && user.githubLinked);
     root.querySelector('[data-profile-logout]').disabled = busy || !user;
     root.querySelector('[data-profile-delete]').disabled = busy || !user;
     var cancelEmail = root.querySelector('[data-profile-cancel-email]');
-    cancelEmail.hidden = !user || !user.email || user.emailVerified || user.hasPassword || !user.googleLinked; cancelEmail.disabled = busy || !user;
+    cancelEmail.hidden = !user || !user.email || user.emailVerified || user.hasPassword || !(user.googleLinked || user.githubLinked); cancelEmail.disabled = busy || !user;
     root.querySelector('[data-profile-enrollment]').hidden = !user || !email || user.hasPassword;
     root.querySelector('[data-profile-member-resend]').hidden = !user || !email || (user.hasPassword && user.emailVerified);
     root.querySelector('[data-profile-password-form]').hidden = !user || !email || !user.hasPassword;
     if (user) {
       root.querySelector('[data-profile-name]').textContent = user.name;
-      root.querySelector('[data-profile-email]').textContent = user.email ? 'Email: ' + user.email : user.googleEmail ? 'Google email: ' + user.googleEmail : 'No email sign-in has been added.';
+      root.querySelector('[data-profile-email]').textContent = user.email ? 'Email: ' + user.email : user.googleEmail ? 'Google email: ' + user.googleEmail : user.githubLogin ? 'GitHub account: ' + user.githubLogin : 'No email sign-in has been added.';
       var verified = root.querySelector('[data-profile-verified]');
       verified.hidden = !user.email; verified.textContent = user.emailVerified ? 'Email verified.' : 'Email has not been verified for email sign-in.';
       root.querySelector('[data-profile-google-status]').textContent = !user.googleLinked ? 'No Google account is linked.' : user.googleEmail ? 'Google account linked: ' + user.googleEmail : 'A Google account is linked to this account. Its email appears here after your next Google sign-in.';
-      root.querySelector('[data-profile-unlink-help]').textContent = user.googleLinked && !(user.hasPassword && user.emailVerified && email) ? 'Keep Google linked until you have a verified email and password you can use to sign in.' : 'Linking Google adds a sign-in method to this same account; it does not combine different accounts or upload browser learning.';
+      root.querySelector('[data-profile-unlink-help]').textContent = user.googleLinked && !otherThanGoogle ? 'Keep Google linked until you have another way to sign in: a verified email and password, or a linked GitHub account.' : 'Linking Google adds a sign-in method to this same account; it does not combine different accounts or upload browser learning.';
+      root.querySelector('[data-profile-github-status]').textContent = !user.githubLinked ? 'No GitHub account is linked.' : 'GitHub account linked' + (user.githubLogin ? ': ' + user.githubLogin : '') + '.';
+      root.querySelector('[data-profile-github-help]').textContent = user.githubLinked && !otherThanGithub ? 'Keep GitHub linked until you have another way to sign in: a verified email and password, or a linked Google account.' : 'Linking GitHub adds a sign-in method to this same account; it does not combine different accounts.';
       if (fill) { formNamed('name').elements.name.value = user.name; formNamed('enroll').elements.email.value = user.email || pendingEmail; formNamed('resend-member').elements.email.value = user.email || pendingEmail; }
     }
   }
@@ -106,7 +116,7 @@
     try { return JSON.parse(raw); } catch (ignored) { throw error('The account service returned an unreadable response. Please try again later.', 'invalid_response'); }
   }
   async function request(url, method, body, authenticated) {
-    if (method !== 'GET' && ['/api/auth/login', '/api/auth/logout', '/api/auth/account', '/api/auth/password', '/api/auth/verify-email', '/api/auth/reset-password', '/api/auth/google/link'].indexOf(url) >= 0) await beforeAuthAction(url);
+    if (method !== 'GET' && ['/api/auth/login', '/api/auth/logout', '/api/auth/account', '/api/auth/password', '/api/auth/verify-email', '/api/auth/reset-password', '/api/auth/google/link', '/api/auth/github/link'].indexOf(url) >= 0) await beforeAuthAction(url);
     var controller = new AbortController(), timer = setTimeout(function () { controller.abort(); }, 15000);
     var headers = { Accept: 'application/json' };
     if (method !== 'GET') headers['Content-Type'] = 'application/json';
@@ -126,7 +136,7 @@
         if (url === '/api/auth/verify-email' && response.status < 500) throw error('The verification link or password was not accepted. Use the password you chose for this email, or request another verification link.', 'invalid_token');
         if (url === '/api/auth/reset-password' && response.status < 500) throw error('This reset link could not be used. Request a new reset link and try again.', 'invalid_token');
         if (url === '/api/auth/password' && response.status < 500) throw error('The password could not be changed. Check your current password and the new password requirements.', 'password_failed');
-        if (url === '/api/auth/google/link' && method === 'DELETE' && response.status < 500) throw error('Google could not be unlinked. Keep a verified email and password available before removing it.', 'unlink_failed');
+        if ((url === '/api/auth/google/link' || url === '/api/auth/github/link') && method === 'DELETE' && response.status < 500) throw error('This sign-in method could not be unlinked. Keep another way to sign in (a verified email and password, or another linked account) before removing it.', 'unlink_failed');
         if (response.status === 403) throw error('Refresh your account connection before trying this action again.', 'refresh_session');
         throw error('That account action is unavailable right now. Please try again later; your browser learning is unchanged.', 'unavailable');
       }
@@ -190,20 +200,23 @@
       }, form);
     });
   });
-  root.querySelector('[data-profile-link-google]').addEventListener('click', function () {
-    run(async function () {
-      await sameAccount(); var result = await request('/api/auth/google/link', 'POST', {}, true), destination;
-      try { destination = new URL(result.url); } catch (ignored) { throw error('The Google sign-in link could not be verified. Please try again.', 'invalid_response'); }
-      if (destination.origin !== 'https://accounts.google.com' || destination.pathname !== '/o/oauth2/v2/auth' || destination.username || destination.password) throw error('The Google sign-in link could not be verified. No navigation was made.', 'invalid_response');
-      say('Continue with Google to add it to this same account.'); navigating = true; location.assign(destination.href);
+  [{ key: 'google', label: 'Google', origin: 'https://accounts.google.com', path: '/o/oauth2/v2/auth' },
+   { key: 'github', label: 'GitHub', origin: 'https://github.com', path: '/login/oauth/authorize' }].forEach(function (provider) {
+    root.querySelector('[data-profile-link-' + provider.key + ']').addEventListener('click', function () {
+      run(async function () {
+        await sameAccount(); var result = await request('/api/auth/' + provider.key + '/link', 'POST', {}, true), destination;
+        try { destination = new URL(result.url); } catch (ignored) { throw error('The ' + provider.label + ' sign-in link could not be verified. Please try again.', 'invalid_response'); }
+        if (destination.origin !== provider.origin || destination.pathname !== provider.path || destination.username || destination.password) throw error('The ' + provider.label + ' sign-in link could not be verified. No navigation was made.', 'invalid_response');
+        say('Continue with ' + provider.label + ' to add it to this same account.'); navigating = true; location.assign(destination.href);
+      });
+    });
+    root.querySelector('[data-profile-unlink-' + provider.key + ']').addEventListener('click', function () {
+      if (busy || !session || !session.user || !confirm('Unlink ' + provider.label + ' and sign this account out on all devices? You will sign in again with your remaining sign-in method.')) return;
+      run(async function () { await sameAccount(); await request('/api/auth/' + provider.key + '/link', 'DELETE', {}, true); await refresh(true); say(provider.label + ' was unlinked. Sign in again with your remaining sign-in method.'); });
     });
   });
-  root.querySelector('[data-profile-unlink-google]').addEventListener('click', function () {
-    if (busy || !session || !session.user || !confirm('Unlink Google and sign this account out on all devices? You will use your verified email and password to sign in again.')) return;
-    run(async function () { await sameAccount(); await request('/api/auth/google/link', 'DELETE', {}, true); await refresh(true); say('Google was unlinked. Sign in again with your verified email and password.'); });
-  });
   root.querySelector('[data-profile-cancel-email]').addEventListener('click', function () {
-    run(async function () { await sameAccount(); await request('/api/auth/email', 'DELETE', {}, true); pendingEmail = ''; await refresh(true); say('The pending email request was cancelled. Google remains linked, and browser learning is unchanged.'); });
+    run(async function () { await sameAccount(); await request('/api/auth/email', 'DELETE', {}, true); pendingEmail = ''; await refresh(true); say('The pending email request was cancelled. Your linked account remains linked, and browser learning is unchanged.'); });
   });
   root.querySelector('[data-profile-logout]').addEventListener('click', function () {
     run(async function () { await sameAccount(); await request('/api/auth/logout', 'POST', {}, true); clearPasswords(); await refresh(true); say('Signed out. Learning saved in this browser is still here.'); });
@@ -218,8 +231,8 @@
     else if (!session.configured) say('Account sign-in is unavailable right now. You can continue learning and keep local backups from the dashboard.');
     else if (verifyToken) say('Your verification link is ready. Enter the password you chose and select Verify email.');
     else if (resetToken) say('Your reset link is ready. Choose a new password to continue.');
-    else if (new URLSearchParams(location.search).get('auth') === 'linked') say('The Google linking flow finished. Review the sign-in methods below to confirm the linked status.');
-    else if (new URLSearchParams(location.search).get('auth') === 'error') say('Google sign-in or linking did not finish. Your existing account settings were not changed.');
+    else if (new URLSearchParams(location.search).get('auth') === 'linked') say('The account linking flow finished. Review the sign-in methods below to confirm the linked status.');
+    else if (new URLSearchParams(location.search).get('auth') === 'error') say('Sign-in or linking did not finish. Your existing account settings were not changed.');
     else say('');
   }
   root.querySelector('[data-profile-refresh]').addEventListener('click', function () { run(connect); });

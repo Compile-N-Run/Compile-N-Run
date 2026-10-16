@@ -13,7 +13,7 @@
   const message = dialog?.querySelector('[data-auth-message]');
   const forms = dialog ? Array.from(dialog.querySelectorAll('[data-auth-form]')) : [];
   const titles = { login: 'Sign in', register: 'Create an account', forgot: 'Reset your password', resend: 'Verify your email' };
-  let current = null, known = false, published = false, transitionFailed = false, actionPending = false, capabilities = { google: false, email: false };
+  let current = null, known = false, published = false, transitionFailed = false, actionPending = false, capabilities = { google: false, github: false, email: false };
   let inFlight = null, refreshController = null, initial = null, mutation = null;
   let lastAttempt = 0, requestEpoch = 0, stateEpoch = 0, transition = Promise.resolve(), transitioning = false;
   let syncNotice = '', busy = false, mode = 'login', returnFocus = null, focusAvatarOnClose = false;
@@ -23,16 +23,18 @@
   function fault(code, text) { const error = new Error(text); error.code = code; return error; }
   function validate(value) {
     if (!object(value) || typeof value.configured !== 'boolean' || (value.user !== null && !object(value.user))) throw fault('invalid_response','Sign-in details could not be verified. Please try again.');
-    const providers = object(value.providers) ? { google: value.providers.google === true, email: value.providers.email === true } : { google: value.googleConfigured === true, email: value.emailConfigured === true };
-    if (value.user === null) return { configured: value.configured, providers: value.configured ? providers : { google: false, email: false }, user: null };
+    const providers = object(value.providers) ? { google: value.providers.google === true, github: value.providers.github === true, email: value.providers.email === true } : { google: value.googleConfigured === true, github: false, email: value.emailConfigured === true };
+    if (value.user === null) return { configured: value.configured, providers: value.configured ? providers : { google: false, github: false, email: false }, user: null };
     const user = value.user;
     if (!value.configured || !plain(user.id,200) || !plain(user.name,100,true) ||
         !(user.email === undefined || user.email === null || plain(user.email,254)) ||
-        typeof user.emailVerified !== 'boolean' || typeof user.hasPassword !== 'boolean' || typeof user.googleLinked !== 'boolean' || !(user.googleEmail === undefined || user.googleEmail === null || plain(user.googleEmail,254)) || !plain(value.csrfToken,500)) {
+        typeof user.emailVerified !== 'boolean' || typeof user.hasPassword !== 'boolean' || typeof user.googleLinked !== 'boolean' || !(user.googleEmail === undefined || user.googleEmail === null || plain(user.googleEmail,254)) ||
+        !(user.githubLinked === undefined || typeof user.githubLinked === 'boolean') || !(user.githubLogin === undefined || user.githubLogin === null || plain(user.githubLogin,39)) || !plain(value.csrfToken,500)) {
       throw fault('invalid_response','Sign-in details could not be verified. Please try again.');
     }
     return { configured: value.configured, providers, user: { id: user.id, name: user.name, email: user.email || null,
-      emailVerified: user.emailVerified, hasPassword: user.hasPassword, googleLinked: user.googleLinked, googleEmail: user.googleLinked && user.googleEmail || null }, csrfToken: value.csrfToken };
+      emailVerified: user.emailVerified, hasPassword: user.hasPassword, googleLinked: user.googleLinked, googleEmail: user.googleLinked && user.googleEmail || null,
+      githubLinked: user.githubLinked === true, githubLogin: user.githubLinked === true && user.githubLogin || null }, csrfToken: value.csrfToken };
   }
   function clearPasswords() { dialog?.querySelectorAll('input[type="password"]').forEach(input=>{input.value='';}); }
   function say(text, error = false) { if(message){message.textContent=text;message.dataset.error=String(error);} }
@@ -70,9 +72,11 @@
     dialog.setAttribute('aria-busy',String(busy||transitioning));
     dialog.querySelector('[data-auth-google]').hidden=!capabilities.google||(Boolean(user)&&transitionFailed);
     dialog.querySelector('[data-auth-google]').setAttribute('aria-disabled',String(busy||transitioning||transitionFailed));
+    dialog.querySelector('[data-auth-github]').hidden=!capabilities.github||(Boolean(user)&&transitionFailed);
+    dialog.querySelector('[data-auth-github]').setAttribute('aria-disabled',String(busy||transitioning||transitionFailed));
     dialog.querySelector('[data-auth-email]').hidden=!capabilities.email||(Boolean(user)&&transitionFailed);
-    dialog.querySelector('[data-auth-divider]').hidden=!(capabilities.email&&capabilities.google);
-    dialog.querySelector('[data-auth-retry]').hidden=!transitionFailed&&Boolean(current?.configured && (capabilities.email||capabilities.google));
+    dialog.querySelector('[data-auth-divider]').hidden=!(capabilities.email&&(capabilities.google||capabilities.github));
+    dialog.querySelector('[data-auth-retry]').hidden=!transitionFailed&&Boolean(current?.configured && (capabilities.email||capabilities.google||capabilities.github));
     dialog.querySelector('[data-auth-retry]').disabled=busy||Boolean(inFlight);
     dialog.querySelector('#cnr-auth-title').textContent=transitionFailed&&user?'Learning needs attention':titles[mode];
     forms.forEach(form=>{
@@ -272,6 +276,11 @@
     });
     dialog.addEventListener('click',event=>{if(event.target===dialog){const box=dialog.getBoundingClientRect();if(event.clientX<box.left||event.clientX>box.right||event.clientY<box.top||event.clientY>box.bottom)closeDialog();}});
     dialog.querySelectorAll('[data-auth-mode]').forEach(button=>button.addEventListener('click',()=>modeChanged(button.dataset.authMode)));
+    dialog.querySelector('[data-auth-github]').addEventListener('click',event=>{
+      event.preventDefault();if(busy||transitioning||transitionFailed||!capabilities.github)return;
+      busy=true;clearPasswords();render();say('Opening GitHub sign-in…');
+      beforeAction('github').then(()=>location.assign('/api/auth/github')).catch(error=>{busy=false;transitionFailed=true;say(error.message,true);render();});
+    });
     dialog.querySelector('[data-auth-google]').addEventListener('click',event=>{
       event.preventDefault();if(busy||transitioning||transitionFailed||!capabilities.google)return;
       busy=true;clearPasswords();render();say('Opening Google sign-in…');

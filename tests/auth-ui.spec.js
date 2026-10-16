@@ -6,7 +6,7 @@ const {chromium}=require(process.env.CNR_PLAYWRIGHT_MODULE||'playwright');
 const root=path.resolve(__dirname,'..');
 const partial=fs.readFileSync(path.join(root,'hugo/layouts/partials/account-menu.html'),'utf8');
 const user=(id='user-a',name='Alex Learner')=>({id,name,email:'alex@example.invalid',emailVerified:true,hasPassword:true,googleLinked:true});
-const state=()=>({configured:true,providers:{google:true,email:true},user:null,csrfToken:'csrf-a',calls:[],offline:false,loginError:false});
+const state=()=>({configured:true,providers:{google:true,github:true,email:true},user:null,csrfToken:'csrf-a',calls:[],offline:false,loginError:false});
 let browser,server,origin;
 before(async()=>{
  server=http.createServer((req,res)=>{
@@ -60,7 +60,7 @@ async function login(page){const form=page.locator('[data-auth-form="login"]');a
 test('one shared discovery, native dialog focus, provider switches, and safe form methods',async t=>{
  const{page,account,errors}=await setup(t);assert.equal(account.calls.length,1);
  await Promise.all([page.evaluate(()=>CNRAuth.ready()),page.evaluate(()=>CNRAuth.refresh({force:false}))]);assert.equal(account.calls.length,1);
- await open(page);assert.equal(account.calls.length,1);assert.equal(await page.locator('[data-auth-google]').getAttribute('href'),'/api/auth/google');
+ await open(page);assert.equal(account.calls.length,1);assert.equal(await page.locator('[data-auth-google]').getAttribute('href'),'/api/auth/google');assert.equal(await page.locator('[data-auth-github]').getAttribute('href'),'/api/auth/github');assert.equal(await page.locator('[data-auth-github]').isVisible(),true);
  for(const form of await page.locator('[data-auth-form]').all())assert.equal(await form.getAttribute('method'),'post');
  await page.locator('[data-auth-form="login"] [name="password"]').fill('not persisted');await page.keyboard.press('Escape');
  assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false);await page.waitForFunction(()=>document.querySelector('[data-auth-open]')===document.activeElement);assert.equal(await page.locator('[name="password"]').first().inputValue(),'');

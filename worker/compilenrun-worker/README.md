@@ -76,6 +76,7 @@ The flow uses a random state nonce bound to a separate HttpOnly cookie, S256 PKC
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-schema.sql
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-email-schema.sql
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-google-profile-schema.sql
+   npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-github-schema.sql
    ```
 
 4. Deploy with Wrangler 4 after validating the migration, secret, and Worker changes. The configuration adds only the auth, learning, and Google callback routes (patterns end in `*`: Cloudflare skips the Worker for a wildcard-less pattern once a query string is present) plus the `AUTH_LIMIT` binding (60 account requests per minute per IP). It preserves existing AI/quiz/feedback routes and bindings.
@@ -106,6 +107,8 @@ The website automatically synchronizes the signed-in learner’s state through t
 References: [Google OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect), [Google discovery endpoints and PKCE methods](https://accounts.google.com/.well-known/openid-configuration), [D1 primary/session behavior](https://developers.cloudflare.com/d1/worker-api/d1-database/), and [D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
 
 ## Email/password, verification, recovery, and profile settings
+
+The v4 `accounts-github-schema.sql` migration adds GitHub sign-in: `cnr_account_github_identities` (GitHub user id → account) and `cnr_account_github_profiles` (login, primary verified email, name), plus a `provider` column on the OAuth challenge table so a state can only be redeemed at the provider that issued it. GitHub uses the same PKCE/state/binding-cookie flow as Google (`GET /api/auth/github`, callback `/auth/github_oauth2/callback`, `POST/DELETE /api/auth/github/link`), needs the `GITHUB_CLIENT_ID` var and `GITHUB_CLIENT_SECRET` secret, and requests the `read:user user:email` scopes. Unlinking any provider is allowed while another usable sign-in method remains (a verified password with email configured, or another linked provider). Apply this migration once: its `ALTER TABLE` is not repeatable.
 
 The v3 `accounts-google-profile-schema.sql` migration adds `cnr_account_google_profiles` (Google email, `email_verified`, and name, keyed by `google_sub`). Sign-in requests the `openid email profile` scopes and refreshes the row at every Google sign-in or link; the row is deleted on unlink and cascades away on account deletion. The Google email is informational only and is never used to authenticate or to match password accounts. Existing Google users get a row at their next Google sign-in.
 
