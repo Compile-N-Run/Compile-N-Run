@@ -7,6 +7,7 @@
   var MAX_STORE = 2 * 1024 * 1024, MAX_BACKUP = 6 * 1024 * 1024, MAX_NOTE = 20000;
   var state, catalog = null, pending = null, volatile = false, blocked = false, notice = '';
   var volatileKeys = Object.create(null);
+  var importSequence = 0;
   var catalogPromise = null, noteDirty = false, noteBaseline = '', initialised = false;
   var own = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
   var map = function () { return Object.create(null); };
@@ -273,9 +274,31 @@
     Object.keys(KEYS).forEach(function (name) { out[name] = checkSize(validators[name](out[name]), name); });
     return { state: out, summary: summary };
   }
-  function validateBackup(raw) {
+  // Account snapshots must not silently drop fields from an unsupported schema.
+  function checkBackupFields(backup) {
+    function only(value, names, label) {
+      object(value, label); Object.keys(value).forEach(function (key) { if (names.indexOf(key) < 0) fail(label + ' contains an unsupported field.'); });
+    }
+    only(backup, ['format', 'version', 'exportedAt', 'progress', 'learning', 'playground'], 'Backup');
+    only(backup.progress, ['v', 'done', 'tuts'], 'Reading progress');
+    keys(backup.progress.tuts, 1000, 'Courses').forEach(function (id) {
+      var item = backup.progress.tuts[id]; only(item, ['label', 'url', 'total', 'done', 'last', 't'], 'Course');
+      if (item.last !== undefined) only(item.last, ['path', 'title'], 'Last lesson');
+    });
+    only(backup.learning, ['v', 'lessons'], 'Learning data');
+    keys(backup.learning.lessons, 5000, 'Lessons').forEach(function (p) {
+      var item = backup.learning.lessons[p]; only(item, ['title', 'course', 'visitedAt', 'updatedAt', 'bookmark', 'note', 'practice'], 'Lesson');
+      if (item.bookmark !== undefined) only(item.bookmark, ['value', 'updatedAt'], 'Bookmark');
+      if (item.note !== undefined) only(item.note, ['text', 'updatedAt'], 'Note');
+      keys(item.practice || {}, 100, 'Exercise records').forEach(function (id) { only(item.practice[id], ['attemptedAt', 'passedAt', 'lastResult'], 'Exercise record'); });
+    });
+    only(backup.playground, ['version', 'drafts'], 'Playground data');
+    keys(backup.playground.drafts, 100, 'Playground drafts').forEach(function (key) { only(backup.playground.drafts[key], ['html', 'css', 'js', 'title', 'path', 'course', 'exerciseId', 'updatedAt'], 'Draft'); });
+  }
+  function validateBackup(raw, strict) {
     if (typeof raw !== 'string' || bytes(raw) > MAX_BACKUP) fail('Choose a JSON backup no larger than 6 MB.');
     var backup = parse(raw); object(backup, 'Backup');
+    if (strict) checkBackupFields(backup);
     if (backup.format !== 'cnr-learning-backup' || backup.version !== 1) fail('This is not a supported Compile N Run learning backup.');
     if (!Number.isFinite(Date.parse(backup.exportedAt))) fail('The backup date is invalid.');
     var clean = empty(); Object.keys(KEYS).forEach(function (name) { clean[name] = checkSize(validators[name](backup[name]), name); });
@@ -285,11 +308,12 @@
     pending = null;
     if (volatile || blocked) fail('Your browser has unsaved or unreadable data. Export it before importing, then retry in a tab with working storage.');
     var incoming = validateBackup(raw), current = readAll(), merged = merge(current, incoming);
-    pending = { incoming: incoming, base: serialise(current), summary: merged.summary };
-    return clone(merged.summary);
+    pending = { incoming: incoming, base: serialise(current), summary: merged.summary, token: String(++importSequence) };
+    var summary = clone(merged.summary); summary.previewToken = pending.token; return summary;
   }
-  function applyImport() {
+  function applyImport(expectedToken) {
     if (!pending) fail('Preview a backup before merging it.');
+    if (expectedToken !== undefined && expectedToken !== pending.token) fail('A different backup has been previewed. Preview this backup again before merging it.');
     if (volatile || blocked) fail('Browser storage is not ready for a backup merge.');
     var before = readAll();
     if (serialise(before) !== pending.base) { pending = null; fail('Your saved data changed since the preview. Choose the backup again to preview the updated merge.'); }
@@ -559,7 +583,7 @@
     });
     var root = document.querySelector('[data-learning-dashboard]'); if (!root) return;
     var status = root.querySelector('[data-learning-backup-status]'), input = root.querySelector('[data-learning-import-file]'), preview = root.querySelector('[data-learning-import-preview]');
-    var mergeButton = root.querySelector('[data-learning-import-apply]'), cancel = root.querySelector('[data-learning-import-cancel]'), fileTicket = 0;
+    var mergeButton = root.querySelector('[data-learning-import-apply]'), cancel = root.querySelector('[data-learning-import-cancel]'), fileTicket = 0, previewToken = null;
     function clearPreview() { fileTicket++; pending = null; preview.hidden = true; mergeButton.disabled = true; input.value = ''; }
     input.addEventListener('change', function () {
       var ticket = ++fileTicket; pending = null; preview.hidden = true; mergeButton.disabled = true; var file = input.files && input.files[0]; if (!file) return;
@@ -567,14 +591,14 @@
       status.textContent = 'Checking backup…';
       file.text().then(function (raw) {
         if (ticket !== fileTicket) return;
-        var summary = prepareImport(raw), counts = root.querySelector('[data-learning-import-counts]'); counts.replaceChildren();
+        var summary = prepareImport(raw); previewToken = summary.previewToken; var counts = root.querySelector('[data-learning-import-counts]'); counts.replaceChildren();
         counts.appendChild(el('p', summary.read + ' read marks · ' + summary.bookmarks + ' bookmarks · ' + summary.notes + ' notes · ' + summary.practice + ' exercise records · ' + summary.drafts + ' drafts'));
         counts.appendChild(el('p', 'Merge keeps existing read marks. The newest bookmark choice wins. Different notes are kept together; conflicting code drafts are added as separate copies.'));
         counts.appendChild(el('p', summary.noteConflicts + ' different notes will be appended; ' + summary.draftCopies + ' draft copies will be added.'));
         preview.hidden = false; mergeButton.disabled = false; status.textContent = 'Backup validated. Review the preview, then choose Merge backup. Nothing has changed yet.';
       }).catch(function (error) { if (ticket === fileTicket) status.textContent = 'Backup not imported: ' + error.message; });
     });
-    mergeButton.addEventListener('click', function () { try { applyImport(); clearPreview(); status.textContent = 'Backup merged. Your existing read marks, notes, and drafts were preserved.'; } catch (error) { clearPreview(); status.textContent = error.message; } });
+    mergeButton.addEventListener('click', function () { try { applyImport(previewToken); clearPreview(); status.textContent = 'Backup merged. Your existing read marks, notes, and drafts were preserved.'; } catch (error) { clearPreview(); status.textContent = error.message; } });
     cancel.addEventListener('click', function () { clearPreview(); status.textContent = 'Import cancelled. No saved data changed.'; });
   }
   function init() {
@@ -598,7 +622,7 @@
   window.addEventListener('beforeunload', function (event) { if (noteDirty || volatile) { event.preventDefault(); event.returnValue = ''; } });
   window.CNRLearning = Object.freeze({
     getSnapshot: function () { return clone(state); }, setRead: setRead, setBookmark: bookmark, saveNote: saveNote, recordPractice: practice,
-    exportBackup: exportBackup, prepareImport: prepareImport, applyImport: applyImport, loadCatalog: loadCatalog,
+    exportBackup: exportBackup, validateBackup: function (raw) { return clone(validateBackup(raw, true)); }, prepareImport: prepareImport, applyImport: applyImport, loadCatalog: loadCatalog,
     limits: Object.freeze({ backupBytes: MAX_BACKUP, storeBytes: MAX_STORE, noteCharacters: MAX_NOTE })
   });
   init();

@@ -64,7 +64,7 @@ hugo/scripts/build.sh
 python3 -m http.server 8000 --bind 127.0.0.1 --directory hugo/public
 ```
 
-Open `http://127.0.0.1:8000/`. The complete build includes the Pagefind index, so filtered search works in this preview. `/learn/` provides browser-local progress, bookmarks, notes, and JSON backups. `/playground/` provides HTML/CSS/JavaScript projects; supported lesson examples also open a practice panel. HTML and CSS render automatically, while JavaScript uses Run or the explicit Auto-run JavaScript option. Drafts and learning records stay in the browser unless exported.
+Open `http://127.0.0.1:8000/`. The complete build includes the Pagefind index, so filtered search works in this preview. `/learn/` provides browser-local progress, bookmarks, notes, and JSON backups. `/playground/` provides HTML/CSS/JavaScript projects; supported lesson examples also open a practice panel. HTML and CSS render automatically, while JavaScript uses Run or the explicit Auto-run JavaScript option. Drafts and learning records stay in the browser unless exported or explicitly saved to a signed-in account. Optional Google or verified email/password sign-in uses the existing Cloudflare Worker and D1, with Brevo for verification and password resets. `/profile/` provides profile and security settings; see [account deployment and OAuth setup](worker/ask-ai/README.md). Account saves are manual snapshots with revision checks; another device can preview and merge a saved snapshot.
 
 The publishing workflow requires content-quality checks and built-site browser tests before deployment. See [the quality-check guide](tests/content-quality/README.md) for commands, review metadata, and the boundary of legacy-content validation. To run application tests after building:
 

@@ -5,6 +5,8 @@
 // POST /api/quiz {path, round, turnstile, stream?} -> cached: {title, round, questions: [{question, code, options[4], answer, explanation}]};
 //   new, with stream: application/x-ndjson lines {question} ... then {done, count} or {error} (without: one JSON answer)
 
+import { handleAccounts } from './accounts.js';
+
 const SITE = 'https://www.compilenrun.com';
 // Small and cheap: ~8 Neurons for an answer with a full tutorial as context (Gemma 4 26B was ~50).
 const MODEL = '@cf/ibm-granite/granite-4.0-h-micro';
@@ -388,6 +390,8 @@ async function feedback(request, env, ctx, cors, ip) {
 
 export default {
   async fetch(request, env, ctx) {
+    const accountResponse = await handleAccounts(request, env, ctx);
+    if (accountResponse) return accountResponse;
     const cors = corsFor(request.headers.get('Origin') || '');
     if (request.method === 'OPTIONS') return new Response(null, { status: cors ? 204 : 403, headers: cors || {} });
     if (request.method !== 'POST') return json(405, { error: 'Use POST.' }, cors || {});

@@ -19,10 +19,16 @@ npx playwright install chromium
 npm run test:browser
 ```
 
-From the repository root, also run the learning/playground fixtures with the same pinned dependencies:
+From the repository root, also run the learning, playground, account, and profile fixtures with the same pinned dependencies:
 
 ```sh
-NODE_PATH="$PWD/tests/content-quality/node_modules" CNR_PLAYWRIGHT_MODULE="$PWD/tests/content-quality/node_modules/playwright" node --test --test-concurrency=1 tests/learning.spec.js tests/playground.spec.js
+NODE_PATH="$PWD/tests/content-quality/node_modules" CNR_PLAYWRIGHT_MODULE="$PWD/tests/content-quality/node_modules/playwright" node --test --test-concurrency=1 tests/learning.spec.js tests/playground.spec.js tests/accounts.spec.js tests/profile.spec.js
+```
+
+Account API and security tests use in-memory SQLite and mocked Google/Brevo endpoints; they do not send real email or need production secrets:
+
+```sh
+node --test tests/accounts-*.test.mjs tests/auth-security.test.mjs
 ```
 
 The quality workflow runs these fixtures alongside static example checks. Application tests against the generated Hugo site run separately after the publishing workflow builds that site.

@@ -5,7 +5,7 @@ description: The Compile N Run privacy policy explains what data we collect, how
 
 # Privacy Policy
 
-**Last updated: June 3, 2026**
+**Last updated: October 15, 2026**
 
 This Privacy Policy describes how **Compile N Run** ("we", "us", or "our"), operator of [https://www.compilenrun.com](https://www.compilenrun.com) (the "Site"), collects, uses, and shares information when you visit the Site. By using the Site, you agree to the practices described in this policy.
 
@@ -17,6 +17,18 @@ We may collect the following types of information automatically:
 
 - **Usage and device data** — such as your IP address (often anonymized or truncated by our providers), browser type, device type, operating system, referring pages, pages visited, and the date and time of your visit.
 - **Cookies and similar technologies** — small data files stored on your device that help us understand site usage and that enable advertising. See the [Cookies](#cookies) section below.
+
+## Optional Learning Accounts
+
+Tutorials and browser-local learning tools remain available without an account. Read marks, bookmarks, notes, exercise records, and playground drafts are stored in your browser. Downloaded backup files stay on your device.
+
+If you register with email and password, we store your email address, display name, verification status, and a salted password hash. We do not store your password in readable form. We use Brevo to send the verification and password-reset messages you request; Brevo processes the recipient address and message delivery information. Verification and reset links expire and can be used only once.
+
+If you choose Google sign-in or link Google to your account, we use your Google account identifier and display name to recognize that sign-in method. We do not receive your Google password. Google handles the sign-in process under its own privacy policy. The site uses an essential session cookie to keep you signed in. You can manage your display name, password, and linked sign-in methods on your profile page.
+
+Choosing **Save to account** uploads a snapshot of your learning records, including saved notes and playground drafts, to our Cloudflare D1 database. Account saves are manual. On another device, you can preview and merge the saved snapshot into that browser. We use this information to provide your learning account and restore your progress.
+
+Signing out ends your session but leaves learning records in that browser. On a shared device, clear the site's browser data after keeping any backup you need. You can delete your account and its saved learning from **My learning**; this also ends its active sessions. Cloudflare's database recovery copies may retain deleted data for its configured recovery period. Local browser records and previously downloaded backups are separate copies.
 
 ## How We Use Information
 

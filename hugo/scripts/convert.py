@@ -463,6 +463,11 @@ def main():
         'title': 'My Learning', 'url': '/learn/', 'type': 'learning',
         'description': 'Continue your courses, keep bookmarks and notes, and back up your learning progress.',
     })
+    write_page(os.path.join(OUT, 'profile.md'), {
+        'title': 'Profile and settings', 'url': '/profile/', 'type': 'profile',
+        'description': 'Manage your Compile N Run profile, sign-in methods, and account settings.',
+        'robots': 'noindex, nofollow',
+    })
     write_page(os.path.join(OUT, 'playground.md'), {
         'title': 'HTML, CSS and JavaScript Playground', 'url': '/playground/', 'type': 'playground',
         'description': 'Practice HTML, CSS and JavaScript with a live preview, saved projects, and guided exercises.',
