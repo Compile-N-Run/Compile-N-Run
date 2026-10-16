@@ -1,5 +1,5 @@
 /* /roadmap/: tabs per track, arrows between nodes, the reader's progress on each node (from the
-   cnr_progress record main.js keeps), and a panel with a node's sections. */
+   cnr_progress reading record learning.js keeps), and a panel with a node's sections. */
 (function () {
   var root = document.documentElement;
   var get = function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } };
@@ -16,13 +16,20 @@
     var done = Math.min(count(node.getAttribute('data-prefix')), total);
     return { done: done, total: total };
   };
-  document.querySelectorAll('.cnr-rm__node[data-prefix]').forEach(function (node) {
-    var p = nodeProgress(node);
-    if (!p.done) return;
-    node.classList.add(p.done >= p.total ? 'cnr-rm__node--done' : 'cnr-rm__node--started');
-    node.querySelector('.cnr-rm__bar i').style.width = Math.round(100 * p.done / p.total) + '%';
-    node.querySelector('.cnr-rm__meta').textContent = p.done >= p.total ? '✓ Completed' : p.done + ' / ' + p.total + ' pages';
-  });
+  var paintReading = function () {
+    try { progress = JSON.parse(get('cnr_progress') || 'null') || { done: {}, tuts: {} }; } catch (e) { progress = { done: {}, tuts: {} }; }
+    doneKeys = Object.keys(progress.done || {});
+    document.querySelectorAll('.cnr-rm__node[data-prefix]').forEach(function (node) {
+      var p = nodeProgress(node);
+      node.classList.toggle('cnr-rm__node--done', p.total > 0 && p.done >= p.total);
+      node.classList.toggle('cnr-rm__node--started', p.done > 0 && p.done < p.total);
+      node.querySelector('.cnr-rm__bar i').style.width = (p.total ? Math.round(100 * p.done / p.total) : 0) + '%';
+      node.querySelector('.cnr-rm__meta').textContent = p.done ? p.done + ' / ' + p.total + ' pages read' : p.total + ' pages';
+    });
+  };
+  paintReading();
+  window.addEventListener('storage', function (e) { if (e.key === 'cnr_progress' || e.key === null) { paintReading(); redraw(); } });
+  window.addEventListener('cnr:learning-updated', function () { paintReading(); redraw(); });
 
   /* ---------- Arrows: from each node to the ones that build on it ---------- */
   var draw = function (track) {
@@ -114,7 +121,7 @@
       var tut = node.getAttribute('data-tut');
       var last = tut && progress.tuts && progress.tuts[tut] && progress.tuts[tut].last;
       html += (note ? '<p>' + esc(note) + '</p>' : '') +
-        '<p class="cnr-rm__pmeta">' + (p.done ? p.done + ' of ' + p.total + ' pages done' : p.total + (p.total === 1 ? ' page' : ' pages')) + '</p>' + bar(p.done, p.total) +
+        '<p class="cnr-rm__pmeta">' + (p.done ? p.done + ' of ' + p.total + ' pages read' : p.total + (p.total === 1 ? ' page' : ' pages')) + '</p>' + bar(p.done, p.total) +
         '<div class="cnr-rm__actions">' +
         (last && /^\/docs\//.test(last.path) && p.done < p.total ? '<a class="button button--primary" href="' + esc(last.path) + '">Continue: ' + esc(last.title) + '</a>' : '') +
         '<a class="button ' + (last && p.done < p.total ? 'button--secondary' : 'button--primary') + '" href="' + esc(href) + '">' + (p.done >= p.total ? 'Review' : p.done ? 'Open' : 'Start') + '</a></div>';

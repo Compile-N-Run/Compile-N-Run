@@ -413,7 +413,7 @@ def main():
                 'srcdir': rel_dir,
                 'srcfile': os.path.relpath(src, ROOT).replace(os.sep, '/'),
             }
-            for k in ('description', 'sidebar_label', 'keywords', 'tags'):
+            for k in ('description', 'sidebar_label', 'keywords', 'tags', 'content_type', 'last_reviewed', 'tested_versions'):
                 if fm.get(k):
                     new_fm[k] = fm[k]
             if not fm.get('description'):
@@ -459,6 +459,14 @@ def main():
         'description: Step-by-step learning paths for frontend, backend, DevOps, data and AI, mobile, systems and '
         'algorithms, built from the Compile N Run tutorials, with your progress on each step.\n---\n')
     open(os.path.join(OUT, 'search.md'), 'w').write('---\ntitle: Search the documentation\nurl: /search/\ntype: search\nrobots: noindex, follow\n---\n')
+    write_page(os.path.join(OUT, 'learn.md'), {
+        'title': 'My Learning', 'url': '/learn/', 'type': 'learning',
+        'description': 'Continue your courses, keep bookmarks and notes, and back up your learning progress.',
+    })
+    write_page(os.path.join(OUT, 'playground.md'), {
+        'title': 'HTML, CSS and JavaScript Playground', 'url': '/playground/', 'type': 'playground',
+        'description': 'Practice HTML, CSS and JavaScript with a live preview, saved projects, and guided exercises.',
+    })
     open(os.path.join(OUT, '_index.md'), 'w').write('---\ntitle: Compile N Run\n'
                                                      'description: The best website to learn any programming language for free!\n'
                                                      f"lastmod: {dates.get('src/pages/index.js')}\n---\n")

@@ -55,7 +55,28 @@ Our content spans essential areas of software development:
 
 *Start your journey in software development with practical, hands-on learning materials designed for real-world applications.*
 
-### Installation
+### Production site and learning tools
+
+The production site uses Hugo. Tutorials are authored in `docs/`; `hugo/scripts/convert.py` generates the Hugo content tree. Use the Hugo, Node.js, and Python versions specified in `.github/workflows/hugo.yml`, with PyYAML installed.
+
+```sh
+hugo/scripts/build.sh
+python3 -m http.server 8000 --bind 127.0.0.1 --directory hugo/public
+```
+
+Open `http://127.0.0.1:8000/`. The complete build includes the Pagefind index, so filtered search works in this preview. `/learn/` provides browser-local progress, bookmarks, notes, and JSON backups. `/playground/` provides HTML/CSS/JavaScript projects; supported lesson examples also open a practice panel. HTML and CSS render automatically, while JavaScript uses Run or the explicit Auto-run JavaScript option. Drafts and learning records stay in the browser unless exported.
+
+The publishing workflow requires content-quality checks and built-site browser tests before deployment. See [the quality-check guide](tests/content-quality/README.md) for commands, review metadata, and the boundary of legacy-content validation. To run application tests after building:
+
+```sh
+npm ci --prefix tests/content-quality
+npx --prefix tests/content-quality playwright install chromium
+npx --prefix tests/content-quality playwright test --config=tests/content-quality/application.config.mjs
+```
+
+Generated Hugo content and public output should not be committed. The following Docusaurus commands remain available for the legacy build.
+
+### Legacy Docusaurus installation
 
 ```
 $ yarn
