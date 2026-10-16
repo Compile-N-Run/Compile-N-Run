@@ -101,6 +101,7 @@ test('problem page is a workspace: tabbed write-up on the left, a highlighted ed
   await expect(tabs).toHaveText(['Python', 'JavaScript', 'Java', 'C++', 'Go']);
   await expect(page.locator('.cnr-iv-ws--cm .cnr-iv-ws__editor .cm-editor')).toBeVisible({ timeout: 30000 }); // CodeMirror loaded
   const doc = () => page.evaluate(() => document.querySelector('.cnr-iv-ws__editor .cm-content').textContent);
+  expect(await doc()).not.toMatch(/:\n\n\s+seen/); // no doubled line breaks
   expect(await doc()).toMatch(/class Solution:\s+def twoSum\(self, nums: List\[int\], target: int\) -> List\[int\]:/); // the solution is loaded by default
   expect(await page.evaluate(() => document.querySelectorAll('.cnr-iv-ws__editor .cm-content span[class]').length)).toBeGreaterThan(5); // highlighted
   await expect(workspace.locator('.cnr-iv-ws__cases-code .cm-content')).toContainText('check('); // test cases shown

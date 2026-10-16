@@ -26,7 +26,8 @@
   const draftKey = lang => `cnr-iv-ws:${slug}:${lang}`;
   const el = (tag, className, text) => { const node = document.createElement(tag); if (className) node.className = className; if (text != null) node.textContent = text; return node; };
   const button = (className, text, onClick) => { const b = el('button', className, text); b.type = 'button'; b.addEventListener('click', onClick); return b; };
-  const codeOf = block => block.querySelector('pre > code').innerText.replace(/ /g, ' ').replace(/\n$/, '');
+  // textContent, not innerText: innerText adds a line break per highlighted line and doubles every newline.
+  const codeOf = block => block.querySelector('pre > code').textContent.replace(/ /g, ' ').replace(/\n+$/, '');
 
   // --- Take the solution blocks out of the article (the heading goes with them) ---
   const solutions = {};
