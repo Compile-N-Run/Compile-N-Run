@@ -13,9 +13,11 @@ test.beforeEach(async ({ context, page }) => {
 });
 test.afterEach(async ({ page }) => { expect(page.__applicationErrors).toEqual([]); });
 
+// The first search downloads and initialises Pagefind's WASM and index; on a busy CI runner right after the
+// Hugo build that can take well over the default 5 s, so allow 20 s for results to settle.
 async function searchSettled(root) {
-  await expect(root.locator('[data-find-status]')).not.toHaveText('Searching…');
-  await expect(root.locator('[data-find-results] li').first()).toBeVisible();
+  await expect(root.locator('[data-find-status]')).not.toHaveText('Searching…', { timeout: 20_000 });
+  await expect(root.locator('[data-find-results] li').first()).toBeVisible({ timeout: 20_000 });
 }
 
 test('course search, content filters, result context, and keyboard dialog', async ({ page }) => {

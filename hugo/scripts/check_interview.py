@@ -80,6 +80,10 @@ def validate(slug, problems):
     for name in names:
         if name not in SECTIONS and name not in OPTIONAL:
             errors.append(f'{slug}: unexpected section "## {name}"')
+    # Links to other write-ups must point at problems that exist (others stay plain text until written).
+    for target in re.findall(r'\]\(/interview/problems/([a-z0-9-]+)/\)', body):
+        if not os.path.isfile(os.path.join(PROBLEMS, target + '.md')):
+            errors.append(f'{slug}: links to /interview/problems/{target}/, which has no write-up yet')
     code, order = solutions(body)
     if order != LANGUAGES:
         errors.append(f'{slug}: Solutions must contain exactly one block each, in order: {", ".join(LANGUAGES)} (found {order})')

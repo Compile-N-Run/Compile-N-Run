@@ -36,7 +36,7 @@ description: "One sentence for search results: what the problem is and the techn
 ## Complexity         **Time:** and **Space:** with one-line justifications
 ## Common mistakes    optional bullet list
 ## Follow-up questions   optional (what interviewers ask next)
-## Related problems   optional
+## Related problems   optional; link written ones as [Title](/interview/problems/<slug>/), others as plain text
 ## Solutions          exactly five fenced blocks, in this order: python, java, cpp, javascript, go
 ```
 
