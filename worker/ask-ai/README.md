@@ -32,15 +32,15 @@ answers itself.
 ## Page feedback
 
 `POST https://www.compilenrun.com/api/feedback` with `{path, vote: 1 | -1, comment?}` stores one vote per page and
-reader in the D1 database `compilenrun-feedback` (table in `schema.sql`). Readers are told apart by a salted hash of
+reader in the D1 database `compilenrun-data` (table in `schema.sql`). Readers are told apart by a salted hash of
 their IP (`IP_SALT` Worker secret); the IP itself is not stored. 20 votes per minute per IP (`FEEDBACK_LIMIT`).
 
 Pages readers found least helpful, and their comments:
 
 ```sh
-npx wrangler@4 d1 execute compilenrun-feedback --remote --command \
+npx wrangler@4 d1 execute compilenrun-data --remote --command \
   "SELECT path, SUM(vote = 1) AS up, SUM(vote = -1) AS down FROM votes GROUP BY path ORDER BY down DESC, up LIMIT 30"
-npx wrangler@4 d1 execute compilenrun-feedback --remote --command \
+npx wrangler@4 d1 execute compilenrun-data --remote --command \
   "SELECT updated_at, path, comment FROM votes WHERE comment IS NOT NULL ORDER BY updated_at DESC LIMIT 50"
 ```
 
@@ -73,9 +73,9 @@ The flow uses a random state nonce bound to a separate HttpOnly cookie, S256 PKC
 3. Apply the additive migrations to the existing D1 database in order:
 
    ```sh
-   npx wrangler@4 d1 execute compilenrun-feedback --remote --file accounts-schema.sql
-   npx wrangler@4 d1 execute compilenrun-feedback --remote --file accounts-email-schema.sql
-   npx wrangler@4 d1 execute compilenrun-feedback --remote --file accounts-google-profile-schema.sql
+   npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-schema.sql
+   npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-email-schema.sql
+   npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-google-profile-schema.sql
    ```
 
 4. Deploy with Wrangler 4 after validating the migration, secret, and Worker changes. The configuration adds only the auth, learning, and Google callback routes (patterns end in `*`: Cloudflare skips the Worker for a wildcard-less pattern once a query string is present) plus the `AUTH_LIMIT` binding (60 account requests per minute per IP). It preserves existing AI/quiz/feedback routes and bindings.
