@@ -175,7 +175,7 @@ async function beginOAuth(request, env, linking = null) {
   const url = new URL(AUTH_URL);
   url.search = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID, redirect_uri: ACCOUNT_SITE + OAUTH_CALLBACK,
-    response_type: 'code', scope: 'openid profile', state,
+    response_type: 'code', scope: 'openid email profile', state,
     code_challenge: await hash(verifier), code_challenge_method: 'S256',
     access_type: 'online', include_granted_scopes: 'false', prompt: 'select_account',
   });
@@ -201,6 +201,18 @@ async function googleIdentity(db, subject) {
   ]);
   identity = await db.prepare('SELECT user_id AS id FROM cnr_account_google_identities WHERE google_sub = ?1').bind(subject).first();
   return identity;
+}
+
+// Record what Google reports for this identity. Informational only (never used to
+// authenticate or to match password accounts); a failure must not block sign-in.
+async function saveGoogleProfile(db, identity, name, stamp) {
+  const email = typeof identity.email === 'string' && identity.email.length <= 254 && !/[\u0000-\u001f\u007f\s]/.test(identity.email) && identity.email.includes('@') ? identity.email.toLowerCase() : null;
+  try {
+    await db.prepare(`INSERT INTO cnr_account_google_profiles (google_sub, email, email_verified, name, updated_at)
+      SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM cnr_account_google_identities WHERE google_sub = ?1)
+      ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, email_verified = excluded.email_verified, name = excluded.name, updated_at = excluded.updated_at`)
+      .bind(identity.sub, email, email && identity.email_verified === true ? 1 : 0, name || null, stamp).run();
+  } catch (error) { console.warn('google profile not saved', error?.message); }
 }
 
 async function finishOAuth(request, env) {
@@ -255,6 +267,7 @@ async function finishOAuth(request, env) {
         .bind(identity.sub, stamp, linking.session_hash, linking.user_id).first();
       if (!added) return oauthError(true);
     }
+    await saveGoogleProfile(env.DB, identity, name, stamp);
     return redirect(ACCOUNT_SITE + '/profile/?auth=linked', [cookie(OAUTH_COOKIE, '', 0)]);
   }
   if (!user) {
@@ -272,6 +285,7 @@ async function finishOAuth(request, env) {
       if (!user) throw error;
     }
   }
+  await saveGoogleProfile(env.DB, identity, name, stamp);
   const sessionCookie = await issueSession(request, env, user.id, null, identity.sub);
   return sessionCookie ? redirect(ACCOUNT_SITE + '/learn/', [cookie(OAUTH_COOKIE, '', 0), sessionCookie]) : oauthError();
 }
@@ -317,12 +331,15 @@ export async function handleAccounts(request, env, ctx) {
       const guard = `EXISTS (SELECT 1 FROM cnr_account_password_credentials WHERE user_id = ?1 AND email_verified_at IS NOT NULL)
         AND EXISTS (SELECT 1 FROM cnr_account_sessions WHERE user_id = ?1 AND token_hash = ?2 AND expires_at > ?3)`;
       const removed = await env.DB.batch([
+        // Explicit (not just cascaded) so the identity DELETE below reports exactly one change.
+        env.DB.prepare(`DELETE FROM cnr_account_google_profiles WHERE google_sub IN
+          (SELECT google_sub FROM cnr_account_google_identities WHERE user_id = ?1) AND ${guard}`).bind(login.user.id, login.tokenHash, now()),
         env.DB.prepare(`DELETE FROM cnr_account_oauth_challenges WHERE state_hash IN
           (SELECT state_hash FROM cnr_account_oauth_links WHERE user_id = ?1) AND ${guard}`).bind(login.user.id, login.tokenHash, now()),
         env.DB.prepare(`DELETE FROM cnr_account_google_identities WHERE user_id = ?1 AND ${guard}`).bind(login.user.id, login.tokenHash, now()),
         env.DB.prepare('DELETE FROM cnr_account_sessions WHERE user_id = ?1 AND changes() = 1').bind(login.user.id),
       ]);
-      return removed[1].meta.changes === 1 ? response(200, { ok: true }, [cookie(SESSION_COOKIE, '', 0), cookie(OAUTH_COOKIE, '', 0)]) : response(409, { error: 'last_login_method' });
+      return removed[2].meta.changes === 1 ? response(200, { ok: true }, [cookie(SESSION_COOKIE, '', 0), cookie(OAUTH_COOKIE, '', 0)]) : response(409, { error: 'last_login_method' });
     }
     if (url.pathname === '/api/auth/logout') {
       await env.DB.prepare('DELETE FROM cnr_account_sessions WHERE token_hash = ?1').bind(login.tokenHash).run();

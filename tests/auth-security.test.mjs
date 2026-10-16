@@ -19,7 +19,7 @@ const seconds = () => Math.floor(Date.now() / 1000);
 class D1 {
   constructor() {
     this.sqlite = new DatabaseSync(':memory:');
-    for (const file of ['accounts-schema.sql', 'accounts-email-schema.sql']) {
+    for (const file of ['accounts-schema.sql', 'accounts-email-schema.sql', 'accounts-google-profile-schema.sql']) {
       this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/' + file, import.meta.url), 'utf8'));
     }
     this.beforeBatch = null;
@@ -160,14 +160,14 @@ function authRequest(route, method = 'GET', cookie = '', headers = {}) {
   return new Request(SITE + route, { method, headers: { ...(cookie ? { Cookie: cookie } : {}), ...headers } });
 }
 function cookiePair(response, name) { return response.headers.getSetCookie().find(value => value.startsWith(name + '='))?.split(';')[0]; }
-function googleProvider(sub, pauseToken) {
+function googleProvider(sub, pauseToken, profile = { name: 'Google name' }) {
   const mailFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
     if (String(url) === 'https://oauth2.googleapis.com/token') {
       if (pauseToken) await pauseToken();
       return Response.json({ access_token: 'mock-access-token', token_type: 'Bearer' });
     }
-    if (String(url) === 'https://openidconnect.googleapis.com/v1/userinfo') return Response.json({ sub, name: 'Google name' });
+    if (String(url) === 'https://openidconnect.googleapis.com/v1/userinfo') return Response.json({ sub, ...profile });
     return mailFetch(url, options);
   };
   env.GOOGLE_CLIENT_ID = 'mock-client-id'; env.GOOGLE_CLIENT_SECRET = 'mock-client-secret';
@@ -195,6 +195,28 @@ test('Google identity must still be linked when normal sign-in atomically create
   const result = await handleAccounts(authRequest('/auth/google_oauth2/callback?state=' + state + '&code=mock-code', 'GET', oauthCookie), env);
   assert.equal(cookiePair(result, '__Host-cnr_session'), undefined);
   assert.equal(db.sqlite.prepare('SELECT count(*) AS count FROM cnr_account_sessions WHERE user_id=?').get(user.id).count, 0);
+});
+
+test('Google sign-in requests the email scope and stores the reported email and name; unlink removes them', async () => {
+  googleProvider('google-new-learner', null, { name: 'Ada Lovelace', email: 'Ada@Example.test', email_verified: true });
+  const begin = await handleAccounts(authRequest('/api/auth/google'), env);
+  assert.equal(new URL(begin.headers.get('location')).searchParams.get('scope'), 'openid email profile');
+  const state = new URL(begin.headers.get('location')).searchParams.get('state');
+  const result = await handleAccounts(authRequest('/auth/google_oauth2/callback?state=' + state + '&code=mock-code', 'GET', cookiePair(begin, '__Host-cnr_oauth')), env);
+  assert.equal(new URL(result.headers.get('location')).pathname, '/learn/');
+  const row = db.sqlite.prepare('SELECT p.email, p.email_verified, p.name, g.user_id FROM cnr_account_google_profiles p JOIN cnr_account_google_identities g USING (google_sub) WHERE google_sub=?').get('google-new-learner');
+  assert.equal(row.email, 'ada@example.test'); assert.equal(row.email_verified, 1); assert.equal(row.name, 'Ada Lovelace');
+  // The Google email is informational: it never creates or matches a password credential.
+  assert.equal(db.sqlite.prepare('SELECT count(*) AS count FROM cnr_account_password_credentials WHERE email=?').get('ada@example.test').count, 0);
+  // A later sign-in refreshes the stored values; a malformed email is dropped.
+  googleProvider('google-new-learner', null, { name: 'Ada King', email: 'bad address' });
+  const again = await handleAccounts(authRequest('/api/auth/google'), env);
+  const state2 = new URL(again.headers.get('location')).searchParams.get('state');
+  await handleAccounts(authRequest('/auth/google_oauth2/callback?state=' + state2 + '&code=mock-code', 'GET', cookiePair(again, '__Host-cnr_oauth')), env);
+  const refreshed = db.sqlite.prepare('SELECT email, email_verified, name FROM cnr_account_google_profiles WHERE google_sub=?').get('google-new-learner');
+  assert.equal(refreshed.email, null); assert.equal(refreshed.email_verified, 0); assert.equal(refreshed.name, 'Ada King');
+  db.sqlite.prepare('DELETE FROM cnr_account_google_identities WHERE google_sub=?').run('google-new-learner');
+  assert.equal(db.sqlite.prepare('SELECT count(*) AS count FROM cnr_account_google_profiles').get().count, 0);
 });
 
 test('unlink cancels a link callback that already consumed its state and is awaiting Google', async () => {

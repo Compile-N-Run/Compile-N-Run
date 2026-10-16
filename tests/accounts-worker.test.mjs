@@ -11,6 +11,7 @@ class D1 {
     this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/accounts-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/accounts-email-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/accounts-google-profile-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -136,7 +137,7 @@ test('disabled accounts expose configured:false without querying D1 or affecting
 test('OAuth uses fixed Google endpoints, exact callback, state-cookie binding and S256 PKCE', async () => {
   const challenge = await begin();
   assert.equal(challenge.url.origin, 'https://accounts.google.com');
-  assert.equal(challenge.url.searchParams.get('scope'), 'openid profile');
+  assert.equal(challenge.url.searchParams.get('scope'), 'openid email profile');
   assert.equal(challenge.url.searchParams.get('redirect_uri'), SITE + '/auth/google_oauth2/callback');
   assert.equal(challenge.url.searchParams.get('code_challenge_method'), 'S256');
   assert.match(challenge.response.headers.get('set-cookie'), /__Host-cnr_oauth=.*Path=\/; Max-Age=600; HttpOnly; Secure; SameSite=Lax/);
