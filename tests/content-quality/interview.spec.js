@@ -77,43 +77,54 @@ test('global ranking lists every problem, most asked first, with a recent view',
   expect(recent).toBeLessThan(total);
 });
 
-test('problem page puts the write-up beside an editor that runs the tests in the browser', async ({ page }) => {
+test('problem page is a workspace: tabbed write-up on the left, a highlighted editor with the solution and test cases on the right', async ({ page, context }) => {
+  await context.route('https://esm.sh/**', route => route.continue()); // CodeMirror comes from the CDN
   await page.goto('/interview/problems/two-sum/');
   const workspace = page.locator('[data-iv-workspace]');
   await expect(workspace).toBeVisible();
-  await expect(page.locator('[data-iv-body] h2#solutions')).toHaveCount(0); // moved into the editor's Solution view
-  const tabs = workspace.locator('[role=tab]');
-  await expect(tabs).toHaveText(['Python', 'JavaScript', 'Java', 'C++', 'Go']);
-  const article = await page.locator('.cnr-iv-split__text').boundingBox();
+  await expect(page.locator('[data-iv-body] h2#solutions')).toHaveCount(0); // the code lives in the editor now
+  await expect(page.locator('[data-iv-pane-tab]')).toHaveText(['Problem', 'Solution', 'Companies']);
+  await expect(page.locator('[data-iv-body] h2#key-idea')).toBeHidden();
+  await page.locator('[data-iv-pane-tab="solution"]').click();
+  await expect(page.locator('[data-iv-body] h2#key-idea')).toBeVisible();
+  await expect(page.locator('[data-iv-body] h2#problem')).toBeHidden();
+  await page.locator('[data-iv-pane-tab="companies"]').click();
+  await expect(page.locator('[data-iv-chips] a').first()).toBeVisible();
+  await expect(page.locator('[data-iv-chips] a').first()).toHaveAttribute('href', /^\/interview\/company\//);
+  await page.locator('[data-iv-pane-tab="problem"]').click();
+  await expect(page.locator('.cnr-iv-meta__topics a').first()).toHaveAttribute('href', /^\/interview\/topics\//);
+  const text = await page.locator('.cnr-iv-split__text').boundingBox();
   const aside = await workspace.boundingBox();
-  expect(aside.x).toBeGreaterThan(article.x + article.width - 1); // two columns at desktop width
-  const editor = workspace.locator('textarea');
-  await expect(editor).toHaveValue(/class Solution:\n    def twoSum\(self, nums: List\[int\], target: int\) -> List\[int\]:/);
+  expect(aside.x).toBeGreaterThan(text.x + text.width - 1); // two panes at desktop width
+  expect(aside.height).toBeGreaterThan(500);
+  const tabs = workspace.locator('[role=tab].cnr-iv-ws__lang');
+  await expect(tabs).toHaveText(['Python', 'JavaScript', 'Java', 'C++', 'Go']);
+  await expect(page.locator('.cnr-iv-ws--cm .cnr-iv-ws__editor .cm-editor')).toBeVisible({ timeout: 30000 }); // CodeMirror loaded
+  const doc = () => page.evaluate(() => document.querySelector('.cnr-iv-ws__editor .cm-content').textContent);
+  expect(await doc()).toMatch(/class Solution:\s+def twoSum\(self, nums: List\[int\], target: int\) -> List\[int\]:/); // the solution is loaded by default
+  expect(await page.evaluate(() => document.querySelectorAll('.cnr-iv-ws__editor .cm-content span[class]').length)).toBeGreaterThan(5); // highlighted
+  await expect(workspace.locator('.cnr-iv-ws__cases-code .cm-content')).toContainText('check('); // test cases shown
   await tabs.nth(1).click();
-  await expect(editor).toHaveValue(/^var twoSum = function \(nums, target\) \{/);
-  await editor.fill('var twoSum = function (nums, target) {\n  return [0, 0];\n};');
-  await workspace.locator('.cnr-iv-ws__run--tests').click();
-  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('Some tests failed');
-  await expect(workspace.locator('.cnr-iv-ws__err')).toContainText('expected');
-  await workspace.locator('[aria-pressed]:has-text("Solution")').click();
-  await expect(workspace.locator('.cnr-iv-ws__solution-body .theme-code-block.language-javascript')).toBeVisible();
-  page.once('dialog', dialog => dialog.accept());
-  await workspace.locator('button:has-text("Load into editor")').click();
-  await expect(editor).toHaveValue(/const seen = new Map\(\)|new Map\(\)/);
-  await workspace.locator('.cnr-iv-ws__run--tests').click();
+  expect(await doc()).toMatch(/var twoSum = function \(nums, target\) \{/);
+  await workspace.locator('.cnr-iv-ws__btn--primary').click(); // Run tests on the reference solution
   await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('All tests passed');
   await page.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
   await workspace.locator('.cnr-iv-ws__verdict button:has-text("Mark as solved")').click();
   await expect(page.locator('[data-iv-solve-toggle]')).toHaveAttribute('aria-pressed', 'true');
+  await workspace.locator('summary:has-text("Reset")').click();
+  await workspace.locator('.cnr-iv-ws__menu-item:has-text("Starter code")').click();
+  expect(await doc()).toMatch(/^var twoSum = function \(nums, target\) \{\s*\/\/ your code here/);
+  await workspace.locator('.cnr-iv-ws__btn--primary').click();
+  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('Some tests failed');
+  await expect(workspace.locator('.cnr-iv-ws__err')).toContainText(/expected|TypeError/); // the stub returns nothing
   await page.reload();
-  await expect(workspace.locator('[role=tab][aria-selected=true]')).toHaveText('JavaScript'); // remembered
-  await expect(editor).toHaveValue(/new Map\(\)/); // the draft survives a reload
-  await expect(page.locator('[data-iv-chips] a').first()).toHaveAttribute('href', /^\/interview\/company\//);
-  await expect(page.locator('.cnr-iv-meta__topics a').first()).toHaveAttribute('href', /^\/interview\/topics\//);
+  await expect(workspace.locator('[role=tab][aria-selected=true].cnr-iv-ws__lang')).toHaveText('JavaScript'); // remembered
+  await expect(page.locator('.cnr-iv-ws--cm .cnr-iv-ws__editor .cm-editor')).toBeVisible({ timeout: 30000 });
+  expect(await doc()).toMatch(/your code here/); // the draft survives a reload
   await page.setViewportSize({ width: 820, height: 900 });
-  const narrowArticle = await page.locator('.cnr-iv-split__text').boundingBox();
+  const narrowText = await page.locator('.cnr-iv-split__text').boundingBox();
   const narrowAside = await workspace.boundingBox();
-  expect(narrowAside.y).toBeGreaterThan(narrowArticle.y + narrowArticle.height - 1); // stacked on narrow screens
+  expect(narrowAside.y).toBeGreaterThan(narrowText.y + narrowText.height - 1); // stacked on narrow screens
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 

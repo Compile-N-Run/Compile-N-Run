@@ -47,13 +47,14 @@ def read(*parts):
 
 
 def workspace(slug, body):
-    """Editor data for a problem page: starter code per language, the Python/JavaScript tests and any
-    problem-specific prelude, so readers can write and test a solution in the browser."""
+    """Editor data for a problem page: starter code per language, the test cases (run in the browser for
+    Python and JavaScript, shown for the others) and any problem-specific prelude."""
     code = parse_solutions(body)[0]
     tests = os.path.join(TESTS, slug)
     return {'stubs': stubs(slug, code),
             'tests': {'python': read(tests, 'test.py').replace('from solution import *\n', ''),
-                      'javascript': read(tests, 'test.js')},
+                      'javascript': read(tests, 'test.js'), 'java': read(tests, 'Main.java'),
+                      'cpp': read(tests, 'test.cpp'), 'go': read(tests, 'test.go')},
             'prelude': {'python': read(tests, 'prelude.py'), 'javascript': read(tests, 'prelude.js')}}
 
 
