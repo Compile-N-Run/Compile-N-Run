@@ -6,8 +6,15 @@
   var session = null, busy = false, verifyToken = '', resetToken = '', badLink = false, pendingEmail = '';
   var status = root.querySelector('[data-profile-status]');
   var forms = Array.from(root.querySelectorAll('[data-profile-form]'));
+  var externalAuthPending = false, navigating = false;
+  async function beforeAuthAction(action) {
+    if (!window.CNRAuth) return;
+    externalAuthPending = true; var waits = [];
+    window.dispatchEvent(new CustomEvent('cnr:auth-changing', { detail: { action: action, session: window.CNRAuth.getSession(), waitUntil: function (task) { waits.push(Promise.resolve(task)); } } }));
+    await Promise.all(waits);
+  }
   var TOKEN = /^[A-Za-z0-9_-]{43}$/;
-  // Remove mail secrets before the first session request. Fragments are preferred;
+  // Remove mail secrets as the profile initializes. Fragments never enter requests;
   // older query links are accepted but also immediately removed from the address bar.
   function captureMailLink() {
     try {
@@ -99,6 +106,7 @@
     try { return JSON.parse(raw); } catch (ignored) { throw error('The account service returned an unreadable response. Please try again later.', 'invalid_response'); }
   }
   async function request(url, method, body, authenticated) {
+    if (method !== 'GET' && ['/api/auth/login', '/api/auth/logout', '/api/auth/account', '/api/auth/password', '/api/auth/verify-email', '/api/auth/reset-password', '/api/auth/google/link'].indexOf(url) >= 0) await beforeAuthAction(url);
     var controller = new AbortController(), timer = setTimeout(function () { controller.abort(); }, 15000);
     var headers = { Accept: 'application/json' };
     if (method !== 'GET') headers['Content-Type'] = 'application/json';
@@ -126,10 +134,10 @@
     } catch (e) { if (e.code) throw e; throw error('Could not reach the account service. Check your connection and try again. Your browser learning is unchanged.', 'offline'); }
     finally { clearTimeout(timer); }
   }
-  async function refresh(fill) { accept(await request('/api/auth/session', 'GET'), fill); }
+  async function refresh(fill) { accept(window.CNRAuth ? await window.CNRAuth.refresh({ force: true }) : await request('/api/auth/session', 'GET'), fill); externalAuthPending = false; }
   async function sameAccount() {
     if (!session || !session.user) throw error('Please sign in before changing account settings.', 'authentication_required');
-    var expected = session.user.id, next = validateSession(await request('/api/auth/session', 'GET'));
+    var expected = session.user.id, next = validateSession(window.CNRAuth ? await window.CNRAuth.refresh({ force: true }) : await request('/api/auth/session', 'GET'));
     if (!next.user || next.user.id !== expected) { accept(next, true); throw error('The signed-in account changed. Review the account shown here and choose your action again. No settings were changed.', 'identity_changed'); }
     session = next;
   }
@@ -141,7 +149,7 @@
   async function run(action, form) {
     if (busy) return; busy = true; render(); say('Working…', form);
     try { await action(); } catch (e) { handle(e, form); }
-    finally { busy = false; render(); }
+    finally { if (externalAuthPending && !navigating && window.CNRAuth) { try { await refresh(true); } catch (_) {} externalAuthPending = false; } busy = false; render(); }
   }
   function password(value, field) {
     var length = Array.from(value).length;
@@ -167,7 +175,7 @@
           await request('/api/auth/register', 'POST', { email: fields.email, password: fields.password, name: fields.name }); clearPasswords(form);
           say('If this address can be registered, a verification email will arrive shortly. Keep the password you chose: you will enter it when verifying your email.', form);
         } else if (kind === 'login') {
-          await request('/api/auth/login', 'POST', { email: fields.email, password: fields.password }); clearPasswords(form); await refresh(true); say('Signed in. You can manage your account here or save a learning snapshot from the dashboard.');
+          await request('/api/auth/login', 'POST', { email: fields.email, password: fields.password }); clearPasswords(form); await refresh(true); say('Signed in. You can manage your account here or continue learning with automatic progress saving.');
         } else if (kind === 'forgot' || kind === 'resend' || kind === 'resend-member') {
           await request(kind === 'forgot' ? '/api/auth/forgot-password' : '/api/auth/resend-verification', 'POST', { email: fields.email });
           say(kind === 'forgot' ? 'If this address has an eligible account, a password reset email will arrive shortly.' : 'If this address needs verification, a verification email will arrive shortly.', form);
@@ -192,7 +200,7 @@
       await sameAccount(); var result = await request('/api/auth/google/link', 'POST', {}, true), destination;
       try { destination = new URL(result.url); } catch (ignored) { throw error('The Google sign-in link could not be verified. Please try again.', 'invalid_response'); }
       if (destination.origin !== 'https://accounts.google.com' || destination.pathname !== '/o/oauth2/v2/auth' || destination.username || destination.password) throw error('The Google sign-in link could not be verified. No navigation was made.', 'invalid_response');
-      say('Continue with Google to add it to this same account.'); location.assign(destination.href);
+      say('Continue with Google to add it to this same account.'); navigating = true; location.assign(destination.href);
     });
   });
   root.querySelector('[data-profile-unlink-google]').addEventListener('click', function () {
@@ -217,7 +225,7 @@
     else if (resetToken) say('Your reset link is ready. Choose a new password to continue.');
     else if (new URLSearchParams(location.search).get('auth') === 'linked') say('The Google linking flow finished. Review the sign-in methods below to confirm the linked status.');
     else if (new URLSearchParams(location.search).get('auth') === 'error') say('Google sign-in or linking did not finish. Your existing account settings were not changed.');
-    else say(session.user ? 'Your profile is ready. Changes here do not upload learning snapshots automatically.' : 'Choose Google or email to sign in. You can also keep learning without an account.');
+    else say(session.user ? 'Your profile is ready. Your learning progress syncs automatically while signed in.' : 'Choose Google or email to sign in. You can also keep learning without an account.');
   }
   root.querySelector('[data-profile-refresh]').addEventListener('click', function () { run(connect); });
   window.addEventListener('hashchange', function () {

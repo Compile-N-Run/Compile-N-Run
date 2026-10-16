@@ -6,17 +6,13 @@ const cssLesson = '/docs/language/css/';
 
 test.beforeEach(async ({ context, page }) => {
   await context.route('**/*', route => route.request().url().startsWith(origin) ? route.continue() : route.abort());
+  await context.route('**/api/auth/session', route => route.fulfill({ json: { configured: false, providers: { google: false, email: false }, user: null } }));
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   page.__applicationErrors = errors;
 });
 test.afterEach(async ({ page }) => { expect(page.__applicationErrors).toEqual([]); });
 
-async function openLearning(page) {
-  const disclosure = page.locator('[data-learning-disclosure]');
-  if ((await disclosure.getAttribute('open')) === null) await disclosure.locator(':scope > summary').click();
-  await expect(page.locator('[data-learning-tools]')).toBeVisible();
-}
 async function searchSettled(root) {
   await expect(root.locator('[data-find-status]')).not.toHaveText('Searching…');
   await expect(root.locator('[data-find-results] li').first()).toBeVisible();
@@ -24,11 +20,11 @@ async function searchSettled(root) {
 
 test('course search, content filters, result context, and keyboard dialog', async ({ page }) => {
   await page.goto(cssLesson);
-  const trigger = page.getByRole('button', { name: 'Search this course', exact: true });
+  const trigger = page.locator('[data-navbar] [data-search-open]');
   await trigger.click();
   const modal = page.locator('[data-search-modal]');
   await expect(modal).toBeVisible();
-  await expect(modal.locator('[data-find-course]')).toHaveValue('language/css');
+  await modal.locator('[data-find-course]').selectOption('language/css');
   await modal.locator('[data-find-query]').fill('grid');
   await modal.locator('[data-find-form]').getByRole('button', { name: 'Search', exact: true }).click();
   await searchSettled(modal);
@@ -61,17 +57,14 @@ test('reading is explicit; bookmark, note, dashboard, and roadmap agree', async 
   // Scrolling is not an assessment or an automatic read mark.
   await page.locator('footer.theme-doc-footer').scrollIntoViewIfNeeded();
   await expect(page.locator('[data-mark-done]').first()).toHaveAttribute('aria-pressed', 'false');
-  await openLearning(page);
-  const tools = page.locator('[data-learning-tools]');
-  await tools.locator('[data-mark-done]').click();
-  await tools.locator('[data-learning-bookmark]').click();
-  await tools.getByText('Your lesson notes', { exact: true }).click();
-  await tools.locator('[data-learning-note]').fill('Grid: remember the intrinsic minimum size. <script>not executable</script>');
-  await tools.locator('[data-learning-save-note]').click();
-  await expect(tools.locator('[data-learning-note-status]')).toContainText('saved', { ignoreCase: true });
-  await tools.locator('[data-learning-practiced]').click();
-  await expect(tools.locator('[data-learning-states]')).toContainText('Practiced');
-  await expect(tools.locator('[data-learning-states] .cnr-learning__badge').filter({ hasText: 'Check passed' })).not.toHaveClass(/is-recorded/);
+  await expect(page.locator('.cnr-doc-toolbar, [data-learning-disclosure], [data-learning-tools]')).toHaveCount(0);
+  await page.locator('[data-mark-done]').click();
+  await expect(page.locator('[data-mark-done]')).toHaveAttribute('aria-pressed', 'true');
+  // Existing saved bookmarks and notes remain available in the dashboard.
+  await page.evaluate(async path => {
+    await window.CNRLearning.setBookmark(path, true);
+    await window.CNRLearning.saveNote(path, 'Grid: remember the intrinsic minimum size. <script>not executable</script>');
+  }, cssLesson);
   await page.goto('/learn/');
   await expect(page.locator('[data-learning-bookmarks]')).toContainText('Introduction to CSS');
   await expect(page.locator('[data-learning-notes]')).toContainText('intrinsic minimum size');
@@ -84,9 +77,10 @@ test('reading is explicit; bookmark, note, dashboard, and roadmap agree', async 
 
 test('learning backup downloads, previews and merges in a clean browser', async ({ page, browser }) => {
   await page.goto(cssLesson);
-  await openLearning(page);
-  await page.locator('[data-learning-bookmark]').click();
-  await page.locator('[data-learning-tools] [data-mark-done]').click();
+  await page.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
+  await page.evaluate(path => window.CNRLearning.setBookmark(path, true), cssLesson);
+  await page.locator('[data-mark-done]').click();
+  await expect(page.locator('[data-mark-done]')).toHaveAttribute('aria-pressed', 'true');
   await page.goto('/learn/');
   const downloaded = page.waitForEvent('download');
   await page.locator('[data-learning-export]').click();
@@ -96,11 +90,13 @@ test('learning backup downloads, previews and merges in a clean browser', async 
   expect(backup).toBeTruthy();
   const other = await browser.newContext();
   await other.route('**/*', route => route.request().url().startsWith(origin) ? route.continue() : route.abort());
+  await other.route('**/api/auth/session', route => route.fulfill({ json: { configured: false, providers: { google: false, email: false }, user: null } }));
   const restored = await other.newPage();
   await restored.goto(origin + '/learn/');
+  await restored.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
   await restored.locator('[data-learning-import-file]').setInputFiles({ name: 'learning-backup.json', mimeType: 'application/json', buffer });
   await expect(restored.locator('[data-learning-import-preview]')).toBeVisible();
-  expect(await restored.evaluate(() => localStorage.getItem('cnr_progress'))).toBeNull();
+  expect(await restored.evaluate(() => window.CNRLearning.getSnapshot().progress.done)).toEqual({});
   await restored.locator('[data-learning-import-apply]').click();
   await expect(restored.locator('[data-learning-backup-status]')).toContainText('Backup merged');
   await expect(restored.locator('[data-learning-bookmarks]')).toContainText('Introduction to CSS');

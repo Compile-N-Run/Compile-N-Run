@@ -26,9 +26,9 @@ If you register with email and password, we store your email address, display na
 
 If you choose Google sign-in or link Google to your account, we use your Google account identifier and display name to recognize that sign-in method. We do not receive your Google password. Google handles the sign-in process under its own privacy policy. The site uses an essential session cookie to keep you signed in. You can manage your display name, password, and linked sign-in methods on your profile page.
 
-Choosing **Save to account** uploads a snapshot of your learning records, including saved notes and playground drafts, to our Cloudflare D1 database. Account saves are manual. On another device, you can preview and merge the saved snapshot into that browser. We use this information to provide your learning account and restore your progress.
+While you are signed in, your learning records—including reading progress, bookmarks, saved notes, practice records, and playground drafts—are automatically saved to our Cloudflare D1 database and synchronized across your devices. Guest learning stays in a separate browser-local workspace and is not automatically added to a signed-in account. We use account learning data to restore your progress and continue your work across devices.
 
-Signing out ends your session but leaves learning records in that browser. On a shared device, clear the site's browser data after keeping any backup you need. You can delete your account and its saved learning from **My learning**; this also ends its active sessions. Cloudflare's database recovery copies may retain deleted data for its configured recovery period. Local browser records and previously downloaded backups are separate copies.
+Signing out ends your session and restores the guest workspace. Guest and account learning caches remain in that browser. On a shared device, clear the site's browser data after keeping any backup you need. You can delete your account and its saved learning from **My learning**; this also ends its active sessions. Cloudflare's database recovery copies may retain deleted data for its configured recovery period. Local browser records and previously downloaded backups are separate copies.
 
 ## How We Use Information
 

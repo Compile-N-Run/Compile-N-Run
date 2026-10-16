@@ -5,8 +5,11 @@
   var get = function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } };
   var set = function (k, v) { try { localStorage.setItem(k, v); } catch (e) {} };
   var esc = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
-  var progress = { done: {}, tuts: {} };
-  try { progress = JSON.parse(get('cnr_progress') || 'null') || progress; } catch (e) {}
+  function visibleProgress() {
+    if (window.CNR_SYNC_ENABLED && (!window.CNRLearning || !window.CNRLearning.canView())) return { done: {}, tuts: {} };
+    try { return JSON.parse(get('cnr_progress') || 'null') || { done: {}, tuts: {} }; } catch (e) { return { done: {}, tuts: {} }; }
+  }
+  var progress = visibleProgress();
   var doneKeys = Object.keys(progress.done || {});
   var count = function (prefix) { return doneKeys.filter(function (k) { return k.indexOf(prefix) === 0; }).length; };
 
@@ -17,7 +20,7 @@
     return { done: done, total: total };
   };
   var paintReading = function () {
-    try { progress = JSON.parse(get('cnr_progress') || 'null') || { done: {}, tuts: {} }; } catch (e) { progress = { done: {}, tuts: {} }; }
+    progress = visibleProgress();
     doneKeys = Object.keys(progress.done || {});
     document.querySelectorAll('.cnr-rm__node[data-prefix]').forEach(function (node) {
       var p = nodeProgress(node);

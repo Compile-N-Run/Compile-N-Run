@@ -22,7 +22,7 @@ npm run test:browser
 From the repository root, also run the learning, playground, account, and profile fixtures with the same pinned dependencies:
 
 ```sh
-NODE_PATH="$PWD/tests/content-quality/node_modules" CNR_PLAYWRIGHT_MODULE="$PWD/tests/content-quality/node_modules/playwright" node --test --test-concurrency=1 tests/learning.spec.js tests/playground.spec.js tests/accounts.spec.js tests/profile.spec.js
+NODE_PATH="$PWD/tests/content-quality/node_modules" CNR_PLAYWRIGHT_MODULE="$PWD/tests/content-quality/node_modules/playwright" node --test --test-concurrency=1 tests/learning.spec.js tests/playground.spec.js tests/profile.spec.js tests/auth-ui.spec.js tests/learning-sync.spec.js
 ```
 
 Account API and security tests use in-memory SQLite and mocked Google/Brevo endpoints; they do not send real email or need production secrets:

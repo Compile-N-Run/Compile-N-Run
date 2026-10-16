@@ -461,7 +461,7 @@ def main():
     open(os.path.join(OUT, 'search.md'), 'w').write('---\ntitle: Search the documentation\nurl: /search/\ntype: search\nrobots: noindex, follow\n---\n')
     write_page(os.path.join(OUT, 'learn.md'), {
         'title': 'My Learning', 'url': '/learn/', 'type': 'learning',
-        'description': 'Continue your courses, keep bookmarks and notes, and back up your learning progress.',
+        'description': 'Continue your courses and sync learning progress across devices.',
     })
     write_page(os.path.join(OUT, 'profile.md'), {
         'title': 'Profile and settings', 'url': '/profile/', 'type': 'profile',

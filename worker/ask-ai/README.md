@@ -53,7 +53,7 @@ Logs: `npx wrangler@4 tail compilenrun-ask-ai`.
 Test the widget locally against production:
 `HUGO_PARAMS_ASKAI_ENDPOINT=https://www.compilenrun.com/api/ask hugo server`
 
-## Google accounts and optional learning snapshots
+## Accounts and synchronized learning
 
 Accounts are an independent optional feature. Ask AI, quizzes, Turnstile, and feedback keep their existing contracts. Google sign-in requests only `openid profile`; the Worker obtains identity from Google's authenticated UserInfo endpoint after a server-side authorization-code exchange. It identifies Google identities by the stable `sub`, never by email. Google-provided email addresses are not imported. An email address is stored only when a person explicitly registers or adds an email/password method. Google access/ID/refresh tokens are not stored, logged, or sent to the browser.
 
@@ -98,9 +98,9 @@ All learning requests and logout/deletion require `X-CNR-User` equal to the user
 
 Snapshots use the existing `cnr-learning-backup` version-1 JSON envelope. The server checks the envelope, bounded depth/entry counts, unsafe keys, and a **1,800,000-byte UTF-8 limit** (below D1's 2 MB row limit). The body is read incrementally with a byte limit; a missing or false Content-Length does not bypass it. Browser import validation still checks individual lesson and draft records before a user explicitly merges them.
 
-Writes use an atomic compare-and-swap revision. `409 {error: "revision_conflict", revision}` means another device saved first; clients must obtain and review that newer snapshot before retrying, rather than overwriting it automatically. `409 {error: "account_changed"}` means the expected identity no longer matches the session. Other errors include `401 authentication_required`, `403 csrf_failed`/`origin_not_allowed`, `400 invalid_snapshot`, `413 snapshot_too_large`, `415 json_required`, `429 rate_limited`, and `503 accounts_not_configured`/`accounts_unavailable`.
+Writes use an atomic compare-and-swap revision. `409 {error: "revision_conflict", revision}` means another device saved first; clients must retrieve that newer state, merge it against their last acknowledged state, and retry using the current revision. A stale whole-state overwrite is never accepted. `409 {error: "account_changed"}` means the expected identity no longer matches the session. Other errors include `401 authentication_required`, `403 csrf_failed`/`origin_not_allowed`, `400 invalid_snapshot`, `413 snapshot_too_large`, `415 json_required`, `429 rate_limited`, and `503 accounts_not_configured`/`accounts_unavailable`.
 
-The application performs only explicit snapshot saves and loads. Account deletion removes application data, not the user's Google account or local browser backup. To revoke the Google app authorization itself, the user can remove it in their Google account's third-party connections settings. Signing in again after application-account deletion creates a new internal account without restoring the deleted snapshot.
+The website automatically synchronizes the signed-in learner’s state through these revision-checked endpoints; each browser keeps separate guest and account caches. Account deletion removes application data, not the user's Google account or local browser backup. To revoke the Google app authorization itself, the user can remove it in their Google account's third-party connections settings. Signing in again after application-account deletion creates a new internal account without restoring the deleted snapshot.
 
 References: [Google OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect), [Google discovery endpoints and PKCE methods](https://accounts.google.com/.well-known/openid-configuration), [D1 primary/session behavior](https://developers.cloudflare.com/d1/worker-api/d1-database/), and [D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
 

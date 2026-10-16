@@ -27,6 +27,10 @@ THE SOFTWARE.
  * a learning tool, not a hostile-code VM or a trusted assessment system. */
 (function () {
   'use strict';
+  const workspaces = [];
+  const mayView = () => !window.CNR_SYNC_ENABLED || window.CNRLearning?.canView() === true;
+  const maySave = () => !window.CNR_SYNC_ENABLED || window.CNRLearning?.canWrite() === true;
+  window.CNRPlayground = Object.freeze({ captureDrafts(base) { const result = JSON.parse(JSON.stringify(base)); workspaces.forEach(capture => { const item = capture(); if (item) result.drafts[item.key] = item.draft; }); return result; } });
   const STORE = 'cnr_playground_v1', MAX_FILE = 100000, MAX_STORE = 2 * 1024 * 1024;
   const LANGS = { html: 'html', css: 'css', javascript: 'js', js: 'js' };
   const EMPTY = { html: '<main>\n  <h1>Hello, web!</h1>\n  <p>Edit the files and try your ideas.</p>\n</main>', css: 'body { font: 18px/1.6 system-ui, sans-serif; padding: 2rem; }\nh1 { color: #076779; }', js: '// JavaScript runs when you select Run.\nconsole.log("Ready to experiment");' };
@@ -180,7 +184,7 @@ THE SOFTWARE.
 
   function createWorkspace(root, meta, exercises) {
     root.classList.add('cnr-pg');
-    let key = meta.path ? 'lesson:' + meta.path : 'workspace', project, starter = { ...EMPTY }, exercise = null, frame = null, runNonce = '', runTimer = null, editTimer = null, counter = 0, currentTab = 'html', pendingCheck = false, explicit = false, executedJS = false, unsaved = false;
+    let key = meta.path ? 'lesson:' + meta.path : 'workspace', project, starter = { ...EMPTY }, exercise = null, frame = null, runNonce = '', runTimer = null, editTimer = null, counter = 0, currentTab = 'html', pendingCheck = false, explicit = false, executedJS = false, unsaved = false, savedFiles = null, retryingSave = false, pendingSaves = 0, saveSequence = 0;
     const prefix = 'cnr-pg-' + nonce().slice(0,8);
     const heading = el('h2','cnr-pg__heading',meta.path ? 'Practice this lesson' : 'Your web workspace');
     const status = el('p','cnr-pg__status','Choose an exercise or edit a file. Drafts stay in this browser.'); status.setAttribute('role','status');
@@ -224,11 +228,27 @@ THE SOFTWARE.
     function setFiles(value){project={...files(value),title:meta.title||'Web workspace',path:meta.path||'',course:meta.course||'',exerciseId:exercise?.id||''};if(exercise){project.title=exercise.title;project.path=safePath(exercise.path);project.course=exercise.course;}Object.keys(inputs).forEach(k=>inputs[k].value=project[k]);}
     function save(){
       unsaved=true;
+      if(!maySave()){status.textContent='Account learning is changing. Your editor is preserved; wait or download this project.';return;}
       if(['html','css','js'].some(k=>project[k].length>MAX_FILE||project[k].includes('\u0000'))){status.textContent='A file exceeds 100,000 characters or contains a NUL character. Saving is paused; your previous draft is preserved.';return;}
-      const store=readStore();if(store.blocked){showStoreProblem(store);return;}if(!store.drafts[key]&&Object.keys(store.drafts).length>=100){status.textContent='Draft limit reached (100). Download this project or manage saved learning data.';return;}
+      const store=readStore();const beforeStore=JSON.parse(JSON.stringify(store));if(store.blocked){showStoreProblem(store);return;}if(!store.drafts[key]&&Object.keys(store.drafts).length>=100){status.textContent='Draft limit reached (100). Download this project or manage saved learning data.';return;}
+      const signature = value => JSON.stringify(['html','css','js'].map(k=>value[k]));
+      const remote=store.drafts[key];
+      if(remote&&savedFiles!==null&&signature(remote)!==savedFiles&&signature(remote)!==signature(project)){
+        if(Object.keys(store.drafts).length>=100){status.textContent='A conflicting draft needs another slot. Download your version before continuing.';return;}
+        let id='workspace:conflict-'+Date.parse(remote.updatedAt),n=1;while(store.drafts[id]&&signature(store.drafts[id])!==signature(remote))id='workspace:conflict-'+Date.parse(remote.updatedAt)+'-'+n++;store.drafts[id]={...remote};
+      }
       store.drafts[key]={...project,updatedAt:new Date().toISOString()};const data=JSON.stringify(store);
       if(new TextEncoder().encode(data).length>MAX_STORE){status.textContent='Draft storage limit reached (2 MB). Download this project before leaving.';return;}
-      try{localStorage.setItem(STORE,data);unsaved=false;status.textContent=autoJS.checked?'Draft saved on this device. Live update queued.':'Draft saved on this device. JavaScript runs on Run or Check.';}catch(_){status.textContent='Browser storage is unavailable or full. Download this project to keep your changes.';}
+      if(window.CNR_SYNC_ENABLED&&window.CNRLearningSync){
+        const sequence=++saveSequence,oldKey=key,oldOwner=window.CNRLearningSync.getOwner();pendingSaves++;
+        window.CNRLearningSync.commitPlayground(beforeStore,JSON.parse(data)).then(ok=>{
+          if(sequence===saveSequence&&key===oldKey&&window.CNRLearningSync.getOwner()===oldOwner){
+            if(ok){unsaved=false;savedFiles=signature(project);status.textContent='Draft saved on this device. Account progress syncs automatically when connected.';refreshDrafts();}
+            else status.textContent='This draft could not be saved safely. Keep the editor open or download the ZIP.';
+          }
+        }).finally(()=>{pendingSaves--;});return;
+      }
+      try{localStorage.setItem(STORE,data);unsaved=false;savedFiles=signature(project);window.dispatchEvent(new CustomEvent('cnr:playground-saved',{detail:{before:beforeStore,after:JSON.parse(data)}})); status.textContent=autoJS.checked?'Draft saved on this device. Live update queued.':'Draft saved on this device. JavaScript runs on Run or Check.';}catch(_){status.textContent='Browser storage is unavailable or full. Download this project to keep your changes.';}
       refreshDrafts();
     }
     function showStoreProblem(store) {
@@ -238,7 +258,7 @@ THE SOFTWARE.
       });
       const clear=button('Reset saved projects',()=>{
         if(confirm('Delete all saved playground projects on this device? Download the saved data first if you need to recover it.')){
-          try{localStorage.removeItem(STORE);notice.hidden=true;save();}catch(_){status.textContent='Browser storage remains unavailable. Download your project ZIP.';}
+          try{if(!maySave())return;if(window.CNR_SYNC_ENABLED&&window.CNRLearningSync){const prior=readStore();window.CNRLearningSync.commitPlayground(prior,{version:1,drafts:{}}).then(ok=>{if(ok){notice.hidden=true;save();}});return;}localStorage.removeItem(STORE);notice.hidden=true;save();}catch(_){status.textContent='Browser storage remains unavailable. Download your project ZIP.';}
         }
       });
       notice.replaceChildren(el('p',null,'Saving is paused to protect existing data. Download a backup, or explicitly reset saved projects to start a new store.'),backup,clear);notice.hidden=false;
@@ -246,8 +266,9 @@ THE SOFTWARE.
     function refreshDrafts(){draftSelect.replaceChildren(new Option('Choose a saved project…',''));Object.entries(readStore().drafts).sort((a,b)=>String(b[1].updatedAt).localeCompare(String(a[1].updatedAt))).forEach(([k,v])=>draftSelect.append(new Option(v.title+(k.startsWith('workspace:import')?' (imported)':''),k)));draftSelect.value=readStore().drafts[key]?key:'';}
     function removeFrame(){clearTimeout(runTimer);runNonce='';pendingCheck=false;if(frame){frame.remove();frame=null;}previewBox.replaceChildren(el('p','cnr-pg__placeholder','Preview stopped. Select Run to restart.'));}
     function appendLog(level,text){const line=(level==='log'?'':level.toUpperCase()+': ')+String(text).slice(0,2500)+'\n'; if(output.textContent.length<25000)output.textContent+=line;}
-    function emit(passed){const detail={path:project.path,title:project.title,course:project.course,exerciseId:project.exerciseId||''};if(typeof passed==='boolean')detail.passed=passed;window.dispatchEvent(new CustomEvent('cnr:practice',{detail}));}
+    function emit(passed){if(!maySave())return;const detail={path:project.path,title:project.title,course:project.course,exerciseId:project.exerciseId||''};if(typeof passed==='boolean')detail.passed=passed;window.dispatchEvent(new CustomEvent('cnr:practice',{detail}));}
     function render(userRun,checks,recordPractice=userRun){
+      if(!mayView()){syncAccess();return;}
       clearTimeout(editTimer);removeFrame();output.textContent='';explicit=recordPractice;executedJS=userRun;pendingCheck=checks;counter++;
       const warnings=[];let source=project.js;const guard='__cnr_budget_'+nonce();
       // A detached template is inert: scripts do not run and its resources are
@@ -285,16 +306,24 @@ THE SOFTWARE.
       const solution=button('Load solution',()=>{if(confirm('Replace this exercise draft with the solution? Download first if you want to keep your version.')){setFiles(exercise.solution);save();render(false,false);}});
       const check=button('Check my work',()=>render(true,true));instruction.append(title,text,link,hint,solution,check);
     }
-    function loadProject(nextKey,defaultFiles,nextExercise){if(unsaved&&!confirm('This project has changes that could not be saved. Download the ZIP before switching if you want to keep them. Switch anyway?')){exerciseSelect.value=exercise?.id||'';draftSelect.value=readStore().drafts[key]?key:'';return false;}unsaved=false;removeFrame();key=nextKey;exercise=nextExercise||null;starter={...defaultFiles};const saved=readStore().drafts[key];setFiles(saved||starter);if(saved){project={...project,...saved};status.textContent='Restored your saved draft. Select Run when ready.';}else status.textContent='Starter loaded. Edit a file or select Run.';notice.hidden=true;describeExercise();exerciseSelect.value=exercise?.id||'';refreshDrafts();selectTab('html');const state=readStore();if(state.blocked)showStoreProblem(state);}
+    function loadProject(nextKey,defaultFiles,nextExercise){if(unsaved&&!confirm('This project has changes that could not be saved. Download the ZIP before switching if you want to keep them. Switch anyway?')){exerciseSelect.value=exercise?.id||'';draftSelect.value=readStore().drafts[key]?key:'';return false;}unsaved=false;removeFrame();key=nextKey;exercise=nextExercise||null;starter={...defaultFiles};const saved=readStore().drafts[key];setFiles(saved||starter);savedFiles=saved?JSON.stringify(['html','css','js'].map(k=>saved[k])):null;if(saved){project={...project,...saved};status.textContent='Restored your saved draft. Select Run when ready.';}else status.textContent='Starter loaded. Edit a file or select Run.';notice.hidden=true;describeExercise();exerciseSelect.value=exercise?.id||'';refreshDrafts();selectTab('html');const state=readStore();if(state.blocked)showStoreProblem(state);}
     exerciseSelect.addEventListener('change',()=>{const selected=exercises.find(e=>e.id===exerciseSelect.value);if(selected)loadProject('exercise:'+selected.id,selected.starter,selected);else loadProject('workspace',EMPTY,null);});
     draftSelect.addEventListener('change',()=>{const saved=readStore().drafts[draftSelect.value];if(!saved)return;const chosen=exercises.find(e=>e.id===saved.exerciseId);loadProject(draftSelect.value,chosen?.starter||EMPTY,chosen);});
-    function externalUpdate(){refreshDrafts();notice.replaceChildren(el('p',null,'Saved learning data changed in another view. Your current editor has not been replaced.'),button('Reload saved draft',()=>loadProject(key,starter,exercise)),button('Keep this version',()=>{save();notice.hidden=true;}));notice.hidden=false;}
+    function externalUpdate(){if(!maySave()){syncAccess();return;}refreshDrafts();notice.replaceChildren(el('p',null,'Saved learning data changed in another view. Your current editor has not been replaced.'),button('Reload saved draft',()=>loadProject(key,starter,exercise)),button('Keep this version',()=>{save();notice.hidden=true;}));notice.hidden=false;}
     window.addEventListener('storage',event=>{if(event.key===STORE)externalUpdate();});window.addEventListener('cnr:learning-imported',externalUpdate);
+    function syncAccess(){root.hidden=!mayView();if(!mayView()){clearTimeout(editTimer);removeFrame();}else if(unsaved&&maySave()&&!retryingSave&&pendingSaves===0){retryingSave=true;save();retryingSave=false;}}
+    workspaces.push(()=>unsaved&&project?{key,draft:{...project,updatedAt:new Date().toISOString()}}:null);
+    window.addEventListener('cnr:learning-updated',syncAccess);
     const requested=new URLSearchParams(location.search);const selected=exercises.find(e=>e.id===requested.get('exercise'));const requestedLesson=safePath(requested.get('lesson'));
-    if(!meta.path&&selected)loadProject('exercise:'+selected.id,selected.starter,selected);
-    else if(!meta.path&&requestedLesson&&readStore().drafts['lesson:'+requestedLesson])loadProject('lesson:'+requestedLesson,EMPTY,null);
-    else loadProject(key,EMPTY,null);
-    return { preview:()=>render(false,false,false), openSnippet(snippet,note){
+    function loadRequestedProject(){
+      if(!meta.path&&selected)loadProject('exercise:'+selected.id,selected.starter,selected);
+      else if(!meta.path&&requestedLesson)loadProject('lesson:'+requestedLesson,EMPTY,null);
+      else loadProject(meta.path?'lesson:'+meta.path:'workspace',EMPTY,null);
+    }
+    window.addEventListener('cnr:learning-owner-changed',()=>{clearTimeout(editTimer);removeFrame();output.textContent='';autoJS.checked=false;unsaved=false;savedFiles=null;saveSequence++;setFiles(EMPTY);loadRequestedProject();syncAccess();render(false,false,false);});
+    loadRequestedProject();
+    syncAccess();
+    return { preview:()=>{if(maySave())render(false,false,false);}, openSnippet(snippet,note){
       if(unsaved&&!confirm('This project has changes that could not be saved. Download the ZIP before replacing them. Open this example anyway?'))return;
       if(Object.values(snippet).some(value=>value.length>MAX_FILE||value.includes('\u0000'))){status.textContent='This example exceeds the workspace file limits. Download or copy it into a local editor instead.';return;}
       const lessonKey=meta.path?'lesson:'+meta.path:'workspace';

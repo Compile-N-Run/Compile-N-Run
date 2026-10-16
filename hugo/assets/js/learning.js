@@ -7,8 +7,12 @@
   var MAX_STORE = 2 * 1024 * 1024, MAX_BACKUP = 6 * 1024 * 1024, MAX_NOTE = 20000;
   var state, catalog = null, pending = null, volatile = false, blocked = false, notice = '';
   var volatileKeys = Object.create(null);
-  var importSequence = 0;
-  var catalogPromise = null, noteDirty = false, noteBaseline = '', initialised = false;
+  var mutationBase = null;
+  function beginMutation(data) { mutationBase = clone(data); return data; }
+  var importSequence = 0, writeGuard = null, displayGuard = null;
+  function canView() { try { return displayGuard ? displayGuard() === true : canWrite(); } catch (_) { return false; } }
+  function canWrite() { try { return writeGuard ? writeGuard() === true : !window.CNR_SYNC_ENABLED; } catch (_) { return false; } }
+  var catalogPromise = null, noteDirty = false, noteBaseline = '', noteEditAt = 0, initialised = false;
   var own = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
   var map = function () { return Object.create(null); };
   var fail = function (message) { throw new Error(message); };
@@ -91,6 +95,10 @@
         object(item.bookmark, 'Bookmark'); if (typeof item.bookmark.value !== 'boolean') fail('Invalid bookmark value.');
         clean.bookmark = { value: item.bookmark.value, updatedAt: time(item.bookmark.updatedAt, 'Bookmark') };
       }
+      if (item.noteConflicts !== undefined) {
+        if (!Array.isArray(item.noteConflicts) || item.noteConflicts.length > 10) fail('Too many conflicting note versions.');
+        clean.noteConflicts = item.noteConflicts.map(function (n) { object(n, 'Conflicting note'); return { text: text(n.text, MAX_NOTE, 'Conflicting note'), updatedAt: time(n.updatedAt, 'Conflicting note') }; });
+      }
       if (item.note !== undefined) {
         object(item.note, 'Note'); clean.note = { text: text(item.note.text, MAX_NOTE, 'Note'), updatedAt: time(item.note.updatedAt, 'Note') };
       }
@@ -155,13 +163,15 @@
   }
   function fresh() {
     if (volatile && !blocked) {
-      try { var pendingState = empty(); Object.keys(volatileKeys).forEach(function (name) { pendingState[name] = state[name]; }); return merge(readAll(), pendingState, 'Recovered note from this tab').state; }
+      try { var pendingState = empty(); Object.keys(volatileKeys).forEach(function (name) { pendingState[name] = state[name]; }); return beginMutation(merge(readAll(), pendingState, 'Recovered note from this tab').state); }
       catch (error) { notice = 'Unsaved changes could not be combined with the latest browser data: ' + error.message + ' Export this tab before reloading. Nothing was overwritten.'; renderNotices(); return null; }
     }
-    if (blocked) return clone(state);
-    try { return readAll(); } catch (e) { storageError(e, !(e && e.name === 'SecurityError')); return clone(state); }
+    if (blocked) return beginMutation(clone(state));
+    try { return beginMutation(readAll()); } catch (e) { storageError(e, !(e && e.name === 'SecurityError')); return beginMutation(clone(state)); }
   }
   function persist(next, names) {
+    var beforeMutation = mutationBase; mutationBase = null;
+    if (!canWrite()) { notice = 'Learning is waiting for your account connection. Your existing data has not been changed.'; renderNotices(); return false; }
     names = Array.from(new Set(names.concat(Object.keys(volatileKeys))));
     try {
       names.forEach(function (name) { next[name] = checkSize(validators[name](next[name]), name); });
@@ -170,19 +180,20 @@
       changed(); return false;
     }
     if (blocked) { state = next; storageError(null, true); return false; }
+    if (window.CNR_SYNC_ENABLED && window.CNRLearningSync && beforeMutation) return window.CNRLearningSync.commitMutation(beforeMutation, next);
     var old = {}, written = [];
     try {
       if (localStorage.getItem(JOURNAL)) fail('A backup merge is in progress. Please reload after it finishes.');
       names.forEach(function (name) { old[name] = localStorage.getItem(KEYS[name]); });
       names.forEach(function (name) { localStorage.setItem(KEYS[name], serialise(next[name])); written.push(name); });
-      state = next; volatile = false; volatileKeys = map(); notice = ''; changed(); return true;
+      state = next; volatile = false; volatileKeys = map(); notice = ''; changed(beforeMutation); return true;
     } catch (e) {
       try {
         written.forEach(function (name) { localStorage.removeItem(KEYS[name]); });
         written.forEach(function (name) { if (old[name] !== null) localStorage.setItem(KEYS[name], old[name]); });
       } catch (ignored) { blocked = true; }
       names.forEach(function (name) { volatileKeys[name] = true; });
-      state = next; storageError(e, blocked); changed(); return false;
+      state = next; storageError(e, blocked); changed(beforeMutation); return false;
     }
   }
   function metadata(p) {
@@ -287,9 +298,10 @@
     });
     only(backup.learning, ['v', 'lessons'], 'Learning data');
     keys(backup.learning.lessons, 5000, 'Lessons').forEach(function (p) {
-      var item = backup.learning.lessons[p]; only(item, ['title', 'course', 'visitedAt', 'updatedAt', 'bookmark', 'note', 'practice'], 'Lesson');
+      var item = backup.learning.lessons[p]; only(item, ['title', 'course', 'visitedAt', 'updatedAt', 'bookmark', 'note', 'noteConflicts', 'practice'], 'Lesson');
       if (item.bookmark !== undefined) only(item.bookmark, ['value', 'updatedAt'], 'Bookmark');
       if (item.note !== undefined) only(item.note, ['text', 'updatedAt'], 'Note');
+      if (item.noteConflicts !== undefined) { if (!Array.isArray(item.noteConflicts)) fail('Invalid note conflicts.'); item.noteConflicts.forEach(function (n) { only(n, ['text', 'updatedAt'], 'Conflicting note'); }); }
       keys(item.practice || {}, 100, 'Exercise records').forEach(function (id) { only(item.practice[id], ['attemptedAt', 'passedAt', 'lastResult'], 'Exercise record'); });
     });
     only(backup.playground, ['version', 'drafts'], 'Playground data');
@@ -305,6 +317,7 @@
     return clean;
   }
   function prepareImport(raw) {
+    if (!canWrite()) fail('Wait for your learning workspace to finish opening before previewing a backup.');
     pending = null;
     if (volatile || blocked) fail('Your browser has unsaved or unreadable data. Export it before importing, then retry in a tab with working storage.');
     var incoming = validateBackup(raw), current = readAll(), merged = merge(current, incoming);
@@ -312,12 +325,19 @@
     var summary = clone(merged.summary); summary.previewToken = pending.token; return summary;
   }
   function applyImport(expectedToken) {
+    if (!canWrite()) fail('Wait for your account connection before importing learning.');
     if (!pending) fail('Preview a backup before merging it.');
     if (expectedToken !== undefined && expectedToken !== pending.token) fail('A different backup has been previewed. Preview this backup again before merging it.');
     if (volatile || blocked) fail('Browser storage is not ready for a backup merge.');
     var before = readAll();
     if (serialise(before) !== pending.base) { pending = null; fail('Your saved data changed since the preview. Choose the backup again to preview the updated merge.'); }
     var merged = merge(before, pending.incoming).state, originals = {}, journalWritten = false;
+    if (window.CNR_SYNC_ENABLED && window.CNRLearningSync) {
+      return window.CNRLearningSync.commitMutation(before, merged).then(function (ok) {
+        if (!ok) fail('The backup could not be merged safely. Existing account copies are preserved.');
+        pending = null; window.dispatchEvent(new CustomEvent('cnr:learning-imported')); return true;
+      });
+    }
     Object.keys(KEYS).forEach(function (name) { originals[name] = localStorage.getItem(KEYS[name]); });
     try {
       if (localStorage.getItem(JOURNAL)) fail('Another backup merge is in progress.');
@@ -330,7 +350,7 @@
       state = before; pending = null; renderNotices();
       fail('The backup was not merged. Existing data was preserved' + (blocked ? ' in the recovery record.' : '. Browser storage may be full or unavailable.'));
     }
-    state = merged; pending = null; notice = ''; changed();
+    state = merged; pending = null; notice = ''; changed(before);
     window.dispatchEvent(new CustomEvent('cnr:learning-imported'));
     return true;
   }
@@ -387,6 +407,7 @@
     return sidebar && sidebar.getAttribute('data-tut') === id ? sidebarLessons(sidebar.querySelector('.theme-doc-sidebar-menu')) : [];
   }
   function visit() {
+    if (!canWrite()) return;
     if (!currentPage || !document.querySelector('[data-learning-tools], [data-mark-done]')) return;
     var next = fresh(); if (!next) return; var item = ensureLesson(next, currentPage.path, currentPage), now = Date.now();
     item.title = currentPage.title; item.course = currentPage.course; item.visitedAt = now;
@@ -406,6 +427,7 @@
     if (!read && existing) existing.remove();
   }
   function renderSidebar() {
+    if (!canView()) { document.querySelectorAll('.cnr-check').forEach(function (n) { n.remove(); }); var waiting = sidebar && sidebar.querySelector('[data-learning-sidebar]'); if (waiting) waiting.hidden = true; return; }
     document.querySelectorAll('.theme-doc-sidebar-menu').forEach(function (menu) {
       menu.querySelectorAll('.theme-doc-sidebar-item-link > a.menu__link[href]').forEach(function (a) { markLink(a, !!state.progress.done[path(a.getAttribute('href'))]); });
       menu.querySelectorAll('.theme-doc-sidebar-item-category').forEach(function (li) {
@@ -419,7 +441,7 @@
       var n = lessons.filter(function (l) { return state.progress.done[l.path]; }).length;
       var box = sidebar.querySelector('[data-learning-sidebar]');
       if (!box) { box = el('div', null, 'cnr-progress'); box.setAttribute('data-learning-sidebar', ''); sidebar.insertBefore(box, sidebar.firstChild); }
-      box.replaceChildren(el('p', n + ' of ' + lessons.length + ' pages read'));
+      box.hidden = false; box.replaceChildren(el('p', n + ' of ' + lessons.length + ' pages read'));
       var bar = el('progress'); bar.max = lessons.length || 1; bar.value = n; bar.setAttribute('aria-label', 'Pages read'); box.appendChild(bar); box.appendChild(link('Your learning dashboard', '/learn/'));
       var categories = map();
       sidebar.querySelectorAll('.theme-doc-sidebar-item-category').forEach(function (li) {
@@ -440,15 +462,19 @@
   function renderTools() {
     if (!currentPage) return;
     var p = currentPage.path, item = state.learning.lessons[p], status = lessonStatus(p);
-    document.querySelectorAll('[data-mark-done]').forEach(function (b) { b.textContent = status.read ? '✓ Read' : 'Mark as read'; b.setAttribute('aria-pressed', String(status.read)); b.title = status.read ? 'Mark this page as unread' : 'Record that you have read this page'; });
+    document.querySelectorAll('[data-mark-done]').forEach(function (b) { b.disabled = !canWrite(); b.textContent = status.read ? '✓ Read' : 'Mark as read'; b.setAttribute('aria-pressed', String(status.read)); b.title = status.read ? 'Mark this page as unread' : 'Record that you have read this page'; });
     document.querySelectorAll('[data-learning-tools]').forEach(function (root) {
-      root.hidden = false;
+      root.hidden = !canView();
       var b = root.querySelector('[data-learning-bookmark]'); if (b) { var on = !!(item && item.bookmark && item.bookmark.value); b.textContent = on ? '✓ Bookmarked' : 'Bookmark'; b.setAttribute('aria-pressed', String(on)); }
       var practiced = root.querySelector('[data-learning-practiced]'); if (practiced) practiced.textContent = status.practiced ? 'Record another practice session' : 'Record practice';
       var states = root.querySelector('[data-learning-states]'); if (states) states.replaceChildren(badges(p));
       var field = root.querySelector('[data-learning-note]'), saved = item && item.note ? item.note.text : '';
       if (field && !noteDirty) { field.value = saved; noteBaseline = saved; }
       var conflict = root.querySelector('[data-learning-note-conflict]'); if (conflict) { conflict.hidden = !(noteDirty && saved !== noteBaseline); conflict.textContent = 'The saved note changed in another tab or backup merge. Your unsaved text is still here. Save it to replace the saved note, or reload the saved version.'; }
+      var conflicts = root.querySelector('[data-learning-note-versions]');
+      if (!conflicts) { conflicts = el('details'); conflicts.setAttribute('data-learning-note-versions', ''); var editor = root.querySelector('.cnr-learning__editor'); if (editor) editor.appendChild(conflicts); }
+      conflicts.replaceChildren(el('summary', 'Other saved versions')); conflicts.hidden = !(item && item.noteConflicts && item.noteConflicts.length);
+      if (item && item.noteConflicts) item.noteConflicts.forEach(function (n) { conflicts.appendChild(el('p', date(n.updatedAt), 'cnr-learning__muted')); conflicts.appendChild(el('p', n.text, 'cnr-learning__note-text')); });
       var evidence = root.querySelector('[data-learning-evidence]');
       if (evidence) {
         evidence.replaceChildren();
@@ -484,7 +510,7 @@
     return card;
   }
   function renderHome() {
-    var root = document.querySelector('[data-continue]'); if (!root) return;
+    var root = document.querySelector('[data-continue]'); if (!root) return; if (!canView()) { root.hidden = true; return; }
     var recent = recentCourses().slice(0, 4); root.replaceChildren(); if (!recent.length) { root.hidden = true; return; }
     root.hidden = false; var container = el('div', null, 'container cnr-learning-home');
     var head = el('div', null, 'cnr-learning__section-head'); head.appendChild(el('h2', 'Continue learning')); head.appendChild(link('Open your dashboard', '/learn/')); container.appendChild(head);
@@ -497,6 +523,8 @@
   }
   function renderDashboard() {
     var root = document.querySelector('[data-learning-dashboard]'); if (!root) return;
+    root.querySelectorAll('[data-learning-personal]').forEach(function (node) { node.hidden = !canView(); });
+    if (!canView()) return;
     var records = Object.keys(state.learning.lessons), stats = root.querySelector('[data-learning-summary]');
     if (stats) {
       stats.replaceChildren();
@@ -515,8 +543,8 @@
     }
     var notes = root.querySelector('[data-learning-notes]');
     if (notes) {
-      notes.replaceChildren(); records.filter(function (p) { return state.learning.lessons[p].note && state.learning.lessons[p].note.text; }).sort(function (a, b) { return state.learning.lessons[b].note.updatedAt - state.learning.lessons[a].note.updatedAt; }).forEach(function (p) {
-        var item = state.learning.lessons[p], d = el('details', null, 'cnr-learning__note-card'); d.appendChild(el('summary', item.title)); d.appendChild(el('p', item.note.text, 'cnr-learning__note-text')); d.appendChild(link('Open lesson to edit this note', p)); notes.appendChild(d);
+      notes.replaceChildren(); records.filter(function (p) { var item = state.learning.lessons[p]; return item.note && item.note.text || item.noteConflicts && item.noteConflicts.length; }).sort(function (a, b) { return (state.learning.lessons[b].note || {}).updatedAt - (state.learning.lessons[a].note || {}).updatedAt; }).forEach(function (p) {
+        var item = state.learning.lessons[p], d = el('details', null, 'cnr-learning__note-card'); d.appendChild(el('summary', item.title)); d.appendChild(el('p', item.note ? item.note.text : '', 'cnr-learning__note-text')); if (item.noteConflicts) item.noteConflicts.forEach(function (n) { d.appendChild(el('p', 'Other saved version · ' + date(n.updatedAt), 'cnr-learning__muted')); d.appendChild(el('p', n.text, 'cnr-learning__note-text')); }); d.appendChild(link('Open lesson', p)); notes.appendChild(d);
       });
       if (!notes.children.length) notes.appendChild(el('p', 'Save a note on any lesson. Notes stay private to this browser unless you export them.'));
     }
@@ -533,10 +561,10 @@
     if (drafts) { var count = Object.keys(state.playground.drafts).length; drafts.replaceChildren(el('p', count + ' playground draft' + (count === 1 ? '' : 's') + ' saved in this browser.')); drafts.appendChild(link('Open playground', '/playground/')); }
     renderNotices();
   }
-  function changed() {
+  function changed(before) {
     if (!initialised) return;
     renderTools(); renderSidebar(); renderHome(); renderDashboard(); renderNotices();
-    window.dispatchEvent(new CustomEvent('cnr:learning-updated', { detail: { persistent: !volatile && !blocked } }));
+    window.dispatchEvent(new CustomEvent('cnr:learning-updated', { detail: { persistent: !volatile && !blocked, before: before || null } }));
   }
   function loadCatalog() {
     if (catalogPromise) return catalogPromise;
@@ -560,9 +588,10 @@
       var b = root.querySelector('[data-learning-bookmark]'); if (b) b.addEventListener('click', function () { var item = state.learning.lessons[currentPage.path]; bookmark(currentPage.path, !(item && item.bookmark && item.bookmark.value)); });
       var practiceButton = root.querySelector('[data-learning-practiced]'); if (practiceButton) practiceButton.addEventListener('click', function () { practice({ path: currentPage.path, exerciseId: 'manual' }); });
       var field = root.querySelector('[data-learning-note]'), status = root.querySelector('[data-learning-note-status]');
-      if (field) field.addEventListener('input', function () { noteDirty = field.value !== noteBaseline; if (status) status.textContent = noteDirty ? 'Unsaved note. Choose Save note to keep it.' : ''; });
-      var save = root.querySelector('[data-learning-save-note]'); if (save) save.addEventListener('click', function () {
-        try { var ok = saveNote(currentPage.path, field.value); if (ok) { noteDirty = false; noteBaseline = field.value; } else { noteDirty = true; var held = state.learning.lessons[currentPage.path]; if (held && held.note && held.note.text === field.value) noteBaseline = field.value; } renderTools(); if (status) status.textContent = ok ? 'Note saved in this browser.' : 'Your note could not be saved. Your text is still here; see the storage message above before leaving.'; }
+      if (field) field.addEventListener('input', function () { noteDirty = field.value !== noteBaseline; noteEditAt = Date.now(); if (status) status.textContent = noteDirty ? 'Unsaved note. Choose Save note to keep it.' : ''; });
+      var save = root.querySelector('[data-learning-save-note]'); if (save) save.addEventListener('click', async function () {
+        var savingOwner = window.CNRLearningSync && window.CNRLearningSync.getOwner(), submittedText = field.value;
+        try { var ok = await saveNote(currentPage.path, submittedText); if (window.CNRLearningSync && window.CNRLearningSync.getOwner() !== savingOwner) return; if (field.value !== submittedText) { noteDirty = true; if (ok) noteBaseline = submittedText; renderTools(); if (status) status.textContent = ok ? 'Earlier text saved. Your newer edits are still in the editor.' : 'Your edits are still here; see the storage message above.'; return; } if (ok) { noteDirty = false; noteBaseline = field.value; } else { noteDirty = true; var held = state.learning.lessons[currentPage.path]; if (held && held.note && held.note.text === field.value) noteBaseline = field.value; } renderTools(); if (status) status.textContent = ok ? 'Note saved in this browser.' : 'Your note could not be saved. Your text is still here; see the storage message above before leaving.'; }
         catch (error) { if (status) status.textContent = error.message; }
       });
       var reload = root.querySelector('[data-learning-reload-note]'); if (reload) reload.addEventListener('click', function () { noteDirty = false; renderTools(); if (status) status.textContent = 'Loaded the saved note.'; });
@@ -598,7 +627,7 @@
         preview.hidden = false; mergeButton.disabled = false; status.textContent = 'Backup validated. Review the preview, then choose Merge backup. Nothing has changed yet.';
       }).catch(function (error) { if (ticket === fileTicket) status.textContent = 'Backup not imported: ' + error.message; });
     });
-    mergeButton.addEventListener('click', function () { try { applyImport(previewToken); clearPreview(); status.textContent = 'Backup merged. Your existing read marks, notes, and drafts were preserved.'; } catch (error) { clearPreview(); status.textContent = error.message; } });
+    mergeButton.addEventListener('click', async function () { try { await applyImport(previewToken); clearPreview(); status.textContent = 'Backup merged. Your existing read marks, notes, and drafts were preserved.'; } catch (error) { clearPreview(); status.textContent = error.message; } });
     cancel.addEventListener('click', function () { clearPreview(); status.textContent = 'Import cancelled. No saved data changed.'; });
   }
   function init() {
@@ -611,6 +640,7 @@
   window.addEventListener('cnr:practice', function (event) { try { practice(event.detail); } catch (error) { notice = 'Practice could not be saved: ' + error.message; renderNotices(); } });
   window.addEventListener('storage', function (event) {
     if (event.key !== null && Object.values(KEYS).indexOf(event.key) < 0 && event.key !== JOURNAL) return;
+    if (!canWrite()) return;
     if (volatile || blocked) { notice = 'Another tab changed saved learning data. Your unsaved changes are still in this tab; export them before reloading.'; renderNotices(); return; }
     try {
       if (localStorage.getItem(JOURNAL)) return; // Wait for the import's commit/rollback event.
@@ -620,8 +650,34 @@
     } catch (error) { storageError(error, true); }
   });
   window.addEventListener('beforeunload', function (event) { if (noteDirty || volatile) { event.preventDefault(); event.returnValue = ''; } });
+  function captureSnapshot(includeEditor) {
+    if (blocked) fail('Saved learning data needs recovery before it can be moved safely.');
+    var current = clone(state);
+    if (includeEditor && noteDirty && currentPage) {
+      var field = document.querySelector('[data-learning-note]');
+      if (field) { var item = ensureLesson(current, currentPage.path, currentPage); if (item.note && item.note.text && item.note.text !== noteBaseline && item.note.text !== field.value) { item.noteConflicts = item.noteConflicts || []; if (!item.noteConflicts.some(function (n) { return n.text === item.note.text; })) item.noteConflicts.push(clone(item.note)); } item.note = { text: field.value, updatedAt: noteEditAt || Date.now() }; item.updatedAt = item.note.updatedAt; }
+    }
+    if (includeEditor && window.CNRPlayground && window.CNRPlayground.captureDrafts) current.playground = window.CNRPlayground.captureDrafts(current.playground);
+    Object.keys(KEYS).forEach(function (name) { current[name] = checkSize(validators[name](current[name]), name); });
+    return { format: 'cnr-learning-backup', version: 1, exportedAt: new Date().toISOString(), progress: current.progress, learning: current.learning, playground: current.playground };
+  }
+  // Called by the sync coordinator only after its IndexedDB recovery record is durable.
+  function replaceSnapshot(backup, options) {
+    var clean = validateBackup(typeof backup === 'string' ? backup : JSON.stringify(backup), true), old = {}, written = [];
+    try {
+      Object.keys(KEYS).forEach(function (name) { old[name] = localStorage.getItem(KEYS[name]); });
+      Object.keys(KEYS).forEach(function (name) { localStorage.setItem(KEYS[name], JSON.stringify(clean[name])); written.push(name); });
+    } catch (error) {
+      try { written.forEach(function (name) { localStorage.removeItem(KEYS[name]); }); written.forEach(function (name) { if (old[name] !== null) localStorage.setItem(KEYS[name], old[name]); }); } catch (_) {}
+      throw error;
+    }
+    state = clean; volatile = false; blocked = false; volatileKeys = map(); pending = null; notice = '';
+    if (options && options.ownerChange) { noteDirty = false; noteBaseline = ''; noteEditAt = 0; }
+    else if (noteDirty && currentPage) { var field = document.querySelector('[data-learning-note]'), saved = state.learning.lessons[currentPage.path]; if (field && saved && saved.note && saved.note.text === field.value) { noteDirty = false; noteBaseline = field.value; noteEditAt = 0; } }
+    updateCounts(state); changed(); return true;
+  }
   window.CNRLearning = Object.freeze({
-    getSnapshot: function () { return clone(state); }, setRead: setRead, setBookmark: bookmark, saveNote: saveNote, recordPractice: practice,
+    getSnapshot: function () { return clone(state); }, canWrite: canWrite, canView: canView, setWriteGuard: function (guard, display) { writeGuard = guard; displayGuard = display || guard; changed(); }, captureSnapshot: captureSnapshot, replaceSnapshot: replaceSnapshot, recordVisit: visit, readDiskSnapshot: function () { var data = readAll(); return { format: 'cnr-learning-backup', version: 1, exportedAt: new Date().toISOString(), progress: data.progress, learning: data.learning, playground: data.playground }; }, refreshState: function () { if (canWrite()) { state = readAll(); changed(); } }, setRead: setRead, setBookmark: bookmark, saveNote: saveNote, recordPractice: practice,
     exportBackup: exportBackup, validateBackup: function (raw) { return clone(validateBackup(raw, true)); }, prepareImport: prepareImport, applyImport: applyImport, loadCatalog: loadCatalog,
     limits: Object.freeze({ backupBytes: MAX_BACKUP, storeBytes: MAX_STORE, noteCharacters: MAX_NOTE })
   });
