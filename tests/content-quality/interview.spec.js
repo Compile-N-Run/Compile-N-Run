@@ -58,17 +58,17 @@ test('company table switches time windows, filters, pages and links each problem
   for (const badge of await page.locator('[data-iv-rows] .cnr-iv-diff-col .cnr-iv-diff').allInnerTexts()) expect(badge).toBe('Hard');
   await page.locator('[data-iv-difficulty]').selectOption('');
   await page.locator('[data-iv-search]').fill('two sum');
-  await expect(rows.first().locator('.cnr-iv-title a')).toHaveText('Two Sum');
+  await expect(rows.first().locator('.cnr-iv-title a').first()).toHaveText('1. Two Sum');
   await expect(rows.first().locator('a.cnr-iv-solution')).toHaveAttribute('href', '/interview/problems/two-sum/');
   await expect(rows.first().locator('a.cnr-iv-lc')).toHaveAttribute('href', 'https://leetcode.com/problems/two-sum/');
-  await page.locator('[data-iv-written]').check();
-  for (const link of await rows.locator('.cnr-iv-title a').all()) await expect(link).toHaveAttribute('href', /^\/interview\/problems\//);
+  await page.locator('[data-iv-status]').selectOption('explained');
+  for (const link of await rows.locator('.cnr-iv-title a:first-child').all()) await expect(link).toHaveAttribute('href', /^\/interview\/problems\//);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
 test('global ranking lists every problem, most asked first, with a recent view', async ({ page }) => {
   await page.goto('/interview/most-asked/');
-  await expect(page.locator('[data-iv-rows] tr').first().locator('.cnr-iv-title a')).toHaveText('Two Sum');
+  await expect(page.locator('[data-iv-rows] tr').first().locator('.cnr-iv-title a').first()).toHaveText('1. Two Sum');
   const total = Number((await page.locator('[data-iv-count]').innerText()).split(' ')[0]);
   expect(total).toBeGreaterThan(3000);
   await page.locator('[data-iv-window="m6"]').click();
@@ -90,4 +90,36 @@ test('problem write-up shows one solution tab at a time and remembers the langua
   await expect(page.locator('#iv-solution-go')).toBeVisible();
   await expect(page.locator('[data-iv-chips] a').first()).toHaveAttribute('href', /^\/interview\/company\//);
   await expect(page.locator('a.cnr-iv-button')).toHaveAttribute('href', 'https://leetcode.com/problems/two-sum/');
+});
+
+test('catalog lists every LeetCode problem by number, finds one by number, and solved marks reach the dashboard', async ({ page }) => {
+  await page.goto('/interview/problems/');
+  const rows = page.locator('[data-iv-rows] tr');
+  const total = Number((await page.locator('[data-iv-count]').innerText()).split(' ')[0]);
+  expect(total).toBeGreaterThan(4000);
+  await expect(rows.first().locator('.cnr-iv-num')).toHaveText('1');
+  await expect(rows.first().locator('.cnr-iv-title a').first()).toHaveText('1. Two Sum');
+  await page.locator('[data-iv-search]').fill('146');
+  await expect(rows.first().locator('.cnr-iv-title a').first()).toHaveText('146. LRU Cache');
+  await page.locator('[data-iv-search]').fill('');
+  await expect(rows.first().locator('.cnr-iv-title a').first()).toHaveText('1. Two Sum'); // the search is debounced
+  await page.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
+  await expect(rows.first().locator('.cnr-iv-solve-toggle')).toBeEnabled();
+  await rows.first().locator('.cnr-iv-solve-toggle').click();
+  await expect(rows.first().locator('.cnr-iv-solve-toggle')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('[data-iv-count]')).toContainText('1 solved');
+  await page.locator('[data-iv-status]').selectOption('solved');
+  await expect(rows).toHaveCount(1);
+  // The mark is committed asynchronously; wait until it has reached storage before leaving the page.
+  await expect.poll(() => page.evaluate(() => !!window.CNRLearning.readDiskSnapshot().learning.lessons['/interview/problems/two-sum/']?.practice?.solved)).toBe(true);
+  await page.goto('/interview/problems/two-sum/');
+  await expect(page.locator('[data-iv-solve-toggle]')).toHaveAttribute('aria-pressed', 'true');
+  await page.goto('/learn/');
+  await expect(page.locator('[data-learning-solved]')).toContainText('1. Two Sum');
+  await expect(page.locator('[data-learning-solved-summary]')).toContainText('Easy 1');
+  await page.locator('[data-learning-solved] button').click();
+  await expect(page.locator('[data-learning-solved]')).not.toContainText('Two Sum');
+  await expect.poll(() => page.evaluate(() => !window.CNRLearning.readDiskSnapshot().learning.lessons['/interview/problems/two-sum/']?.practice?.solved)).toBe(true);
+  await page.goto('/interview/problems/two-sum/');
+  await expect(page.locator('[data-iv-solve-toggle]')).toHaveAttribute('aria-pressed', 'false');
 });

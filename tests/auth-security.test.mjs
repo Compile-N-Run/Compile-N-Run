@@ -6,9 +6,9 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { handleEmailAccount } from '../worker/ask-ai/src/email-accounts.js';
-import { handleAccounts } from '../worker/ask-ai/src/accounts.js';
-import { hashPassword } from '../worker/ask-ai/src/passwords.js';
+import { handleEmailAccount } from '../worker/compilenrun-worker/src/email-accounts.js';
+import { handleAccounts } from '../worker/compilenrun-worker/src/accounts.js';
+import { hashPassword } from '../worker/compilenrun-worker/src/passwords.js';
 
 const SITE = 'https://www.compilenrun.com';
 const PASSWORD = 'a distinct testing passphrase';
@@ -20,7 +20,7 @@ class D1 {
   constructor() {
     this.sqlite = new DatabaseSync(':memory:');
     for (const file of ['accounts-schema.sql', 'accounts-email-schema.sql', 'accounts-google-profile-schema.sql']) {
-      this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/' + file, import.meta.url), 'utf8'));
+      this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/' + file, import.meta.url), 'utf8'));
     }
     this.beforeBatch = null;
   }
@@ -250,11 +250,11 @@ test('unlink cancels a link callback that already consumed its state and is awai
 test('email migration preserves legacy identities and learning data without resurrecting an unlinked provider', () => {
   const legacy = new DatabaseSync(':memory:');
   try {
-    legacy.exec(readFileSync(new URL('../worker/ask-ai/accounts-schema.sql', import.meta.url), 'utf8'));
+    legacy.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-schema.sql', import.meta.url), 'utf8'));
     legacy.prepare('INSERT INTO cnr_account_users VALUES (?,?,?,?,?)').run('legacy-user', 'legacy-google-sub', 'Chosen display name', 100, 200);
     legacy.prepare('INSERT INTO cnr_account_sessions VALUES (?,?,?,?)').run('legacy-session', 'legacy-user', 200, 9999999999);
     legacy.prepare('INSERT INTO cnr_account_learning VALUES (?,?,?,?)').run('legacy-user', 9, '{"private":"retained"}', 200);
-    const migration = readFileSync(new URL('../worker/ask-ai/accounts-email-schema.sql', import.meta.url), 'utf8');
+    const migration = readFileSync(new URL('../worker/compilenrun-worker/accounts-email-schema.sql', import.meta.url), 'utf8');
     legacy.exec(migration);
     assert.equal(legacy.prepare('SELECT user_id FROM cnr_account_google_identities WHERE google_sub=?').get('legacy-google-sub').user_id, 'legacy-user');
     assert.equal(legacy.prepare('SELECT display_name FROM cnr_account_users WHERE id=?').get('legacy-user').display_name, 'Chosen display name');

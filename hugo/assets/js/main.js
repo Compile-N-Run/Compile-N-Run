@@ -218,7 +218,7 @@
   var learn = document.querySelector('[data-learn]');
   if (learn) {
     learn.hidden = false;
-    /* "Was this page helpful?" -> worker/ask-ai (/api/feedback), one vote per page and reader. */
+    /* "Was this page helpful?" -> worker/compilenrun-worker (/api/feedback), one vote per page and reader. */
     var feedbackEndpoint = {{ site.Params.feedback.endpoint | default "/api/feedback" | jsonify | safeJS }};
     var VKEY = 'cnr_votes';
     var votes = {};
@@ -260,7 +260,7 @@
     };
   }
 
-  /* ---------- Ask AI (Cloudflare Worker in worker/ask-ai) ---------- */
+  /* ---------- Ask AI (Cloudflare Worker in worker/compilenrun-worker) ---------- */
   var askEndpoint = {{ site.Params.askAI.endpoint | default "/api/ask" | jsonify | safeJS }};
   var askSitekey = {{ site.Params.askAI.turnstileSitekey | jsonify | safeJS }};
   if (document.querySelector('[data-pagefind-body]') && /^\/(docs|blog)\//.test(location.pathname)) {

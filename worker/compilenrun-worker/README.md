@@ -46,9 +46,9 @@ npx wrangler@4 d1 execute compilenrun-data --remote --command \
 
 ## Deploy
 
-`cd worker/ask-ai && npx wrangler@4 deploy` (needs `wrangler login` with Workers, Workers AI and D1 access).
+`cd worker/compilenrun-worker && npx wrangler@4 deploy` (needs `wrangler login` with Workers, Workers AI and D1 access).
 Use wrangler 4: the repo's own wrangler 3 drops the `ratelimits` bindings, and the Worker then fails on every request.
-Logs: `npx wrangler@4 tail compilenrun-ask-ai`.
+Logs: `npx wrangler@4 tail compilenrun-worker`.
 
 Test the widget locally against production:
 `HUGO_PARAMS_ASKAI_ENDPOINT=https://www.compilenrun.com/api/ask hugo server`
@@ -66,7 +66,7 @@ The flow uses a random state nonce bound to a separate HttpOnly cookie, S256 PKC
 2. `GOOGLE_CLIENT_ID` is a public identifier in `wrangler.jsonc`. Store the secret interactively, never in a source file or a shell argument:
 
    ```sh
-   cd worker/ask-ai
+   cd worker/compilenrun-worker
    npx wrangler@4 secret put GOOGLE_CLIENT_SECRET
    ```
 

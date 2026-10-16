@@ -36,8 +36,11 @@
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > Date.now() + 86400000) fail(label + ' has an invalid timestamp.');
     return value;
   }
+  // Lesson paths are tutorial pages (/docs/...) or interview problem pages (/interview/problems/<slug>/).
+  function isProblem(p) { return typeof p === 'string' && p.indexOf('/interview/problems/') === 0; }
   function docURL(value, allowCategory) {
-    if (typeof value !== 'string' || value.length > 600 || !/^\/docs\/[A-Za-z0-9_+./-]+\/?$/.test(value) || value.indexOf('//') >= 0) return null;
+    if (typeof value !== 'string' || value.length > 600 || value.indexOf('//') >= 0) return null;
+    if (!/^\/docs\/[A-Za-z0-9_+./-]+\/?$/.test(value) && !/^\/interview\/problems\/[a-z0-9]+(-[a-z0-9]+)*\/?$/.test(value)) return null;
     if (value.split('/').some(function (part) { return part === '.' || part === '..'; }) || (!allowCategory && value.indexOf('/docs/category/') === 0)) return null;
     var normal = value.replace(/\/+$/, '') + '/';
     return normal.length <= 600 ? normal : null;
@@ -241,6 +244,22 @@
     item.practice[id] = { attemptedAt: now, passedAt: detail.passed === true ? now : (old && old.passedAt || 0),
       lastResult: detail.passed === true ? 'passed' : (detail.passed === false ? 'not-passed' : 'practiced') };
     item.updatedAt = now; persist(next, ['learning']);
+  }
+  // Interview problems: "solved" is a passed practice record with the id "solved" on the problem's page path.
+  // Marking works from the problem page or any problem table, including problems without a write-up yet.
+  function setSolved(p, on, title) {
+    p = path(p); if (!p || !isProblem(p)) return false;
+    var meta = metadata(p); if (typeof title === 'string' && title.trim() && (meta.title === p || on)) meta.title = title.trim().slice(0, 300);
+    var next = fresh(); if (!next) return false; var item = ensureLesson(next, p, meta), now = Date.now();
+    if (on) { item.practice.solved = { attemptedAt: now, passedAt: now, lastResult: 'passed' }; item.title = meta.title; }
+    else delete item.practice.solved;
+    item.updatedAt = now; return persist(next, ['learning']);
+  }
+  function solvedAt(p) { var item = state.learning.lessons[p], r = item && item.practice.solved; return r && r.passedAt ? r.passedAt : 0; }
+  function solvedProblems() {
+    return Object.keys(state.learning.lessons).filter(function (p) { return isProblem(p) && solvedAt(p); })
+      .map(function (p) { return { path: p, slug: p.slice('/interview/problems/'.length).replace(/\/$/, ''), title: state.learning.lessons[p].title, solvedAt: solvedAt(p) }; })
+      .sort(function (a, b) { return b.solvedAt - a.solvedAt; });
   }
   function merge(base, incoming, noteLabel) {
     var out = clone(base), summary = { read: Object.keys(incoming.progress.done).length, bookmarks: 0, notes: 0, noteConflicts: 0, drafts: Object.keys(incoming.playground.drafts).length, draftCopies: 0, practice: 0 };
@@ -521,17 +540,51 @@
   function lessonCard(p, item) {
     var card = el('article', null, 'cnr-learning__card'); var heading = el('h3'); heading.appendChild(link(item.title || p, p)); card.appendChild(heading); card.appendChild(badges(p)); return card;
   }
+  var problemIndex = null, problemIndexPromise = null;
+  function loadProblemIndex() {
+    if (!problemIndexPromise) problemIndexPromise = fetch('/interview-index.json', { credentials: 'same-origin' }).then(function (r) { if (!r.ok) throw new Error('unavailable'); return r.json(); })
+      .then(function (value) { problemIndex = value && value.v === 1 && value.problems ? value : null; renderDashboard(); }).catch(function () { problemIndex = null; });
+    return problemIndexPromise;
+  }
+  function renderSolved(root, solved) {
+    var box = root.querySelector('[data-learning-solved]'), summary = root.querySelector('[data-learning-solved-summary]');
+    if (!box) return;
+    if (solved.length && !problemIndex) loadProblemIndex();
+    box.replaceChildren();
+    if (summary) {
+      summary.replaceChildren();
+      if (!solved.length) summary.textContent = 'Mark a problem as solved from its page or from any problem list, and it will be counted here.';
+      else if (problemIndex) {
+        var by = { Easy: 0, Medium: 0, Hard: 0 }, explained = 0;
+        solved.forEach(function (item) { var meta = problemIndex.problems[item.slug]; if (meta) { by[meta[1]] = (by[meta[1]] || 0) + 1; if (meta[2]) explained++; } });
+        summary.textContent = solved.length + ' of ' + problemIndex.counts.total + ' LeetCode problems solved · Easy ' + by.Easy + ' · Medium ' + by.Medium + ' · Hard ' + by.Hard + (explained ? ' · ' + explained + ' with an explanation here' : '') + '.';
+      } else summary.textContent = solved.length + ' problem' + (solved.length === 1 ? '' : 's') + ' solved.';
+    }
+    if (!solved.length) return;
+    var list = el('ul', null, 'cnr-learning__solved');
+    solved.slice(0, 60).forEach(function (item) {
+      var li = el('li'), meta = problemIndex && problemIndex.problems[item.slug];
+      li.appendChild(link(item.title, meta && meta[2] ? item.path : 'https://leetcode.com/problems/' + item.slug + '/'));
+      if (meta) { var d = el('span', meta[1], 'cnr-learning__badge is-recorded cnr-learning__badge--' + meta[1].toLowerCase()); li.appendChild(d); }
+      li.appendChild(el('span', 'solved ' + date(item.solvedAt), 'cnr-learning__muted'));
+      li.appendChild(button('Unmark', function () { setSolved(item.path, false); }));
+      list.appendChild(li);
+    });
+    box.appendChild(list);
+    if (solved.length > 60) box.appendChild(el('p', 'Showing the 60 most recent of ' + solved.length + ' solved problems.', 'cnr-learning__muted'));
+  }
   function renderDashboard() {
     var root = document.querySelector('[data-learning-dashboard]'); if (!root) return;
     root.querySelectorAll('[data-learning-personal]').forEach(function (node) { node.hidden = !canView(); });
     if (!canView()) return;
-    var records = Object.keys(state.learning.lessons), stats = root.querySelector('[data-learning-summary]');
+    var records = Object.keys(state.learning.lessons).filter(function (p) { return !isProblem(p); }), stats = root.querySelector('[data-learning-summary]'), solved = solvedProblems();
     if (stats) {
       stats.replaceChildren();
-      [['Pages read', Object.keys(state.progress.done).length], ['Lessons practiced', records.filter(function (p) { return lessonStatus(p).practiced; }).length], ['Lessons with a passed check', records.filter(function (p) { return lessonStatus(p).passed; }).length]].forEach(function (pair) {
+      [['Pages read', Object.keys(state.progress.done).length], ['Lessons practiced', records.filter(function (p) { return lessonStatus(p).practiced; }).length], ['Lessons with a passed check', records.filter(function (p) { return lessonStatus(p).passed; }).length], ['Interview problems solved', solved.length]].forEach(function (pair) {
         var card = el('div', null, 'cnr-learning__stat'); card.appendChild(el('strong', String(pair[1]))); card.appendChild(el('span', pair[0])); stats.appendChild(card);
       });
     }
+    renderSolved(root, solved);
     var recent = root.querySelector('[data-learning-courses]');
     if (recent) { recent.replaceChildren(); recentCourses().slice(0, 12).forEach(function (entry) { recent.appendChild(courseCard(entry)); }); if (!recent.children.length) { recent.appendChild(el('p', 'Your recent courses will appear here after you open a lesson.')); } }
     var saved = root.querySelector('[data-learning-bookmarks]');
@@ -677,7 +730,7 @@
     updateCounts(state); changed(); return true;
   }
   window.CNRLearning = Object.freeze({
-    getSnapshot: function () { return clone(state); }, canWrite: canWrite, canView: canView, setWriteGuard: function (guard, display) { writeGuard = guard; displayGuard = display || guard; changed(); }, captureSnapshot: captureSnapshot, replaceSnapshot: replaceSnapshot, recordVisit: visit, readDiskSnapshot: function () { var data = readAll(); return { format: 'cnr-learning-backup', version: 1, exportedAt: new Date().toISOString(), progress: data.progress, learning: data.learning, playground: data.playground }; }, refreshState: function () { if (canWrite()) { state = readAll(); changed(); } }, setRead: setRead, setBookmark: bookmark, saveNote: saveNote, recordPractice: practice,
+    getSnapshot: function () { return clone(state); }, canWrite: canWrite, canView: canView, setWriteGuard: function (guard, display) { writeGuard = guard; displayGuard = display || guard; changed(); }, captureSnapshot: captureSnapshot, replaceSnapshot: replaceSnapshot, recordVisit: visit, readDiskSnapshot: function () { var data = readAll(); return { format: 'cnr-learning-backup', version: 1, exportedAt: new Date().toISOString(), progress: data.progress, learning: data.learning, playground: data.playground }; }, refreshState: function () { if (canWrite()) { state = readAll(); changed(); } }, setRead: setRead, setBookmark: bookmark, saveNote: saveNote, recordPractice: practice, setSolved: setSolved, solvedAt: solvedAt, solvedProblems: solvedProblems,
     exportBackup: exportBackup, validateBackup: function (raw) { return clone(validateBackup(raw, true)); }, prepareImport: prepareImport, applyImport: applyImport, loadCatalog: loadCatalog,
     limits: Object.freeze({ backupBytes: MAX_BACKUP, storeBytes: MAX_STORE, noteCharacters: MAX_NOTE })
   });

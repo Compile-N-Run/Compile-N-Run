@@ -83,10 +83,20 @@ python3 hugo/scripts/check_interview.py two-sum      # one problem
 python3 hugo/scripts/check_interview.py              # everything (CI runs this)
 ```
 
+## Problem numbers and the full catalog
+
+`data/leetcode-problems.json` is a snapshot of LeetCode's public problem list (number, title, slug, difficulty,
+Premium flag) from `hugo/scripts/import_leetcode_problems.py`. It is the universe for `/interview/problems/`; the
+company lists are a subset of it, and every write-up must be in it. Page titles are "`<number>. <title>`"
+(the write-up's own `title` stays LeetCode's title). Readers mark problems as solved from a problem page or any
+table; the mark is a learning-store practice record on `/interview/problems/<slug>/`, so it syncs and backs up with
+the rest of their learning.
+
 ## Updating the company data
 
 ```bash
 git clone --depth 1 https://github.com/liquidslr/leetcode-company-wise-problems /tmp/lc
+python3 hugo/scripts/import_leetcode_problems.py          # LeetCode's problem list (numbers, premium flags)
 python3 hugo/scripts/import_leetcode.py /tmp/lc
 python3 hugo/scripts/fetch_company_logos.py   # logos for new companies (add their domain first)
 ```

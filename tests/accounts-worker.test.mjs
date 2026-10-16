@@ -2,16 +2,16 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
-import { handleAccounts, ACCOUNT_SITE as SITE, OAUTH_CALLBACK, SNAPSHOT_MAX_BYTES } from '../worker/ask-ai/src/accounts.js';
-import worker from '../worker/ask-ai/src/index.js';
+import { handleAccounts, ACCOUNT_SITE as SITE, OAUTH_CALLBACK, SNAPSHOT_MAX_BYTES } from '../worker/compilenrun-worker/src/accounts.js';
+import worker from '../worker/compilenrun-worker/src/index.js';
 
 class D1 {
   constructor() {
     this.sqlite = new DatabaseSync(':memory:');
-    this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/accounts-schema.sql', import.meta.url), 'utf8'));
-    this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/schema.sql', import.meta.url), 'utf8'));
-    this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/accounts-email-schema.sql', import.meta.url), 'utf8'));
-    this.sqlite.exec(readFileSync(new URL('../worker/ask-ai/accounts-google-profile-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-email-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-google-profile-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -365,10 +365,10 @@ test('pending Google email can be replaced or canceled, and abandoned reservatio
 test('v2 migration preserves legacy users/sessions/snapshots/votes and never relinks after reapplication', () => {
   const legacy = new DatabaseSync(':memory:');
   try {
-    legacy.exec(readFileSync(new URL('../worker/ask-ai/accounts-schema.sql', import.meta.url), 'utf8'));
-    legacy.exec(readFileSync(new URL('../worker/ask-ai/schema.sql', import.meta.url), 'utf8'));
+    legacy.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-schema.sql', import.meta.url), 'utf8'));
+    legacy.exec(readFileSync(new URL('../worker/compilenrun-worker/schema.sql', import.meta.url), 'utf8'));
     legacy.exec("INSERT INTO cnr_account_users VALUES ('legacy-id','legacy-google','Kept name',1,1); INSERT INTO cnr_account_sessions VALUES ('hash','legacy-id',1,9999999999); INSERT INTO cnr_account_learning VALUES ('legacy-id',3,'{}',1); INSERT INTO votes VALUES ('/docs/a/','voter',1,NULL,'before','before');");
-    const migration = readFileSync(new URL('../worker/ask-ai/accounts-email-schema.sql', import.meta.url), 'utf8');
+    const migration = readFileSync(new URL('../worker/compilenrun-worker/accounts-email-schema.sql', import.meta.url), 'utf8');
     legacy.exec(migration);
     assert.equal(legacy.prepare('SELECT user_id FROM cnr_account_google_identities').get().user_id, 'legacy-id');
     assert.equal(legacy.prepare('SELECT user_id FROM cnr_account_legacy_google_migrations').get().user_id, 'legacy-id');
@@ -405,7 +405,7 @@ test('provider redirects are returned for rejection and never followed with cred
   assert.equal(result.headers.get('location'), SITE + '/learn/?auth=error');
   assert.equal(calls, 1);
   assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS count FROM cnr_account_sessions').get().count, 0);
-  const { sendAccountEmail } = await import('../worker/ask-ai/src/email.js');
+  const { sendAccountEmail } = await import('../worker/compilenrun-worker/src/email.js');
   await assert.rejects(sendAccountEmail({ BREVO_API_KEY: 'test-only', BREVO_SENDER_EMAIL: 'no-reply@compilenrun.com' }, 'test@example.invalid', 'verify', 'A'.repeat(43)), error => error.status === 302);
   assert.equal(calls, 2);
 });
