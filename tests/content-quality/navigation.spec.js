@@ -7,21 +7,27 @@ test.beforeEach(async ({ context }) => {
 });
 
 const categories = ['Fundamentals', 'Languages', 'Web', 'Data & AI', 'DevOps & Systems', 'Mobile & IoT'];
-for (const width of [1024, 1200, 1280, 1440]) {
+for (const width of [997, 1024, 1100, 1200, 1280, 1440]) {
   test(`six category menus fit ${width}px without losing course links`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await page.route('**/api/auth/session', route => route.fulfill({ json: { configured: true, providers: { google: true, email: true }, user: null } }));
     await page.goto('/learn/');
     const nav = page.locator('[data-navbar]');
     await expect(nav.locator('[data-navbar-toggle]')).not.toBeVisible();
-    expect((await nav.locator('[data-browse-toggle]').allTextContents()).map(label => label.trim())).toEqual(categories);
+    const categoryToggles = nav.locator('.cnr-nav-categories [data-browse-toggle]');
+    expect((await categoryToggles.allTextContents()).map(label => label.trim())).toEqual(categories);
+    // The brand stays intact and the categories start right after it, on the left.
+    await expect(nav.locator('.navbar__inner .navbar__title')).toBeVisible();
+    const brand = await nav.locator('.navbar__inner .navbar__brand').boundingBox(), first = await categoryToggles.first().boundingBox();
+    expect(first.x - (brand.x + brand.width)).toBeLessThan(32);
+    expect(Math.abs(first.y - brand.y) < brand.height).toBe(true);
     for (const control of await nav.locator('.navbar__inner a:visible, [data-browse-toggle]').all()) {
       const rect = await control.boundingBox();
       expect(rect.x).toBeGreaterThanOrEqual(0);
       expect(rect.x + rect.width).toBeLessThanOrEqual(width);
     }
     let courseLinks = 0;
-    for (const menu of await nav.locator('[data-tutorial-browse]').all()) {
+    for (const menu of await nav.locator('.cnr-nav-categories [data-tutorial-browse]').all()) {
       const toggle = menu.locator('[data-browse-toggle]');
       await toggle.click();
       const panel = menu.locator('[data-browse-panel]');
@@ -36,15 +42,26 @@ for (const width of [1024, 1200, 1280, 1440]) {
       await expect(toggle).toBeFocused();
     }
     expect(courseLinks).toBe(80);
-    await nav.locator('[data-browse-toggle]').nth(3).click();
+    await categoryToggles.nth(3).click();
     await expect(nav.locator('[data-tutorial-browse][open]')).toContainText('Databases');
-    await nav.locator('[data-browse-toggle]').nth(4).click();
+    await categoryToggles.nth(4).click();
     await expect(nav.locator('[data-tutorial-browse][open]')).toHaveCount(1);
     for (const group of ['DevOps', 'Observability', 'Middleware', 'Linux']) {
       await expect(nav.locator('[data-tutorial-browse][open] h3').filter({ hasText: group })).toBeVisible();
     }
     await page.mouse.click(2, 240);
     await expect(nav.locator('[data-tutorial-browse][open]')).toHaveCount(0);
+    // Roadmap, Playground and My learning are folded into one Learn menu; Forum stays one click away.
+    await nav.locator('#cnr-learn-toggle').click();
+    const learn = nav.locator('#cnr-learn-panel');
+    for (const href of ['/roadmap/', '/playground/', '/learn/']) await expect(learn.locator(`a[href="${href}"]`)).toBeVisible();
+    const learnBox = await learn.boundingBox();
+    expect(learnBox.x + learnBox.width).toBeLessThanOrEqual(width);
+    const forumVisible = await nav.locator('.cnr-nav__forum').isVisible();
+    if (!forumVisible) await expect(learn.locator('a[href="https://forum.compilenrun.com/"]')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(learn).not.toBeVisible();
+    await expect(nav.locator('.navbar__inner > .navbar__items--right > .cnr-nav__link[href="/roadmap/"]')).toHaveCount(0);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   });
 }
@@ -77,7 +94,7 @@ test('learning dashboard keeps personal notes away from analytics and advert scr
   expect(sources.some(src => /clarity|umami|googletagmanager|googlesyndication/.test(src))).toBe(false);
 });
 
-test('profile renders email forms and reset links stay out of request URLs', async ({ page }) => {
+test('profile uses the header popup for sign-in and reset links stay out of request URLs', async ({ page }) => {
   const apiCalls = [];
   await page.route('**/api/auth/**', route => {
     const request = route.request(); apiCalls.push({ url: request.url(), method: request.method() });
@@ -86,7 +103,9 @@ test('profile renders email forms and reset links stay out of request URLs', asy
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/profile/#reset=' + 'A'.repeat(43));
   await expect(page.locator('[data-profile-reset]')).toBeVisible();
-  await expect(page.locator('[data-profile-form="login"]')).toBeVisible();
+  await expect(page.locator('[data-profile-guest] [data-auth-open]')).toBeVisible();
+  await expect(page.locator('[data-profile-form="login"], [data-profile-form="register"]')).toHaveCount(0);
+  await expect(page.locator('form[data-auth-form="login"]')).toHaveCount(1);
   expect(new URL(page.url()).hash).toBe('');
   expect(apiCalls.every(call => call.method === 'GET' && !call.url.includes('reset='))).toBe(true);
   await expect(page.locator('meta[name="referrer"]')).toHaveAttribute('content', 'no-referrer');

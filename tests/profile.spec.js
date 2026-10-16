@@ -65,33 +65,36 @@ async function setup(t, account = model(), suffix = '') {
 }
 async function idle(page) { await page.waitForFunction(() => document.querySelector('[data-profile]').getAttribute('aria-busy') === 'false' && !new URLSearchParams(location.hash.slice(1)).has('verify') && !new URLSearchParams(location.hash.slice(1)).has('reset')); }
 async function fill(form, fields) { for (const [key, value] of Object.entries(fields)) await form.locator(`[name="${key}"]`).fill(value); }
+async function signInFromPopup(page, account, signedIn) {
+  // The navbar popup (auth-ui.js) owns sign-in and announces the new session to the profile.
+  account.user = signedIn; const session = { configured: true, providers: account.providers, user: signedIn, csrfToken: account.csrfToken };
+  await page.evaluate(detail => dispatchEvent(new CustomEvent('cnr:auth-changed', { detail })), { session }); await idle(page);
+}
 async function submit(page, kind, fields) { const form = page.locator(`[data-profile-form="${kind}"]`); await fill(form, fields); await form.locator('button[type=submit]').click(); await idle(page); return form; }
 
-test('registration, explicit password-confirmed email verification, and email login work without persisting credentials', async t => {
+test('guests get the shared popup trigger instead of a second sign-in form; mail verification stays on the profile', async t => {
   const { page, account } = await setup(t);
-  await page.getByText('Create an email account', { exact: true }).click();
-  const register = await submit(page, 'register', { name: 'Alex Learner', email: EMAIL, password: PASSWORD, confirm: PASSWORD });
-  assert.match(await register.locator('[data-profile-message]').innerText(), /If this address can be registered/); assert.equal(account.user, null); assert.equal(account.pending.password, PASSWORD); assert.equal(await register.locator('[name=password]').inputValue(), '');
+  assert.equal(await page.locator('[data-profile-guest]').isVisible(), true); assert.equal(await page.locator('[data-profile-guest] [data-auth-open]').isVisible(), true);
+  assert.equal(await page.locator('[data-profile-guest] form, [data-profile-guest] input').count(), 0); assert.equal(await page.locator('[data-profile-form=login], [data-profile-form=register], [data-profile-form=forgot]').count(), 0);
+  account.pending = { email: EMAIL, password: PASSWORD, name: 'Alex Learner' };
   await page.goto(origin + '/profile/#verify=' + VERIFY); await idle(page);
   assert.equal(page.url(), origin + '/profile/'); assert.equal(account.calls.filter(c => c.pathname === '/api/auth/verify-email').length, 0);
   await submit(page, 'verify', { password: PASSWORD }); assert.match(await page.locator('[data-profile-status]').innerText(), /Email verified/);
-  await submit(page, 'login', { email: EMAIL, password: PASSWORD }); assert.equal(await page.locator('[data-profile-name]').innerText(), 'Alex Learner');
+  await signInFromPopup(page, account, user({ name: 'Alex Learner' })); assert.equal(await page.locator('[data-profile-name]').innerText(), 'Alex Learner'); assert.equal(await page.locator('[data-profile-guest]').isVisible(), false);
   const stored = await page.evaluate(() => JSON.stringify({ ...localStorage })); assert.equal(stored.includes(PASSWORD), false); assert.equal(stored.includes(VERIFY), false); assert.equal(stored.includes('profile-csrf'), false);
-  assert(account.calls.every(c => !c.url.includes(VERIFY))); assert.equal(account.calls.find(c => c.pathname === '/api/auth/register').headers.origin, origin);
+  assert(account.calls.every(c => !c.url.includes(VERIFY))); assert.equal(account.calls.find(c => c.pathname === '/api/auth/verify-email').headers.origin, origin);
 });
 
-test('forgot and resend responses are generic; reset link is consumed only on submission', async t => {
+test('reset link is consumed only on submission', async t => {
   const { page, account } = await setup(t);
-  await page.getByText('Forgot your password?', { exact: true }).click(); const forgot = await submit(page, 'forgot', { email: 'not-known@example.test' }); assert.match(await forgot.locator('[data-profile-message]').innerText(), /If this address has an eligible account/);
-  await page.getByText('Need another verification email?', { exact: true }).click(); const resend = await submit(page, 'resend', { email: EMAIL }); assert.match(await resend.locator('[data-profile-message]').innerText(), /If this address needs verification/);
   await page.goto(origin + '/profile/#reset=' + RESET); await idle(page); assert.equal(page.url(), origin + '/profile/'); assert.equal(account.calls.filter(c => c.pathname === '/api/auth/reset-password').length, 0);
   const next = 'another sufficiently long password'; await submit(page, 'reset', { password: next, confirm: next }); assert.equal(account.credential.password, next); assert.match(await page.locator('[data-profile-status]').innerText(), /Password reset/); assert.equal(await page.locator('[data-profile-reset]').isVisible(), false);
 });
 
 test('password validation counts Unicode codepoints and keeps spaces', async t => {
-  const { page, account } = await setup(t); await page.getByText('Create an email account', { exact: true }).click();
-  const short = '🌱'.repeat(14); let form = await submit(page, 'register', { name: 'Alex', email: EMAIL, password: short, confirm: short }); assert.match(await form.locator('[data-profile-message]').innerText(), /15–128/); assert.equal(account.calls.filter(c => c.pathname === '/api/auth/register').length, 0);
-  const valid = ' 🌱'.repeat(15) + ' '; await submit(page, 'register', { password: valid, confirm: valid }); assert.equal(account.pending.password, valid);
+  const { page, account } = await setup(t, model(), '#reset=' + RESET);
+  const short = '🌱'.repeat(14); let form = await submit(page, 'reset', { password: short, confirm: short }); assert.match(await form.locator('[data-profile-message]').innerText(), /15–128/); assert.equal(account.calls.filter(c => c.pathname === '/api/auth/reset-password').length, 0);
+  const valid = ' 🌱'.repeat(15) + ' '; await submit(page, 'reset', { password: valid, confirm: valid }); assert.equal(account.credential.password, valid);
 });
 
 test('display-name and password changes use current identity and CSRF', async t => {
@@ -107,7 +110,7 @@ test('Google-only accounts can enroll and resend a pending email without signing
   assert.equal(await page.locator('[data-profile-unlink-google]').isDisabled(), true);
   await submit(page, 'enroll', { email: EMAIL, password: PASSWORD, confirm: PASSWORD }); assert.equal(account.pending.email, EMAIL); assert.equal(account.user.googleLinked, true);
   await page.getByText('Resend email verification', { exact: true }).click(); const resend = await submit(page, 'resend-member', { email: EMAIL }); assert.match(await resend.locator('[data-profile-message]').innerText(), /If this address needs verification/); assert(account.user);
-  await page.goto(origin + '/profile/#verify=' + VERIFY); await idle(page); await submit(page, 'verify', { password: PASSWORD }); assert.equal(account.user, null); await submit(page, 'login', { email: EMAIL, password: PASSWORD }); assert.equal(account.user.emailVerified, true); assert.equal(account.user.hasPassword, true); assert.equal(account.user.googleLinked, true); assert.equal(await page.locator('[data-profile-unlink-google]').isDisabled(), false);
+  await page.goto(origin + '/profile/#verify=' + VERIFY); await idle(page); await submit(page, 'verify', { password: PASSWORD }); assert.equal(account.user, null); await signInFromPopup(page, account, user({ googleLinked: true })); assert.equal(account.user.emailVerified, true); assert.equal(account.user.hasPassword, true); assert.equal(account.user.googleLinked, true); assert.equal(await page.locator('[data-profile-unlink-google]').isDisabled(), false);
 });
 
 test('Google linking uses an authenticated explicit request and a restricted navigation destination', async t => {
@@ -129,19 +132,18 @@ test('a changed account cannot receive settings intended for the previous identi
 });
 
 test('unavailable providers and network failures leave local learning untouched', async t => {
-  const a = model(); a.providers.email = false; const { page, account } = await setup(t, a); assert.equal(await page.locator('[data-profile-email-methods]').isVisible(), false); assert.equal(await page.locator('[data-profile-google]').isVisible(), true);
-  account.offline = true; await page.locator('[data-profile-refresh]').click(); await idle(page); assert.match(await page.locator('[data-profile-status]').innerText(), /Could not reach/); assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('cnr_progress'))), LOCAL);
+  const a = model(); a.providers.email = false; const { page, account } = await setup(t, a); assert.equal(await page.locator('[data-profile-guest] [data-auth-open]').isVisible(), true); assert.equal(await page.locator('[data-profile-refresh]').isVisible(), false);
+  account.offline = true; await page.reload(); await idle(page); assert.match(await page.locator('[data-profile-status]').innerText(), /Could not reach/); assert.equal(await page.locator('[data-profile-refresh]').isVisible(), true); assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('cnr_progress'))), LOCAL);
 });
 
 test('logout and confirmed deletion retain browser learning', async t => {
   const a = model(); a.user = user(); const { page, account } = await setup(t, a);
   await page.locator('[data-profile-logout]').click(); await idle(page); assert.equal(account.user, null);
-  account.user = user(); await page.locator('[data-profile-refresh]').click(); await idle(page); await page.getByText('Delete account', { exact: true }).click(); page.once('dialog', d => d.accept()); await page.locator('[data-profile-delete]').click(); await idle(page); assert.equal(account.user, null); assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('cnr_progress'))), LOCAL);
+  await signInFromPopup(page, account, user()); await page.getByText('Delete account', { exact: true }).click(); page.once('dialog', d => d.accept()); await page.locator('[data-profile-delete]').click(); await idle(page); assert.equal(account.user, null); assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('cnr_progress'))), LOCAL);
 });
 
 test('malformed email fragments are removed without submission and profile forms remain responsive', async t => {
   const { page, account } = await setup(t, model(), '#reset=invalid&verify=' + VERIFY); assert.equal(page.url(), origin + '/profile/'); assert.match(await page.locator('[data-profile-status]').innerText(), /link is invalid/); assert.equal(account.calls.filter(c => c.method !== 'GET').length, 0);
-  await page.getByText('Create an email account', { exact: true }).click();
   for (const width of [320, 768, 1440]) { await page.setViewportSize({ width, height: 900 }); await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; document.documentElement.dataset.theme = 'dark'; }); assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), `overflow ${width}`); }
 });
 

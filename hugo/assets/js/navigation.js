@@ -42,11 +42,11 @@
       menus.filter(other => other !== menu && other.open).forEach(other => closeMenu(other, false));
       positionPanel();
     });
-    menu.querySelector('[data-browse-close]').addEventListener('click', () => closeMenu(menu, true));
+    menu.querySelector('[data-browse-close]')?.addEventListener('click', () => closeMenu(menu, true));
     toggle.addEventListener('keydown', event => {
       if (event.key === 'ArrowDown') {
         event.preventDefault(); closeBrowse(); menu.open = true; toggle.setAttribute('aria-expanded', 'true'); positionPanel();
-        menu.querySelector('.cnr-nav-browse__group a')?.focus();
+        menu.querySelector('[data-browse-panel] li a')?.focus();
       }
     });
   });

@@ -6,7 +6,7 @@
   var session = null, busy = false, verifyToken = '', resetToken = '', badLink = false, pendingEmail = '';
   var status = root.querySelector('[data-profile-status]');
   var forms = Array.from(root.querySelectorAll('[data-profile-form]'));
-  var externalAuthPending = false, navigating = false;
+  var externalAuthPending = false, navigating = false, connected = false;
   async function beforeAuthAction(action) {
     if (!window.CNRAuth) return;
     externalAuthPending = true; var waits = [];
@@ -57,12 +57,10 @@
     root.setAttribute('aria-busy', String(busy));
     root.querySelector('[data-profile-guest]').hidden = !ready || !!user;
     root.querySelector('[data-profile-member]').hidden = !user;
-    root.querySelector('[data-profile-google]').hidden = !google;
-    root.querySelector('[data-profile-email-methods]').hidden = !email;
-    root.querySelector('[data-profile-email-unavailable]').hidden = email;
     root.querySelector('[data-profile-verify]').hidden = !verifyToken;
     root.querySelector('[data-profile-reset]').hidden = !resetToken;
     root.querySelector('[data-profile-refresh]').disabled = busy;
+    root.querySelector('[data-profile-refresh-row]').hidden = !connected || ready;
     forms.forEach(function (form) {
       var kind = form.getAttribute('data-profile-form'), memberForm = ['name', 'password', 'enroll'].indexOf(kind) >= 0;
       var allowed = kind === 'name' ? !!user : email && (memberForm ? !!user : ready);
@@ -160,7 +158,7 @@
     ['name', 'email', 'password', 'currentPassword', 'newPassword', 'confirm'].forEach(function (key) { if (data.has(key)) payload[key] = String(data.get(key)); });
     if (payload.name !== undefined) { payload.name = payload.name.trim(); if (!payload.name || payload.name.length > 100) throw error('Enter a display name of up to 100 characters.', 'name_length'); }
     if (payload.email !== undefined) payload.email = payload.email.trim();
-    if (['register', 'reset', 'enroll'].indexOf(kind) >= 0) password(payload.password, 'password');
+    if (['reset', 'enroll'].indexOf(kind) >= 0) password(payload.password, 'password');
     if (kind === 'password') password(payload.newPassword, 'newPassword');
     if (payload.confirm !== undefined && payload.confirm !== (payload.newPassword === undefined ? payload.password : payload.newPassword)) { var e = error('The two passwords do not match.', 'password_mismatch'); e.field = 'confirm'; throw e; }
     return payload;
@@ -171,14 +169,9 @@
       var fields; try { fields = capture(form); } catch (e) { say(e.message, form); if (e.field && form.elements[e.field]) form.elements[e.field].focus(); return; }
       var kind = form.getAttribute('data-profile-form'), selectedToken = kind === 'verify' ? verifyToken : resetToken;
       run(async function () {
-        if (kind === 'register') {
-          await request('/api/auth/register', 'POST', { email: fields.email, password: fields.password, name: fields.name }); clearPasswords(form);
-          say('If this address can be registered, a verification email will arrive shortly. Keep the password you chose: you will enter it when verifying your email.', form);
-        } else if (kind === 'login') {
-          await request('/api/auth/login', 'POST', { email: fields.email, password: fields.password }); clearPasswords(form); await refresh(true); say('Signed in. You can manage your account here or continue learning with automatic progress saving.');
-        } else if (kind === 'forgot' || kind === 'resend' || kind === 'resend-member') {
-          await request(kind === 'forgot' ? '/api/auth/forgot-password' : '/api/auth/resend-verification', 'POST', { email: fields.email });
-          say(kind === 'forgot' ? 'If this address has an eligible account, a password reset email will arrive shortly.' : 'If this address needs verification, a verification email will arrive shortly.', form);
+        if (kind === 'resend-member') {
+          await request('/api/auth/resend-verification', 'POST', { email: fields.email });
+          say('If this address needs verification, a verification email will arrive shortly.', form);
         } else if (kind === 'verify') {
           if (!selectedToken) throw error('Open a fresh verification link from your email.', 'invalid_token');
           await request('/api/auth/verify-email', 'POST', { token: selectedToken, password: fields.password }); if (verifyToken === selectedToken) verifyToken = ''; clearPasswords(form); await refresh(true); say('Email verified. You can now use that email and password to sign in.');
@@ -218,14 +211,14 @@
     run(async function () { await sameAccount(); await request('/api/auth/account', 'DELETE', {}, true); clearPasswords(); await refresh(true); say('Your account was deleted. Browser learning was not erased.'); });
   });
   async function connect() {
-    await refresh(true);
+    try { await refresh(true); } finally { connected = true; }
     if (badLink) say('This email link is invalid. Request a new verification or reset email.');
     else if (!session.configured) say('Account sign-in is unavailable right now. You can continue learning and keep local backups from the dashboard.');
     else if (verifyToken) say('Your verification link is ready. Enter the password you chose and select Verify email.');
     else if (resetToken) say('Your reset link is ready. Choose a new password to continue.');
     else if (new URLSearchParams(location.search).get('auth') === 'linked') say('The Google linking flow finished. Review the sign-in methods below to confirm the linked status.');
     else if (new URLSearchParams(location.search).get('auth') === 'error') say('Google sign-in or linking did not finish. Your existing account settings were not changed.');
-    else say(session.user ? 'Your profile is ready. Your learning progress syncs automatically while signed in.' : 'Choose Google or email to sign in. You can also keep learning without an account.');
+    else say('');
   }
   root.querySelector('[data-profile-refresh]').addEventListener('click', function () { run(connect); });
   window.addEventListener('hashchange', function () {
@@ -233,6 +226,11 @@
     if (badLink) say('This email link is invalid. Request a new verification or reset email.');
     else if (verifyToken) say('Your verification link is ready. Enter the password you chose and select Verify email.');
     else if (resetToken) say('Your reset link is ready. Choose a new password to continue.');
+  });
+  // The navbar popup owns sign-in; reflect its result here without reloading.
+  window.addEventListener('cnr:auth-changed', function (event) {
+    if (busy || !event.detail || !event.detail.session) return;
+    try { accept(event.detail.session, true); say(session.user ? '' : 'Signed out. Learning saved in this browser is still here.'); } catch (ignored) {}
   });
   render(); run(connect);
 })();

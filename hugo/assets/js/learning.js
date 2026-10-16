@@ -533,7 +533,7 @@
       });
     }
     var recent = root.querySelector('[data-learning-courses]');
-    if (recent) { recent.replaceChildren(); recentCourses().slice(0, 12).forEach(function (entry) { recent.appendChild(courseCard(entry)); }); if (!recent.children.length) { var p = el('p', 'Your recent courses will appear after you visit a lesson. '); p.appendChild(link('Explore the learning roadmap', '/roadmap/')); recent.appendChild(p); } }
+    if (recent) { recent.replaceChildren(); recentCourses().slice(0, 12).forEach(function (entry) { recent.appendChild(courseCard(entry)); }); if (!recent.children.length) { recent.appendChild(el('p', 'Your recent courses will appear here after you open a lesson.')); } }
     var saved = root.querySelector('[data-learning-bookmarks]');
     if (saved) {
       saved.replaceChildren(); records.filter(function (p) { var b = state.learning.lessons[p].bookmark; return b && b.value; }).sort(function (a, b) { return state.learning.lessons[b].bookmark.updatedAt - state.learning.lessons[a].bookmark.updatedAt; }).forEach(function (p) {
