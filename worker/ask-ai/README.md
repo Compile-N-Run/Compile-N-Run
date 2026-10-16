@@ -148,6 +148,6 @@ Brevo delivery is deferred through `ctx.waitUntil` so public registration/recove
 
 References: [OWASP password storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html), [OWASP password recovery](https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html), [Cloudflare native crypto support](https://developers.cloudflare.com/workers/runtime-apis/nodejs/crypto/), and [Brevo transactional email](https://developers.brevo.com/reference/send-transac-email).
 
-Automatic Worker invocation logs are disabled because callback URLs carry short-lived OAuth codes. Explicit operational warnings remain enabled and omit recipients, passwords, tokens, and provider responses. Avoid recording raw auth request URLs or headers when diagnosing a live login.
+Observability (invocation logs, traces, full sampling, persisted) is enabled and mirrors the dashboard settings in `wrangler.jsonc`. Invocation logs include query strings, so the OAuth callback's short-lived `state`/`code` parameters appear in logs: codes are single-use and exchanged immediately, but treat log access as sensitive. Explicit operational warnings omit recipients, passwords, tokens, and provider responses.
 
 Provider requests use `redirect: "manual"` and reject redirects through explicit status checks. The deployed Workers runtime rejects `redirect: "error"`; do not replace manual handling with redirect following, which could forward provider credentials.
