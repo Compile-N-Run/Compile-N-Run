@@ -3,6 +3,8 @@ from typing import *  # noqa: F401,F403
 import collections, heapq, bisect, itertools, functools, math  # noqa: F401,E401
 from collections import defaultdict, deque, Counter, OrderedDict  # noqa: F401
 from functools import lru_cache, cache  # noqa: F401
+import sys
+sys.setrecursionlimit(10000)  # LeetCode allows deep recursion (chains of thousands of nodes); CPython's default 1000 does not
 
 
 class ListNode:
