@@ -63,7 +63,7 @@ test('one shared discovery, native dialog focus, provider switches, and safe for
  await open(page);assert.equal(account.calls.length,1);assert.equal(await page.locator('[data-auth-google]').getAttribute('href'),'/api/auth/google');assert.equal(await page.locator('[data-auth-github]').getAttribute('href'),'/api/auth/github');assert.equal(await page.locator('[data-auth-github]').isVisible(),true);
  for(const form of await page.locator('[data-auth-form]').all())assert.equal(await form.getAttribute('method'),'post');
  await page.locator('[data-auth-form="login"] [name="password"]').fill('not persisted');await page.keyboard.press('Escape');
- assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false);await page.waitForFunction(()=>document.querySelector('[data-auth-open]')===document.activeElement);assert.equal(await page.locator('[name="password"]').first().inputValue(),'');
+ assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false);await page.waitForFunction(()=>document.querySelector('[data-auth-open]')===document.activeElement);await page.waitForFunction(()=>document.querySelector('[name="password"]').value===''); // cleared in the asynchronous close event
  assert.deepEqual(await page.evaluate(()=>Object.keys(localStorage)),[]);assert.deepEqual(errors,[]);
 });
 
