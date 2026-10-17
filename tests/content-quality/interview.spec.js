@@ -83,11 +83,20 @@ test('problem page is a workspace: tabbed write-up on the left, a highlighted ed
   const workspace = page.locator('[data-iv-workspace]');
   await expect(workspace).toBeVisible();
   await expect(page.locator('[data-iv-body] h2#solutions')).toHaveCount(0); // the code lives in the editor now
-  await expect(page.locator('[data-iv-pane-tab]')).toHaveText(['Problem', 'Solution', 'Companies']);
+  await expect(page.locator('[data-iv-pane-tab]')).toHaveText(['Problem', 'Solution', 'Companies', 'Notes']);
   await expect(page.locator('[data-iv-body] h2#key-idea')).toBeHidden();
   await page.locator('[data-iv-pane-tab="solution"]').click();
-  await expect(page.locator('[data-iv-body] h2#key-idea')).toBeVisible();
   await expect(page.locator('[data-iv-body] h2#problem')).toBeHidden();
+  await expect(page.locator('[data-iv-body] h2#key-idea')).toBeHidden(); // a hint ladder: nothing is revealed yet
+  await page.locator('.cnr-iv-hints__reveal:visible').click();
+  await expect(page.locator('[data-iv-body] h2#key-idea')).toBeVisible();
+  await expect(page.locator('[data-iv-body] h2#approach')).toBeHidden();
+  await page.locator('.cnr-iv-hints__reveal:visible').click();
+  await expect(page.locator('[data-iv-body] h2#approach')).toBeVisible();
+  await expect(page.locator('[data-iv-body] h2#complexity')).toBeHidden();
+  await page.locator('.cnr-iv-hints__reveal:visible').click();
+  await expect(page.locator('[data-iv-body] h2#complexity')).toBeVisible();
+  await expect(page.locator('.cnr-iv-hints__reveal')).toHaveCount(0);
   await page.locator('[data-iv-pane-tab="companies"]').click();
   await expect(page.locator('[data-iv-chips] a').first()).toBeVisible();
   await expect(page.locator('[data-iv-chips] a').first()).toHaveAttribute('href', /^\/interview\/company\//);
@@ -107,24 +116,45 @@ test('problem page is a workspace: tabbed write-up on the left, a highlighted ed
   await expect(workspace.locator('.cnr-iv-ws__cases-code .cm-content')).toContainText('check('); // test cases shown
   await tabs.nth(1).click();
   expect(await doc()).toMatch(/var twoSum = function \(nums, target\) \{/);
-  await workspace.locator('.cnr-iv-ws__btn--primary').click(); // Run executes the test cases on the reference solution
+  await workspace.locator('.cnr-iv-ws__run').click(); // Run executes the test cases on the reference solution
   await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText(/All tests passed \(\d+ of \d+ checks\)/);
   expect(await workspace.locator('.cnr-iv-ws__case--pass').count()).toBeGreaterThan(5);
   await expect(workspace.locator('.cnr-iv-ws__case--fail')).toHaveCount(0);
+  await expect(workspace.locator('.cnr-iv-ws__stats')).toContainText(/Time: [\d.]+ (ms|s)/); // timing feedback
+  await expect(workspace.locator('.cnr-iv-ws__case-ms').first()).toContainText(/ms|s/);
+  // Test cases are editable: add a case of our own and it is reported with the rest.
+  await workspace.locator('.cnr-iv-ws__panel-tab').first().click();
+  await page.locator('.cnr-iv-ws__cases-code .cm-content').click();
+  await page.keyboard.press('Control+End');
+  await page.keyboard.insertText('\ncheck(twoSum([1, 2], 3), [9, 9], "my own case");\n');
+  await workspace.locator('.cnr-iv-ws__run').click();
+  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('Some tests failed');
+  await expect(workspace.locator('.cnr-iv-ws__case--fail .cnr-iv-ws__case-label')).toHaveText('my own case');
+  await workspace.locator('.cnr-iv-ws__panel-tab').first().click();
+  await workspace.locator('.cnr-iv-ws__cases-note .cnr-iv-ws__link').click(); // Reset cases
+  await expect(page.locator('.cnr-iv-ws__cases-code .cm-content')).not.toContainText('my own case');
+  await workspace.locator('.cnr-iv-ws__run').click();
+  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('All tests passed');
   await page.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
   await workspace.locator('.cnr-iv-ws__verdict button:has-text("Mark as solved")').click();
   await expect(page.locator('[data-iv-solve-toggle]')).toHaveAttribute('aria-pressed', 'true');
+  // Notes on the problem go to the learning store and show on the dashboard.
+  await page.locator('[data-iv-pane-tab="notes"]').click();
+  await page.locator('.cnr-iv-notes__field').fill('Check before storing, or the same index is used twice.');
+  await page.locator('.cnr-iv-notes button:has-text("Save note")').click();
+  await expect(page.locator('.cnr-iv-notes__status')).toHaveText('Saved.');
+  await page.locator('[data-iv-pane-tab="problem"]').click();
   await workspace.locator('summary:has-text("Reset")').click();
   await workspace.locator('.cnr-iv-ws__menu-item:has-text("Starter code")').click();
   expect(await doc()).toMatch(/^var twoSum = function \(nums, target\) \{\s*\/\/ your code here/);
-  await workspace.locator('.cnr-iv-ws__btn--primary').click();
+  await workspace.locator('.cnr-iv-ws__run').click();
   await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText(/stopped with an error|Some tests failed/); // the stub returns nothing
   await expect(workspace.locator('.cnr-iv-ws__io-title').last()).toHaveText('Errors');
   await expect(workspace.locator('.cnr-iv-ws__err')).toContainText('TypeError');
   await page.locator('.cnr-iv-ws__editor .cm-content').click();
   await page.keyboard.press('Control+a');
   await page.keyboard.insertText('var twoSum = function (nums, target) { return [0, 1]; };');
-  await workspace.locator('.cnr-iv-ws__btn--primary').click();
+  await workspace.locator('.cnr-iv-ws__run').click();
   await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText(/Some tests failed: \d+ of \d+ checks passed/);
   const failed = workspace.locator('.cnr-iv-ws__case--fail').first();
   await expect(failed.locator('dt')).toHaveText(['Expected', 'Actual']); // each failing check shows both values
@@ -135,11 +165,45 @@ test('problem page is a workspace: tabbed write-up on the left, a highlighted ed
   await expect(workspace.locator('[role=tab][aria-selected=true].cnr-iv-ws__lang')).toHaveText('JavaScript'); // remembered
   await expect(page.locator('.cnr-iv-ws--cm .cnr-iv-ws__editor .cm-editor')).toBeVisible({ timeout: 30000 });
   expect(await doc()).toMatch(/return \[0, 1\]/); // the draft survives a reload
+  await expect.poll(() => page.evaluate(() => window.CNRLearning.readDiskSnapshot().learning.lessons['/interview/problems/two-sum/']?.note?.text || '')).toContain('Check before storing');
+  await page.goto('/learn/');
+  await expect(page.locator('[data-learning-notes]')).toContainText('Check before storing');
+  await expect(page.locator('[data-learning-notes]')).toContainText('1. Two Sum');
+  await page.goto('/interview/problems/two-sum/');
+  await expect(page.locator('.cnr-iv-ws--cm .cnr-iv-ws__editor .cm-editor')).toBeVisible({ timeout: 30000 });
   await page.setViewportSize({ width: 820, height: 900 });
   const narrowText = await page.locator('.cnr-iv-split__text').boundingBox();
   const narrowAside = await workspace.boundingBox();
   expect(narrowAside.y).toBeGreaterThan(narrowText.y + narrowText.height - 1); // stacked on narrow screens
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('study plans track solved problems day by day, on the plan, the directory and the dashboard', async ({ page }) => {
+  await page.goto('/interview/plans/');
+  expect(await page.locator('[data-iv-plan-card]').count()).toBeGreaterThan(10);
+  await page.locator('[data-iv-plan-card="top-75"]').click();
+  await expect(page).toHaveURL(/\/interview\/plans\/top-75\/$/);
+  await expect(page.locator('[data-iv-plan-day]')).toHaveCount(15);
+  await expect(page.locator('[data-iv-plan-problem]')).toHaveCount(75);
+  await page.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
+  await expect(page.locator('[data-iv-plan-today]')).toContainText('Day 1');
+  const day1 = page.locator('[data-iv-plan-day="1"]');
+  await expect(day1).toHaveClass(/cnr-iv-plan__day--today/);
+  for (const toggle of await day1.locator('.cnr-iv-solve-toggle').all()) await toggle.click();
+  await expect(page.locator('[data-iv-plan-solved]')).toHaveText('5');
+  await expect(day1).toHaveClass(/cnr-iv-plan__day--done/);
+  await expect(page.locator('[data-iv-plan-today]')).toContainText('Day 2');
+  await expect(page.locator('[data-iv-plan-day="2"]')).toHaveClass(/cnr-iv-plan__day--today/);
+  await expect.poll(() => page.evaluate(() => Object.keys(window.CNRLearning.readDiskSnapshot().learning.lessons).length)).toBeGreaterThanOrEqual(5);
+  await page.goto('/interview/plans/');
+  await expect(page.locator('[data-iv-plan-card="top-75"] [data-iv-plan-card-progress]')).toHaveText('Your progress: 5 of 75 solved');
+  await expect(page.locator('[data-iv-plan-card="top-150"] [data-iv-plan-card-progress]')).toContainText('5 of 150'); // the same problems count in every plan that has them
+  await page.goto('/learn/');
+  await expect(page.locator('[data-learning-plans]')).toContainText('Top 75 most asked');
+  await expect(page.locator('[data-learning-plans]')).toContainText('5 of 75 solved · Day 2 next:');
+  const planRow = page.locator('[data-learning-plans] li', { hasText: 'Top 75 most asked' });
+  await expect(planRow.locator('a').first()).toHaveAttribute('href', '/interview/plans/top-75/');
+  await expect(planRow.locator('a').last()).toHaveAttribute('href', '/interview/plans/top-75/#day-2');
 });
 
 test('topics directory groups the guides, searches, and a topic page teaches then lists its problems', async ({ page }) => {

@@ -8,6 +8,7 @@ Inputs:  interview/data/leetcode-problems.json  (every LeetCode problem, from im
 Outputs: hugo/data/interview.json                (problems, rankings, companies, topics, for templates)
          hugo/static/interview-index.json        (slug -> [number, difficulty, written], for the learning dashboard)
          hugo/static/interview-runtime.json      (Python/JavaScript test preludes for the in-browser editor)
+         hugo/static/interview-plans.json        (study plans with their problems, for the learning dashboard)
          hugo/content/interview*/...             (stub pages; templates read the data file)
 """
 import json
@@ -27,6 +28,8 @@ CONTENT = os.path.join(ROOT, 'hugo', 'content')
 DATA = os.path.join(ROOT, 'hugo', 'data', 'interview.json')
 INDEX = os.path.join(ROOT, 'hugo', 'static', 'interview-index.json')
 RUNTIME = os.path.join(ROOT, 'hugo', 'static', 'interview-runtime.json')
+PLANS = os.path.join(ROOT, 'hugo', 'static', 'interview-plans.json')
+PER_DAY = 5  # problems per study-plan day
 TESTS = os.path.join(SRC, 'tests')
 GROUPS = [('patterns', 'Patterns and techniques', 'Ways of thinking that solve whole families of problems.'),
           ('structures', 'Data structures', 'The containers the problems are built on and the operations each one makes cheap.'),
@@ -56,6 +59,43 @@ def workspace(slug, body):
                       'javascript': read(tests, 'test.js'), 'java': read(tests, 'Main.java'),
                       'cpp': read(tests, 'test.cpp'), 'go': read(tests, 'test.go')},
             'prelude': {'python': read(tests, 'prelude.py'), 'javascript': read(tests, 'prelude.js')}}
+
+
+def build_plans(order, out_problems, companies, names, topics, guides):
+    """Study plans: fixed-size daily batches drawn from the rankings, so progress can be tracked by solved marks."""
+    plans = []
+
+    def plan(slug, title, blurb, group, slugs, per_day=PER_DAY):
+        slugs = list(dict.fromkeys(slugs))
+        days = [slugs[i:i + per_day] for i in range(0, len(slugs), per_day)]
+        p = {'slug': slug, 'title': title, 'blurb': blurb, 'group': group, 'perDay': per_day, 'days': days,
+             'count': len(slugs), 'written': sum(1 for x in slugs if out_problems[x]['written'])}
+        for level in ('Easy', 'Medium', 'Hard'):
+            p[level.lower()] = sum(1 for x in slugs if out_problems[x]['difficulty'] == level)
+        plans.append(p)
+
+    plan('top-75', 'Top 75 most asked', 'The 75 problems companies ask most, five a day for three weeks. The best general-purpose preparation.',
+         'general', order[:75])
+    plan('top-150', 'Top 150 most asked', 'The 75 above plus the next 75: six weeks of daily practice covering every common pattern.',
+         'general', order[:150])
+    for key, label, blurb in (('patterns', 'Patterns tour', 'Three problems for each technique guide: two pointers, sliding window, binary search, dynamic programming and the rest, in the order the guides are listed.'),
+                              ('structures', 'Data structures tour', 'Three problems for each data-structure guide: arrays, hash tables, stacks, heaps, linked lists, tries and more.'),
+                              ('graphs', 'Trees and graphs tour', 'Three problems for each tree and graph guide: traversals, BFS, DFS, topological sort and shortest paths.')):
+        picks = []
+        for t in topics:
+            if t['group'] == key and t['guide']:
+                picks += t['slugs'][:3]
+        plan(f'{key}-tour', label, blurb, 'topics', picks, 3)
+    by_slug = {c['slug']: c for c in companies}
+    for slug in [c['slug'] for c in sorted(companies, key=lambda c: -c['count'])[:12]]:
+        c = by_slug[slug]
+        top = [x for x, _ in sorted(c['problems'], key=lambda item: (-item[1].get('all', 0), out_problems[item[0]]['rank']))][:100]
+        if len(top) < 20:
+            continue
+        weeks = -(-len(top) // (PER_DAY * 5))
+        plan(f'{slug}-in-{weeks}-weeks', f"{names[slug]} in {weeks} week{'s' if weeks > 1 else ''}",
+             f"{names[slug]}'s {len(top)} most asked problems, five a day on weekdays, most frequent first.", 'company', top)
+    return plans
 
 
 def main():
@@ -140,6 +180,7 @@ def main():
     for name, (fm, _) in guides.items():
         if name not in {t['slug'] for t in topics}:
             sys.exit(f'interview/topics/{name}.md: {fm.get("topic")!r} is not a topic tag in the company data')
+    plans = build_plans(order, out_problems, companies, names, topics, guides)
     by_number = sorted(catalog, key=lambda slug: catalog[slug]['number'])
     counts = {'total': len(catalog), 'premium': sum(1 for p in catalog.values() if p['paid']), 'written': len(written),
               'tagged': len(tagged)}
@@ -152,7 +193,9 @@ def main():
             'names': names, 'logos': sorted(logos), 'problems': out_problems, 'companies': companies,
             'popular': [c['slug'] for c in sorted(companies, key=lambda c: -c['count'])[:12]],
             'writtenCount': len(written), 'topics': topics, 'topicSlugs': topic_slugs,
-            'groups': [{'key': k, 'title': t, 'blurb': b} for k, t, b in GROUPS], 'guideCount': len(guides)}
+            'groups': [{'key': k, 'title': t, 'blurb': b} for k, t, b in GROUPS], 'guideCount': len(guides), 'plans': plans,
+            'planGroups': [{'key': 'general', 'title': 'General practice'}, {'key': 'topics', 'title': 'By technique'},
+                           {'key': 'company', 'title': 'By company'}]}
     with open(DATA, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
     os.makedirs(os.path.dirname(INDEX), exist_ok=True)
@@ -163,6 +206,12 @@ def main():
 
     with open(RUNTIME, 'w', encoding='utf-8') as f:
         json.dump({'v': 1, 'python': read(TESTS, '_prelude', 'prelude.py'), 'javascript': read(TESTS, '_prelude', 'prelude.js')},
+                  f, ensure_ascii=False, separators=(',', ':'))
+
+    with open(PLANS, 'w', encoding='utf-8') as f:
+        json.dump({'v': 1, 'plans': [{'slug': p['slug'], 'title': p['title'], 'perDay': p['perDay'],
+                                      'problems': [[x, out_problems[x]['number'], out_problems[x]['title'], out_problems[x]['difficulty']]
+                                                   for day in p['days'] for x in day]} for p in plans]},
                   f, ensure_ascii=False, separators=(',', ':'))
 
     base = {'type': 'interview'}
@@ -182,6 +231,15 @@ def main():
          'layout': 'topics', 'url': '/interview/topics/',
          'description': f'Learn the techniques behind coding interview questions ({len(guides)} guides, from Two Pointers and '
                         f'Sliding Window to Heaps, Tries and Graphs), then practice the LeetCode problems tagged with each of {len(topics)} topics.'})
+    page(os.path.join(CONTENT, 'interview-plans.md'), {**base, 'title': 'LeetCode Study Plans',
+         'layout': 'plans', 'url': '/interview/plans/',
+         'description': f'{len(plans)} study plans for coding interviews: the most asked problems, a tour of every technique, '
+                        'and company-specific plans, each split into daily batches with progress tracked as you solve.'})
+    for p in plans:
+        page(os.path.join(CONTENT, 'interview-plan', p['slug'] + '.md'), {**base, 'layout': 'plan', 'plan': p['slug'],
+             'title': f"{p['title']}: LeetCode Study Plan", 'url': f"/interview/plans/{p['slug']}/",
+             'description': f"{p['blurb']} {p['count']} problems over {len(p['days'])} days, with explanations and solutions "
+                            'in Python, Java, C++, JavaScript and Go for the ones covered here.'})
     for t in topics:
         guide = guides.get(t['slug'])
         page(os.path.join(CONTENT, 'interview-topic', t['slug'] + '.md'), {**base, 'layout': 'topic', 'topic': t['slug'],
@@ -200,7 +258,7 @@ def main():
              'title': f"{catalog[slug]['number']}. {fm['title']}", 'problem': slug, 'url': f'/interview/problems/{slug}/',
              'description': fm['description'], 'workspace': workspace(slug, body)}, body)
     print(f'interview: {len(companies)} companies, {len(catalog)} problems ({len(tagged)} company-tagged), {len(written)} write-ups, '
-          f'{len(topics)} topics ({len(guides)} guides)')
+          f'{len(topics)} topics ({len(guides)} guides), {len(plans)} study plans')
 
 
 if __name__ == '__main__':

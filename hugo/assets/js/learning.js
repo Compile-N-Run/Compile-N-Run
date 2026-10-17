@@ -386,7 +386,8 @@
     var node = document.createElement(tag); if (value !== undefined && value !== null) node.textContent = value; if (className) node.className = className; return node;
   }
   function link(label, href, className) {
-    var safe = docURL(href, true) || (['/learn/', '/roadmap/', '/playground/'].indexOf(href) >= 0 ? href : null);
+    var safe = docURL(href, true) || (['/learn/', '/roadmap/', '/playground/'].indexOf(href) >= 0 ? href : null) ||
+      (typeof href === 'string' && /^\/interview\/plans\/[a-z0-9]+(-[a-z0-9]+)*\/(#day-\d{1,3})?$/.test(href) ? href : null);
     if (!safe) return el('span', label, className);
     var a = el('a', label, className); a.href = safe; return a;
   }
@@ -546,6 +547,37 @@
       .then(function (value) { problemIndex = value && value.v === 1 && value.problems ? value : null; renderDashboard(); }).catch(function () { problemIndex = null; });
     return problemIndexPromise;
   }
+  // Study plans (interview/plans): progress is derived from solved marks, so a plan "starts" with its first solve.
+  var plansIndex = null, plansPromise = null;
+  function loadPlans() {
+    if (!plansPromise) plansPromise = fetch('/interview-plans.json', { credentials: 'same-origin' }).then(function (r) { if (!r.ok) throw new Error('unavailable'); return r.json(); })
+      .then(function (value) { plansIndex = value && value.v === 1 && Array.isArray(value.plans) ? value : null; renderDashboard(); }).catch(function () { plansIndex = null; });
+    return plansPromise;
+  }
+  function renderPlans(root, solved) {
+    var box = root.querySelector('[data-learning-plans]'); if (!box) return;
+    box.replaceChildren();
+    if (!solved.length) { box.appendChild(el('p', 'Pick a study plan and the problems you solve will be counted here.')); return; }
+    if (!plansIndex) { loadPlans(); box.appendChild(el('p', 'Loading plans…', 'cnr-learning__muted')); return; }
+    var solvedSet = {}; solved.forEach(function (item) { solvedSet[item.slug] = true; });
+    var started = plansIndex.plans.map(function (plan) {
+      var done = plan.problems.filter(function (p) { return solvedSet[p[0]]; }).length, next = null;
+      for (var i = 0; i < plan.problems.length && !next; i++) if (!solvedSet[plan.problems[i][0]]) next = plan.problems[i];
+      return { plan: plan, done: done, next: next, day: next ? Math.floor(plan.problems.indexOf(next) / plan.perDay) + 1 : plan.problems.length / plan.perDay };
+    }).filter(function (item) { return item.done > 0; }).sort(function (a, b) { return b.done / b.plan.problems.length - a.done / a.plan.problems.length; });
+    if (!started.length) { box.appendChild(el('p', 'None of your solved problems is in a study plan yet.')); return; }
+    var list = el('ul', null, 'cnr-learning__plans');
+    started.slice(0, 5).forEach(function (item) {
+      var li = el('li'), total = item.plan.problems.length;
+      li.appendChild(link(item.plan.title, '/interview/plans/' + item.plan.slug + '/'));
+      var bar = document.createElement('progress'); bar.max = total; bar.value = item.done; bar.className = 'cnr-learning__plan-bar'; bar.setAttribute('aria-label', item.done + ' of ' + total + ' solved'); li.appendChild(bar);
+      li.appendChild(el('span', item.done + ' of ' + total + ' solved' + (item.next ? ' · Day ' + item.day + ' next: ' : ' · complete'), 'cnr-learning__muted'));
+      if (item.next) li.appendChild(link(item.next[1] + '. ' + item.next[2], '/interview/plans/' + item.plan.slug + '/#day-' + item.day));
+      list.appendChild(li);
+    });
+    box.appendChild(list);
+  }
+  function noteText(p) { p = path(p); var item = p && state.learning.lessons[p]; return item && item.note && typeof item.note.text === 'string' ? item.note.text : ''; }
   function renderSolved(root, solved) {
     var box = root.querySelector('[data-learning-solved]'), summary = root.querySelector('[data-learning-solved-summary]');
     if (!box) return;
@@ -585,6 +617,7 @@
       });
     }
     renderSolved(root, solved);
+    renderPlans(root, solved);
     var recent = root.querySelector('[data-learning-courses]');
     if (recent) { recent.replaceChildren(); recentCourses().slice(0, 12).forEach(function (entry) { recent.appendChild(courseCard(entry)); }); if (!recent.children.length) { recent.appendChild(el('p', 'Your recent courses will appear here after you open a lesson.')); } }
     var saved = root.querySelector('[data-learning-bookmarks]');
@@ -596,7 +629,7 @@
     }
     var notes = root.querySelector('[data-learning-notes]');
     if (notes) {
-      notes.replaceChildren(); records.filter(function (p) { var item = state.learning.lessons[p]; return item.note && item.note.text || item.noteConflicts && item.noteConflicts.length; }).sort(function (a, b) { return (state.learning.lessons[b].note || {}).updatedAt - (state.learning.lessons[a].note || {}).updatedAt; }).forEach(function (p) {
+      notes.replaceChildren(); Object.keys(state.learning.lessons).filter(function (p) { var item = state.learning.lessons[p]; return item.note && item.note.text || item.noteConflicts && item.noteConflicts.length; }).sort(function (a, b) { return (state.learning.lessons[b].note || {}).updatedAt - (state.learning.lessons[a].note || {}).updatedAt; }).forEach(function (p) {
         var item = state.learning.lessons[p], d = el('details', null, 'cnr-learning__note-card'); d.appendChild(el('summary', item.title)); d.appendChild(el('p', item.note ? item.note.text : '', 'cnr-learning__note-text')); if (item.noteConflicts) item.noteConflicts.forEach(function (n) { d.appendChild(el('p', 'Other saved version · ' + date(n.updatedAt), 'cnr-learning__muted')); d.appendChild(el('p', n.text, 'cnr-learning__note-text')); }); d.appendChild(link('Open lesson', p)); notes.appendChild(d);
       });
       if (!notes.children.length) notes.appendChild(el('p', 'Save a note on any lesson. Notes stay private to this browser unless you export them.'));
@@ -731,6 +764,7 @@
   }
   window.CNRLearning = Object.freeze({
     getSnapshot: function () { return clone(state); }, canWrite: canWrite, canView: canView, setWriteGuard: function (guard, display) { writeGuard = guard; displayGuard = display || guard; changed(); }, captureSnapshot: captureSnapshot, replaceSnapshot: replaceSnapshot, recordVisit: visit, readDiskSnapshot: function () { var data = readAll(); return { format: 'cnr-learning-backup', version: 1, exportedAt: new Date().toISOString(), progress: data.progress, learning: data.learning, playground: data.playground }; }, refreshState: function () { if (canWrite()) { state = readAll(); changed(); } }, setRead: setRead, setBookmark: bookmark, saveNote: saveNote, recordPractice: practice, setSolved: setSolved, solvedAt: solvedAt, solvedProblems: solvedProblems,
+    saveNote: saveNote, noteText: noteText,
     exportBackup: exportBackup, validateBackup: function (raw) { return clone(validateBackup(raw, true)); }, prepareImport: prepareImport, applyImport: applyImport, loadCatalog: loadCatalog,
     limits: Object.freeze({ backupBytes: MAX_BACKUP, storeBytes: MAX_STORE, noteCharacters: MAX_NOTE })
   });

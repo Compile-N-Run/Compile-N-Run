@@ -54,11 +54,50 @@
     target.appendChild(node);
   });
   article.append(problemSection, solutionSection);
+  // The explanation is a hint ladder: the key idea first, then the approach, then everything else.
+  (function hints() {
+    const nodes = Array.from(solutionSection.children);
+    const steps = [];
+    let current = null;
+    nodes.forEach(node => {
+      if (node.tagName === 'H2') { current = { heading: node, nodes: [] }; steps.push(current); }
+      else if (current) current.nodes.push(node);
+    });
+    const ladder = [];
+    const keyIdea = steps.find(st => /key idea/i.test(st.heading.textContent));
+    const approach = steps.find(st => /approach/i.test(st.heading.textContent));
+    if (keyIdea) ladder.push({ label: 'Show hint 1: the key idea', steps: [keyIdea] });
+    if (approach) ladder.push({ label: 'Show hint 2: the approach', steps: [approach] });
+    const rest = steps.filter(st => st !== keyIdea && st !== approach);
+    if (rest.length) ladder.push({ label: ladder.length ? 'Show the full explanation' : 'Show the explanation', steps: rest });
+    if (ladder.length < 2) return;
+    const intro = el('p', 'cnr-iv-hints__intro', 'Try the problem first. Reveal one hint at a time, or jump straight to the full explanation.');
+    const all = button('cnr-iv-ws__btn', 'Reveal everything', () => ladder.forEach(reveal));
+    solutionSection.prepend(intro, all);
+    ladder.forEach((rung, i) => {
+      rung.button = button('cnr-iv-ws__btn cnr-iv-hints__reveal', rung.label, () => reveal(rung));
+      rung.button.hidden = i > 0;
+      rung.steps.forEach(st => { st.heading.hidden = true; st.nodes.forEach(n => { n.hidden = true; }); });
+      rung.steps[0].heading.before(rung.button);
+    });
+    function reveal(rung) {
+      rung.steps.forEach(st => { st.heading.hidden = false; st.nodes.forEach(n => { n.hidden = false; }); });
+      rung.button.remove();
+      const next = ladder[ladder.indexOf(rung) + 1];
+      if (next) next.button.hidden = false;
+      if (ladder.every(r => !r.button.isConnected)) { intro.remove(); all.remove(); }
+    }
+  })();
   const companies = paneBody.querySelector('[data-iv-pane="companies"]');
   if (companies) companies.hidden = true;
   const panes = [['problem', 'Problem', () => { problemSection.hidden = false; solutionSection.hidden = true; }],
     ['solution', 'Solution', () => { problemSection.hidden = true; solutionSection.hidden = false; }]];
   if (companies) panes.push(['companies', 'Companies', () => { problemSection.hidden = true; solutionSection.hidden = true; }]);
+  const notesPane = el('section', 'cnr-iv-notes');
+  notesPane.hidden = true;
+  notesPane.setAttribute('aria-label', 'Your notes');
+  paneBody.appendChild(notesPane);
+  panes.push(['notes', 'Notes', () => { problemSection.hidden = true; solutionSection.hidden = true; }]);
   const head = paneBody.querySelector('[data-iv-pane="problem"]');
   const paneButtons = panes.map(([key, label, show], i) => {
     const b = el('button', 'cnr-iv-pane__tab', label);
@@ -87,11 +126,40 @@
       paneButtons[i].tabIndex = on ? 0 : -1;
       if (on) show();
     });
-    article.hidden = key === 'companies';
-    head.hidden = key === 'companies';
+    article.hidden = key === 'companies' || key === 'notes';
+    head.hidden = key === 'companies' || key === 'notes';
     if (companies) companies.hidden = key !== 'companies';
+    notesPane.hidden = key !== 'notes';
+    if (key === 'notes') renderNotes();
     paneBody.scrollTop = 0;
   }
+
+  // Notes live in the learning store (the same notes as lessons), so they sync and back up with the rest.
+  const notesTitle = el('h2', null, 'Your notes on this problem');
+  const notesHelp = el('p', 'cnr-iv-muted', 'What was the trick? What did you get wrong? Notes are private: guests keep them in this browser, signed-in readers sync them across devices and see them on the learning dashboard.');
+  const notesField = el('textarea', 'cnr-iv-notes__field');
+  notesField.rows = 10;
+  notesField.maxLength = 20000;
+  notesField.setAttribute('aria-label', 'Your notes on this problem');
+  notesField.placeholder = 'Write a note for your next visit…';
+  const notesSave = button('cnr-iv-ws__btn cnr-iv-ws__btn--primary', 'Save note', () => {
+    const learn = window.CNRLearning;
+    if (!learn || !learn.canWrite()) return;
+    try { learn.saveNote(path, notesField.value); notesStatus.textContent = 'Saved.'; notesDirty = false; } catch (err) { notesStatus.textContent = err && err.message ? err.message : String(err); }
+  });
+  const notesStatus = el('p', 'cnr-iv-muted cnr-iv-notes__status');
+  notesStatus.setAttribute('role', 'status');
+  let notesDirty = false;
+  notesField.addEventListener('input', () => { notesDirty = true; notesStatus.textContent = 'Unsaved note. Choose Save note to keep it.'; });
+  notesPane.append(notesTitle, notesHelp, notesField, notesSave, notesStatus);
+  function renderNotes() {
+    const learn = window.CNRLearning;
+    const available = !!learn && learn.canView();
+    notesField.disabled = notesSave.disabled = !available || !learn.canWrite();
+    if (!available) { notesStatus.textContent = 'Notes are unavailable right now.'; return; }
+    if (!notesDirty) { let saved = ''; try { saved = learn.noteText(path); } catch (_) { saved = ''; } if (notesField.value !== saved) notesField.value = saved; }
+  }
+  ['cnr:learning-updated', 'cnr:learning-imported'].forEach(name => window.addEventListener(name, renderNotes));
 
   // --- Right pane: language tabs, actions, editor, bottom panel (test cases / output) ---
   const bar = el('div', 'cnr-iv-ws__bar');
@@ -99,7 +167,7 @@
   tablist.setAttribute('role', 'tablist');
   tablist.setAttribute('aria-label', 'Language');
   const actions = el('div', 'cnr-iv-ws__actions');
-  const testButton = button('cnr-iv-ws__btn cnr-iv-ws__btn--primary', '▶ Run', () => run());
+  const testButton = button('cnr-iv-ws__btn cnr-iv-ws__btn--primary cnr-iv-ws__run', '▶ Run', () => run());
   const resetMenu = el('details', 'cnr-iv-ws__menu');
   const resetSummary = el('summary', 'cnr-iv-ws__btn', 'Reset ▾');
   const resetList = el('div', 'cnr-iv-ws__menu-list');
@@ -125,8 +193,25 @@
   panelTabs.append(el('span', 'cnr-iv-ws__panel-spacer'), stopButton, clearButton, collapseButton);
   const casesView = el('div', 'cnr-iv-ws__cases');
   const casesNote = el('p', 'cnr-iv-ws__cases-note');
+  const casesReset = button('cnr-iv-ws__link', 'Reset cases', () => { setCases(casesText()); store.remove(casesKey(lang)); });
+  casesNote.appendChild(casesReset);
   const casesCode = el('div', 'cnr-iv-ws__cases-code');
   casesView.append(casesNote, casesCode);
+  const casesKey = l => `cnr-iv-ws-cases:${slug}:${l}`;
+  const casesArea = el('textarea', 'cnr-iv-editor cnr-iv-ws__cases-area');
+  casesArea.spellcheck = false;
+  casesArea.setAttribute('aria-label', 'Test cases');
+  casesArea.wrap = 'off';
+  const cases = {
+    get value() { return cmCases ? cmCases.state.doc.toString() : casesArea.value; },
+  };
+  function setCases(text) {
+    if (cmCases) cmCases.dispatch({ changes: { from: 0, to: cmCases.state.doc.length, insert: text } });
+    else casesArea.value = text;
+  }
+  let casesTimer;
+  const saveCases = () => { clearTimeout(casesTimer); casesTimer = setTimeout(() => { if (cases.value === casesText()) store.remove(casesKey(lang)); else store.set(casesKey(lang), cases.value); }, 300); };
+  casesArea.addEventListener('input', saveCases);
   const out = el('div', 'cnr-iv-ws__out');
   out.setAttribute('aria-live', 'polite');
   const status = el('div', 'cnr-iv-ws__status');
@@ -220,13 +305,16 @@
       parent: editorWrap,
     });
     textarea.remove();
+    const casesDoc = cases.value;
+    casesArea.remove();
     cmCases = new EditorView({
-      doc: casesText(),
-      extensions: [basicSetup, EditorState.readOnly.of(true), EditorView.editable.of(false), cmLang.of(cmLangs[lang]), cmTheme.of(themeOf()),
+      doc: casesDoc,
+      extensions: [basicSetup, keymap.of([indentWithTab]), cmLang.of(cmLangs[lang]), cmTheme.of(themeOf()),
+        EditorView.updateListener.of(update => { if (update.docChanged) saveCases(); }),
         EditorView.contentAttributes.of({ 'aria-label': 'Test cases' })],
       parent: casesCode,
     });
-    casesCode.querySelector('pre')?.remove();
+    void EditorState;
     new MutationObserver(() => [cm, cmCases].forEach(view => view.dispatch({ effects: cmTheme.reconfigure(themeOf()) })))
       .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     root.classList.add('cnr-iv-ws--cm');
@@ -264,14 +352,14 @@
     testButton.disabled = !runnable || !window.CNRRunner;
     note.textContent = !window.CNRRunner ? 'The in-browser runner did not load.' : runnable ? 'Run executes the test cases in your browser (Ctrl+Enter). Edit the reference solution, or reset to the starter code to write your own.'
       : 'Java, C++ and Go do not run in the browser yet: edit here, then paste into LeetCode. The tests below are what CI runs.';
-    casesNote.textContent = runnable ? `The checks Run executes against your ${LANGS.find(([l]) => l === lang)[1]} code; each check(actual, expected, label) call becomes one result.`
-      : `The ${LANGS.find(([l]) => l === lang)[1]} test program for this problem, for reference.`;
+    casesNote.replaceChildren(runnable ? `Run executes these checks against your ${LANGS.find(([l]) => l === lang)[1]} code; each check(actual, expected, label) call becomes one result. Edit them or add your own cases. `
+      : `The ${LANGS.find(([l]) => l === lang)[1]} test program for this problem, for reference. `, casesReset);
+    const savedCases = store.get(casesKey(lang));
     if (cm) {
       cm.dispatch({ effects: cmLang.reconfigure(cmLangs[lang]) });
-      cmCases.dispatch({ changes: { from: 0, to: cmCases.state.doc.length, insert: casesText() }, effects: cmLang.reconfigure(cmLangs[lang]) });
-    } else {
-      casesCode.replaceChildren(el('pre', 'cnr-iv-ws__cases-pre', casesText()));
-    }
+      cmCases.dispatch({ effects: cmLang.reconfigure(cmLangs[lang]) });
+    } else if (!casesArea.isConnected) casesCode.replaceChildren(casesArea);
+    setCases(savedCases ?? casesText());
     clearOut();
     setPanel(panelOpen || 'cases');
   }
@@ -321,19 +409,23 @@
   function assemble(prelude) {
     const own = data.prelude[lang] || '';
     if (lang === 'python') {
-      const shim = ['import json as _cnr_json', '_cnr_results = []',
+      const shim = ['import json as _cnr_json, time as _cnr_time, tracemalloc as _cnr_tm', '_cnr_results = []',
         'def _cnr_short(s):', '    return s if len(s) <= 400 else s[:400] + "…"',
+        '_cnr_t0 = _cnr_time.perf_counter(); _cnr_last = _cnr_t0; _cnr_tm.start()',
         'def check(actual, expected, label=""):',
-        '    _cnr_results.append({"label": str(label), "expected": _cnr_short(repr(expected)), "actual": _cnr_short(repr(actual)), "ok": bool(actual == expected)})',
-        'try:', `    exec(compile(${JSON.stringify(data.tests.python)}, "<tests>", "exec"), globals())`,
-        'finally:', `    print("\\n" + "${MARKER}" + _cnr_json.dumps(_cnr_results), flush=True)`, ''].join('\n');
+        '    global _cnr_last',
+        '    now = _cnr_time.perf_counter(); ms = round((now - _cnr_last) * 1000, 1); _cnr_last = now',
+        '    _cnr_results.append({"label": str(label), "expected": _cnr_short(repr(expected)), "actual": _cnr_short(repr(actual)), "ok": bool(actual == expected), "ms": ms})',
+        'try:', `    exec(compile(${JSON.stringify(cases.value)}, "<tests>", "exec"), globals())`,
+        'finally:', '    _cnr_peak = _cnr_tm.get_traced_memory()[1]; _cnr_tm.stop()',
+        `    print("\\n" + "${MARKER}" + _cnr_json.dumps({"checks": _cnr_results, "ms": round((_cnr_time.perf_counter() - _cnr_t0) * 1000, 1), "bytes": _cnr_peak}), flush=True)`, ''].join('\n');
       return [prelude.python, own, editor.value, '', '# --- tests ---', shim].join('\n');
     }
     const shim = ['var process = { exitCode: 0, exit: function () { var e = new Error("process.exit() was called"); e.name = "Tests stopped"; throw e; } };',
-      'var __cnr_results = [];',
+      'var __cnr_results = [], __cnr_t0 = performance.now(), __cnr_last = __cnr_t0;',
       'function __cnr_short(s) { s = s === undefined ? "undefined" : s; return s.length <= 400 ? s : s.slice(0, 400) + "…"; }',
-      'function check(actual, expected, label) { const a = JSON.stringify(actual), e = JSON.stringify(expected); __cnr_results.push({ label: String(label == null ? "" : label), expected: __cnr_short(e), actual: __cnr_short(a), ok: a === e }); }',
-      'try {', data.tests.javascript, '} finally {', `  console.log("\\n${MARKER}" + JSON.stringify(__cnr_results));`, '}', ''].join('\n');
+      'function check(actual, expected, label) { const a = JSON.stringify(actual), e = JSON.stringify(expected); const now = performance.now(); __cnr_results.push({ label: String(label == null ? "" : label), expected: __cnr_short(e), actual: __cnr_short(a), ok: a === e, ms: Math.round((now - __cnr_last) * 10) / 10 }); __cnr_last = now; }',
+      'try {', cases.value, '} finally {', `  console.log("\\n${MARKER}" + JSON.stringify({ checks: __cnr_results, ms: Math.round((performance.now() - __cnr_t0) * 10) / 10 }));`, '}', ''].join('\n');
     return [prelude.javascript, own, editor.value, '', '// --- tests ---', shim].join('\n');
   }
   async function run() {
@@ -360,12 +452,14 @@
       testButton.disabled = false;
     }
   }
+  const fmtMs = ms => ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`;
+  const fmtBytes = b => b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : b >= 1024 ? `${(b / 1024).toFixed(0)} KB` : `${b} B`;
   function report() {
     const at = stdoutText.lastIndexOf(MARKER);
-    let results = null, stdout = stdoutText;
+    let results = null, stdout = stdoutText, timing = null;
     if (at >= 0) {
       stdout = stdoutText.slice(0, at).replace(/\n$/, '');
-      try { results = JSON.parse(stdoutText.slice(at + MARKER.length).split('\n')[0]); } catch (_) { results = null; }
+      try { timing = JSON.parse(stdoutText.slice(at + MARKER.length).split('\n')[0]); results = timing.checks; } catch (_) { results = null; timing = null; }
     }
     pre.textContent = '';
     extra.textContent = '';
@@ -387,12 +481,23 @@
       }));
     } else if (allPassed && solved) verdict.append(' Already marked as solved.');
     view.appendChild(verdict);
+    if (timing) {
+      const parts = [`Time: ${fmtMs(timing.ms)}`];
+      if (typeof timing.bytes === 'number') parts.push(`Peak memory: ${fmtBytes(timing.bytes)}`);
+      const slow = results.length ? Math.max(...results.map(r => r.ms || 0)) : 0;
+      if (timing.ms > 3000) parts.push('That is slow for these inputs; check the time complexity.');
+      else if (slow > 1000) parts.push(`The slowest check took ${fmtMs(slow)}.`);
+      const stats = el('p', 'cnr-iv-ws__stats', parts.join(' · '));
+      if (lang === 'javascript') stats.append(' ', el('span', 'cnr-iv-muted', '(memory is not measurable for JavaScript in the browser)'));
+      view.appendChild(stats);
+    }
     if (results && results.length) {
       const list = el('ol', 'cnr-iv-ws__cases-list');
       results.forEach((r, i) => {
         const item = el('li', `cnr-iv-ws__case ${r.ok ? 'cnr-iv-ws__case--pass' : 'cnr-iv-ws__case--fail'}`);
         const head = el('div', 'cnr-iv-ws__case-head');
         head.append(el('span', 'cnr-iv-ws__case-mark', r.ok ? '✓' : '✗'), el('span', 'cnr-iv-ws__case-label', r.label || `Check ${i + 1}`));
+        if (typeof r.ms === 'number') head.appendChild(el('span', 'cnr-iv-ws__case-ms', fmtMs(r.ms)));
         item.appendChild(head);
         if (!r.ok) {
           const grid = el('dl', 'cnr-iv-ws__case-io');

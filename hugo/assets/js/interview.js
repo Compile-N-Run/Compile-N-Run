@@ -231,6 +231,64 @@
     filter();
   });
 
+  // Study plan page: a solve toggle per problem, progress and "today" (the first day with an unsolved problem).
+  const plan = document.querySelector('[data-iv-plan]');
+  if (plan) {
+    const items = Array.from(plan.querySelectorAll('[data-iv-plan-problem]')).map(li => {
+      const slug = li.dataset.ivPlanProblem, label = li.dataset.title;
+      const button = solveButton(slug, label, () => update());
+      li.querySelector('.cnr-iv-plan__toggle').appendChild(button);
+      return { slug, label, li, button };
+    });
+    const days = Array.from(plan.querySelectorAll('[data-iv-plan-day]'));
+    const solvedCount = plan.querySelector('[data-iv-plan-solved]'), bar = plan.querySelector('[data-iv-plan-bar]'), today = plan.querySelector('[data-iv-plan-today]');
+    function update() {
+      const available = canView();
+      plan.classList.toggle('cnr-iv-plan--nosolve', !available);
+      let done = 0, firstOpen = null;
+      items.forEach(item => { const on = available && isSolved(item.slug); item.li.classList.toggle('cnr-iv-row--solved', on); syncSolveButton(item.button, item.slug, item.label, on); if (on) done++; });
+      days.forEach(day => {
+        const total = day.querySelectorAll('[data-iv-plan-problem]').length, solved = day.querySelectorAll('.cnr-iv-row--solved').length;
+        day.classList.toggle('cnr-iv-plan__day--done', solved === total);
+        day.classList.remove('cnr-iv-plan__day--today');
+        day.querySelector('[data-iv-plan-day-status]').textContent = available ? `${solved} of ${total} solved` : '';
+        if (!firstOpen && solved < total) firstOpen = day;
+      });
+      solvedCount.textContent = String(done);
+      bar.value = done;
+      today.replaceChildren();
+      if (!available) return;
+      if (firstOpen) {
+        firstOpen.classList.add('cnr-iv-plan__day--today');
+        today.append('Today: ', link('#' + firstOpen.id, `Day ${firstOpen.dataset.ivPlanDay}`));
+      } else today.textContent = 'Plan complete. Well done!';
+    }
+    onLearningChange(update);
+    update();
+  }
+
+  // Study plan directory: progress on each card.
+  const plansRoot = document.querySelector('[data-iv-plans]');
+  if (plansRoot) {
+    let problems = {};
+    try { problems = JSON.parse(plansRoot.querySelector('[data-iv-plans-problems]').textContent); } catch (_) { problems = {}; }
+    const summary = plansRoot.querySelector('[data-iv-plans-summary]');
+    const update = () => {
+      const available = canView();
+      let started = 0;
+      plansRoot.querySelectorAll('[data-iv-plan-card]').forEach(card => {
+        const slugs = problems[card.dataset.ivPlanCard] || [], done = available ? slugs.filter(isSolved).length : 0;
+        const out = card.querySelector('[data-iv-plan-card-progress]');
+        out.hidden = !done;
+        out.textContent = done ? `Your progress: ${done} of ${slugs.length} solved` : '';
+        if (done) started++;
+      });
+      summary.textContent = available && started ? `You have started ${started} ${started === 1 ? 'plan' : 'plans'}.` : '';
+    };
+    onLearningChange(update);
+    update();
+  }
+
   // Catalog header: your solved total.
   const solvedSummary = document.querySelector('[data-iv-solved-summary]');
   if (solvedSummary) {
