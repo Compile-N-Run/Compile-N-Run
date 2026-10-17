@@ -1,0 +1,353 @@
+---
+title: "Protobuf and JSON Schema with Kafka"
+description: "Produce and consume Protobuf and JSON Schema records through Schema Registry in Java and Python, with imports, content models and when to pick each format."
+---
+
+# Protobuf and JSON Schema with Kafka
+
+## Introduction
+
+Avro is not the only format a schema registry understands. Confluent Schema Registry, Apicurio, Karapace and Redpanda all handle **Protocol Buffers** and **JSON Schema** too, with the same subjects, compatibility checks and five-byte wire prefix. Many teams arrive at Kafka already invested in one of them: a company that runs gRPC has a repository full of `.proto` files, and a company with public REST APIs has JSON Schema or OpenAPI definitions. Reusing those definitions for events avoids maintaining two descriptions of the same thing.
+
+This page shows how each format works with Kafka in practice. You will produce and consume Protobuf messages from Java and Python, see how `.proto` imports become schema references in the registry, use JSON Schema with validation turned on, and learn the format-specific traps: Protobuf's zero values and field numbers, and JSON Schema's open and closed content models. The general registry concepts are in [Schema Registry: Why and How](./1-kafka-schema-registry.mdx); this page focuses on what differs.
+
+## Protobuf on a Kafka Topic
+
+### The Schema
+
+```protobuf
+// src/main/proto/orders/order_placed.proto
+syntax = "proto3";
+
+package shop.orders.v1;
+
+import "google/protobuf/timestamp.proto";
+import "orders/money.proto";
+
+option java_package = "com.shop.orders.proto";
+option java_multiple_files = true;
+
+message OrderPlaced {
+  string order_id = 1;
+  string customer_id = 2;
+  Money total = 3;
+  google.protobuf.Timestamp placed_at = 4;
+  optional string coupon_code = 5;   // explicit presence: has_coupon_code()
+  Channel channel = 6;
+  repeated OrderItem items = 7;
+
+  reserved 8;                         // was "gift_wrap", removed in v3
+  reserved "gift_wrap";
+}
+
+message OrderItem {
+  string sku = 1;
+  int32 quantity = 2;
+}
+
+enum Channel {
+  CHANNEL_UNSPECIFIED = 0;           // proto3 enums must start at zero
+  CHANNEL_WEB = 1;
+  CHANNEL_MOBILE = 2;
+  CHANNEL_STORE = 3;
+}
+```
+
+```protobuf
+// src/main/proto/orders/money.proto
+syntax = "proto3";
+package shop.orders.v1;
+option java_package = "com.shop.orders.proto";
+option java_multiple_files = true;
+
+message Money {
+  string currency_code = 1;   // ISO 4217, e.g. "EUR"
+  int64 units = 2;            // whole units
+  int32 nanos = 3;            // fractional part, in billionths
+}
+```
+
+Three Protobuf habits matter more on Kafka than in RPC:
+
+- **Field numbers are forever.** Records written today will be read for as long as the topic retains them, possibly years on a compacted topic. Never reuse a number; mark removed fields `reserved`.
+- **Zero values are indistinguishable from absence** for plain proto3 scalars. A `quantity` of 0 and a missing `quantity` decode the same way. When "not set" is meaningful, declare the field `optional` (proto3 has supported it since 3.15) or use a wrapper type.
+- **The first enum value should mean "unknown".** Readers that meet a number they do not know keep it as an unrecognized value; a sensible zero value keeps their logic honest.
+
+Generate Java classes with `protoc` or a build plugin:
+
+```bash
+protoc --proto_path=src/main/proto --java_out=target/generated-sources/protobuf \
+  src/main/proto/orders/order_placed.proto src/main/proto/orders/money.proto
+```
+
+Many teams now use Buf (`buf generate`) for code generation and `buf breaking` for local compatibility checks; it works alongside the registry rather than replacing it.
+
+### Producing from Java
+
+The serializer artifact is `io.confluent:kafka-protobuf-serializer` (version 8.3.2 at the time of writing, from the Confluent Maven repository), plus `com.google.protobuf:protobuf-java`.
+
+```java
+import com.google.protobuf.Timestamp;
+import com.shop.orders.proto.*;
+import io.confluent.kafka.serializers.protobuf.KafkaProtobufSerializer;
+import org.apache.kafka.clients.producer.*;
+import org.apache.kafka.common.serialization.StringSerializer;
+
+import java.time.Instant;
+import java.util.Properties;
+
+public class ProtoOrderProducer {
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaProtobufSerializer.class);
+        props.put("schema.registry.url", "http://localhost:8081");
+
+        Instant now = Instant.now();
+        OrderPlaced order = OrderPlaced.newBuilder()
+                .setOrderId("ord-7781")
+                .setCustomerId("cust-204")
+                .setTotal(Money.newBuilder().setCurrencyCode("EUR").setUnits(45).setNanos(990_000_000))
+                .setPlacedAt(Timestamp.newBuilder().setSeconds(now.getEpochSecond()).setNanos(now.getNano()))
+                .setChannel(Channel.CHANNEL_WEB)
+                .addItems(OrderItem.newBuilder().setSku("KB-104").setQuantity(1))
+                .build();
+
+        try (KafkaProducer<String, OrderPlaced> producer = new KafkaProducer<>(props)) {
+            producer.send(new ProducerRecord<>("orders.placed.proto", order.getOrderId(), order)).get();
+        }
+    }
+}
+```
+
+After the first send, the registry holds more than one subject:
+
+```bash
+$ curl -s http://localhost:8081/subjects
+["google/protobuf/timestamp.proto","orders.placed.proto-value","orders/money.proto"]
+
+$ curl -s http://localhost:8081/subjects/orders.placed.proto-value/versions/latest | jq .references
+[
+  { "name": "google/protobuf/timestamp.proto", "subject": "google/protobuf/timestamp.proto", "version": 1 },
+  { "name": "orders/money.proto", "subject": "orders/money.proto", "version": 1 }
+]
+```
+
+Each import became a **schema reference**: a separate subject that the main schema points to by name and version. The default `DefaultReferenceSubjectNameStrategy` uses the import path as the subject name. References let a shared type like `Money` evolve under its own compatibility rules, and they are why you should treat shared `.proto` files as first-class artifacts with an owner.
+
+### Consuming from Java
+
+```java
+Properties props = new Properties();
+props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(ConsumerConfig.GROUP_ID_CONFIG, "fulfilment-proto");
+props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+        io.confluent.kafka.serializers.protobuf.KafkaProtobufDeserializer.class);
+props.put("schema.registry.url", "http://localhost:8081");
+// Without this the deserializer returns DynamicMessage
+props.put("specific.protobuf.value.type", OrderPlaced.class.getName());
+
+try (KafkaConsumer<String, OrderPlaced> consumer = new KafkaConsumer<>(props)) {
+    consumer.subscribe(List.of("orders.placed.proto"));
+    while (true) {
+        for (ConsumerRecord<String, OrderPlaced> rec : consumer.poll(Duration.ofMillis(500))) {
+            OrderPlaced o = rec.value();
+            String coupon = o.hasCouponCode() ? o.getCouponCode() : "none";
+            System.out.printf("%s %d.%02d %s coupon=%s%n", o.getOrderId(),
+                    o.getTotal().getUnits(), o.getTotal().getNanos() / 10_000_000,
+                    o.getTotal().getCurrencyCode(), coupon);
+        }
+    }
+}
+```
+
+```text
+ord-7781 45.99 EUR coupon=none
+```
+
+If a topic carries several message types (for example under `TopicRecordNameStrategy`), set `derive.type=true` instead, and the deserializer picks the generated class named by the schema.
+
+### Producing from Python
+
+```bash
+pip install "confluent-kafka[protobuf,schemaregistry]"
+protoc --proto_path=src/main/proto --python_out=. \
+  src/main/proto/orders/order_placed.proto src/main/proto/orders/money.proto
+```
+
+```python
+from confluent_kafka import Producer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.protobuf import ProtobufSerializer
+from confluent_kafka.serialization import SerializationContext, MessageField
+
+from orders import order_placed_pb2, money_pb2
+
+registry = SchemaRegistryClient({"url": "http://localhost:8081"})
+serializer = ProtobufSerializer(order_placed_pb2.OrderPlaced, registry)
+
+producer = Producer({"bootstrap.servers": "localhost:9092"})
+
+order = order_placed_pb2.OrderPlaced(
+    order_id="ord-7782",
+    customer_id="cust-311",
+    total=money_pb2.Money(currency_code="EUR", units=12, nanos=500_000_000),
+    channel=order_placed_pb2.CHANNEL_MOBILE,
+)
+order.placed_at.GetCurrentTime()          # fills the Timestamp field
+
+producer.produce(
+    topic="orders.placed.proto",
+    key=order.order_id,
+    value=serializer(order, SerializationContext("orders.placed.proto", MessageField.VALUE)),
+)
+producer.flush()
+```
+
+The Java consumer above reads this record without any change. Both sides only agree on the registry, the wire format and the `.proto` definition.
+
+## JSON Schema on a Kafka Topic
+
+JSON Schema keeps the payload as readable JSON text and adds a contract the serializer can enforce. The registry stores the schema; the record carries the usual magic byte and schema ID followed by plain UTF-8 JSON.
+
+### The Schema and Its Content Model
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OrderPlaced",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["orderId", "customerId", "amountCents"],
+  "properties": {
+    "orderId":     { "type": "string", "pattern": "^ord-[0-9]+$" },
+    "customerId":  { "type": "string" },
+    "amountCents": { "type": "integer", "minimum": 0 },
+    "currency":    { "type": "string", "enum": ["EUR", "USD", "GBP"], "default": "EUR" },
+    "couponCode":  { "type": ["string", "null"] }
+  }
+}
+```
+
+The single most important line is `"additionalProperties": false`. It decides the schema's **content model**, and the content model decides which changes the registry will later accept.
+
+| Content model | How you write it | Meaning | Effect on evolution |
+|---|---|---|---|
+| Open (default) | `additionalProperties` omitted or `true` | Any extra property is allowed | Hard to add properties later: an old writer may already have sent that name with another type |
+| Closed | `additionalProperties: false` | Only declared properties are allowed | Adding an optional property is backward compatible; removing one is not |
+| Partially open | `additionalProperties` set to a schema, or `patternProperties` | Extras allowed if they match a type or naming pattern | Middle ground for extensible documents |
+
+For a producer-owned event with a known shape, closed is the practical choice: it lets you add optional properties later and rejects typos on the way out. [Schema Evolution and Compatibility Rules](./4-kafka-schema-evolution.mdx) goes through the rules in detail.
+
+JSON Schema also validates values, not just shapes. `pattern`, `minimum` and `enum` above are checks Avro and Protobuf cannot express in the schema itself. That is a genuine advantage when the topic receives data from partners.
+
+### Producing and Consuming in Java
+
+The artifact is `io.confluent:kafka-json-schema-serializer`. The serializer can derive a schema from an annotated Java class, but in production you usually register the hand-written schema and tell the serializer to use it.
+
+```java
+public record OrderPlaced(String orderId, String customerId, long amountCents,
+                          String currency, String couponCode) {}
+```
+
+```java
+Properties props = new Properties();
+props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+        io.confluent.kafka.serializers.json.KafkaJsonSchemaSerializer.class);
+props.put("schema.registry.url", "http://localhost:8081");
+props.put("auto.register.schemas", "false");   // schema registered by CI
+props.put("use.latest.version", "true");        // serialize against the registered schema
+props.put("json.fail.invalid.schema", "true");  // reject payloads that do not validate
+
+try (KafkaProducer<String, OrderPlaced> producer = new KafkaProducer<>(props)) {
+    var order = new OrderPlaced("ord-7781", "cust-204", 4599, "EUR", null);
+    producer.send(new ProducerRecord<>("orders.placed.json", order.orderId(), order)).get();
+}
+```
+
+On the consumer, `KafkaJsonSchemaDeserializer` returns a `Map` by default. Set `json.value.type` to your class (or to `com.fasterxml.jackson.databind.JsonNode`) to get something more useful, and enable `json.fail.invalid.schema` there too if you want bad records to fail loudly instead of reaching business logic.
+
+`json.fail.invalid.schema` defaults to `false`. With it off, the serializer registers or looks up a schema but sends whatever the object serializes to, which defeats much of the point.
+
+### Python
+
+```python
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.json_schema import JSONSerializer, JSONDeserializer
+from confluent_kafka.serialization import SerializationContext, MessageField
+
+with open("order_placed.schema.json") as f:
+    schema_str = f.read()
+
+registry = SchemaRegistryClient({"url": "http://localhost:8081"})
+to_json = JSONSerializer(schema_str, registry)       # validates every dict against the schema
+from_json = JSONDeserializer(schema_str)              # validates on the way in
+
+ctx = SerializationContext("orders.placed.json", MessageField.VALUE)
+payload = to_json({"orderId": "ord-9", "customerId": "c-1", "amountCents": 1200}, ctx)
+
+try:
+    to_json({"orderId": "ord-10", "customerId": "c-1", "amount": 1200}, ctx)
+except Exception as e:
+    print(type(e).__name__, e)
+```
+
+```text
+SerializationError Additional properties are not allowed ('amount' was unexpected)
+```
+
+## Choosing Between Them
+
+| Question | Protobuf | JSON Schema |
+|---|---|---|
+| Payload size | Small binary | Full JSON text |
+| Human-readable in a console | No | Yes |
+| Value constraints in the schema | No (needs extra tooling such as protovalidate) | Yes: `pattern`, `minimum`, `enum`, `format` |
+| Code generation | Expected, many languages | Optional |
+| Evolution safety | Strong; field numbers make rules simple | Depends on content model, easy to get wrong |
+| Shared types | `import` becomes registry references | `$ref` becomes registry references |
+| Natural home | gRPC, polyglot microservices, mobile and devices | REST APIs, partner integrations, browser clients |
+
+Pick Protobuf when the same organization already shares `.proto` files or when size matters; pick JSON Schema when readability or field-level validation outweigh the size cost. If neither applies, Avro (previous page) is still the default for data pipelines.
+
+## Worked Scenario: Two Teams, Two Formats, One Registry
+
+A payments company has a Go and Java platform team that already defines every internal API in Protobuf, and an integrations team that receives payment notifications from 40 partner banks over HTTPS.
+
+The platform team publishes `payments.authorized` in Protobuf. They reuse the existing `Money` and `CardRef` messages from their shared `.proto` repository; each becomes a referenced subject in the registry. Go services use `franz-go` with a Confluent-compatible serde library, Java services use `KafkaProtobufSerializer`, and both register through the same CI job. Compatibility on the value subject is `BACKWARD_TRANSITIVE`, which Confluent recommends for Protobuf.
+
+The integrations team writes partner notifications to `partner.notifications` using JSON Schema. Partners already send JSON, and support engineers read the topic through a web UI during incidents, so readable payloads are worth the size. The schema is closed, uses `pattern` for IBANs and `enum` for status codes, and the ingestion service sets `json.fail.invalid.schema=true`. Invalid partner payloads fail at the edge and go to a dead letter topic instead of surprising downstream consumers (see [Dead Letter Topics and Retry Topics](../9-kafka-patterns/3-kafka-dead-letter-queues.mdx)).
+
+They considered forcing everything into Protobuf for uniformity. The cost would have been a translation layer at the edge that loses the field-level validation, plus unreadable incident debugging. One registry handles both formats, so uniformity of governance mattered more than uniformity of format.
+
+## Common Mistakes
+
+- Reusing a deleted Protobuf field number. Old records on the topic decode into the new field with the wrong meaning. Use `reserved`.
+- Relying on plain proto3 scalars to signal "not provided". Zero and absent look the same; use `optional` or wrapper types.
+- Forgetting `specific.protobuf.value.type` and then casting a `DynamicMessage` to a generated class.
+- Letting each service register its own copy of a shared `.proto` file with a slightly different path, which creates several subjects for one type.
+- Leaving JSON Schema open by default, then discovering that adding a property is rejected as incompatible.
+- Turning on JSON Schema but leaving `json.fail.invalid.schema=false`, so nothing is actually validated.
+- Mixing Protobuf and JSON Schema records in one topic. One topic, one format.
+
+## Summary
+
+- Protobuf and JSON Schema use the same registry concepts and wire prefix as Avro; Protobuf adds message indexes after the schema ID.
+- Protobuf imports become schema references stored as their own subjects; shared types need an owner.
+- In Protobuf, field numbers are permanent, `reserved` protects removed ones, and `optional` restores presence for scalars.
+- JSON Schema keeps readable JSON and can validate values; make schemas closed with `additionalProperties: false` unless you have a reason not to.
+- Enable `json.fail.invalid.schema` for JSON Schema and `specific.protobuf.value.type` for Protobuf consumers.
+- Choose by context: Protobuf for gRPC shops and compact service events, JSON Schema for partner-facing and human-read topics.
+
+## Further Reading
+
+- [Protocol Buffers language guide (proto3)](https://protobuf.dev/programming-guides/proto3/) - field numbers, `optional`, `reserved` and the rules for updating messages.
+- [Confluent: Protobuf Schema Serializer and Deserializer](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/serdes-protobuf.html) - references, message indexes and every Protobuf serializer setting.
+- [Confluent: JSON Schema Serializer and Deserializer](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/serdes-json.html) - content models, validation settings and the Java and Python APIs.
+- [JSON Schema: Understanding JSON Schema](https://json-schema.org/understanding-json-schema/) - a readable guide to keywords such as `additionalProperties` and `patternProperties`.
+- [Buf documentation](https://buf.build/docs/) - linting, breaking-change detection and code generation for `.proto` files.

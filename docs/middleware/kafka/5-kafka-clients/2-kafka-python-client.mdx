@@ -1,0 +1,247 @@
+---
+title: "Kafka with Python (confluent-kafka)"
+description: "Produce and consume Kafka records from Python with confluent-kafka: install, delivery callbacks, the poll loop, asyncio clients, and how it compares to kafka-python."
+---
+
+# Kafka with Python (confluent-kafka)
+
+## Introduction
+
+Python is where a lot of Kafka data ends up: analytics jobs, machine learning feature pipelines, data quality checks and the glue scripts that every platform team writes. It is also a common language for the web backends that produce events in the first place.
+
+The Python ecosystem has more than one Kafka library, and choosing well matters more than in Java, where there is one obvious answer. The library most teams should start with is **confluent-kafka** (the `confluent_kafka` module). It is a thin Python layer over **librdkafka**, a mature C client used by the Go, .NET, Node.js and many other Kafka libraries. You get C-level performance and the same behaviour as those clients, at the price of a compiled dependency.
+
+By the end of this page you will be able to install the client, produce records with delivery callbacks, run a consumer poll loop with manual commits and clean shutdown, use the asyncio clients from an async web framework, and decide when another Python library is a better fit.
+
+The running example is a news website. Every page view becomes a JSON event on a `page-views` topic, keyed by article ID. A Python consumer counts views per article per minute and writes the counts to a database that powers a "trending now" box.
+
+## Installing the Client
+
+```bash
+pip install confluent-kafka
+```
+
+Pre-built wheels are published for Linux (x86-64, ARM64 and s390x, glibc-based distributions), macOS and Windows, with librdkafka bundled inside. Alpine and other musl-based images have no wheel, so pip builds from source there. You do not need a compiler or a system librdkafka for the common platforms. If pip starts compiling from source, you are on an unusual platform or Python version, and you will need librdkafka development headers.
+
+Schema Registry support is an optional extra:
+
+```bash
+# Adds the Schema Registry client and Avro serializers.
+pip install "confluent-kafka[avro,schemaregistry]"
+```
+
+The examples here use confluent-kafka 2.16, which bundles librdkafka 2.16. The Python package and librdkafka share version numbers, which makes it easy to read the librdkafka changelog for behaviour changes.
+
+## Producing Records
+
+```python
+import json
+import socket
+
+from confluent_kafka import Producer
+
+producer = Producer({
+    "bootstrap.servers": "localhost:9092",
+    "client.id": socket.gethostname(),
+    # librdkafka defaults this to false, unlike the Java client. Turn it on.
+    "enable.idempotence": True,
+    "compression.type": "lz4",
+    # Give each record up to two minutes to be delivered (librdkafka default: five).
+    "delivery.timeout.ms": 120000,
+})
+
+
+def on_delivery(err, msg):
+    """Called from producer.poll() or flush(), once per record."""
+    if err is not None:
+        print(f"Delivery failed for key={msg.key()}: {err}")
+    # On success, msg.topic(), msg.partition() and msg.offset() are set.
+
+
+def record_page_view(article_id: str, user_id: str, ts: int) -> None:
+    event = {"article_id": article_id, "user_id": user_id, "ts": ts}
+    producer.produce(
+        topic="page-views",
+        key=article_id,
+        value=json.dumps(event).encode("utf-8"),
+        on_delivery=on_delivery,
+    )
+    # Serve delivery callbacks for earlier records without blocking.
+    producer.poll(0)
+
+
+if __name__ == "__main__":
+    for i in range(5):
+        record_page_view("climate-report-2026", f"user-{i}", 1760700000 + i)
+    # Block until every buffered record is delivered or has failed.
+    remaining = producer.flush(10)
+    print(f"{remaining} records still undelivered")
+```
+
+The most surprising part for newcomers is `poll()`. In librdkafka-based clients, delivery callbacks are not run on a background thread. They are queued, and your code runs them by calling `poll()` or `flush()`. If you call `produce()` in a loop and never call `poll()`, callbacks pile up and, eventually, the local queue fills and `produce()` raises `BufferError`. Calling `poll(0)` after each `produce()` (or periodically) keeps the queue drained.
+
+`produce()` itself only places the record in a local queue. It returns immediately and can raise for local problems only, such as a full queue or an unknown configuration key. Broker-side errors always arrive through the callback.
+
+:::warning
+librdkafka-based clients default to `enable.idempotence=false`, while the Java client defaults to `true`. Without idempotence a retry after a network blip can write a duplicate, and ordering can break when several requests are in flight. Set it explicitly in every Python producer that cares about correctness.
+:::
+
+## Consuming Records
+
+```python
+import json
+import signal
+from collections import Counter
+
+from confluent_kafka import Consumer, KafkaError, KafkaException
+
+consumer = Consumer({
+    "bootstrap.servers": "localhost:9092",
+    "group.id": "trending-counter",
+    # KIP-848 rebalance protocol; requires Kafka 4.0+ brokers.
+    "group.protocol": "consumer",
+    # A new group should count from the oldest retained view.
+    "auto.offset.reset": "earliest",
+    # We commit after the counts are safely written.
+    "enable.auto.commit": False,
+})
+
+running = True
+
+
+def stop(signum, frame):
+    global running
+    running = False
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+
+consumer.subscribe(["page-views"])
+counts: Counter[str] = Counter()
+
+try:
+    while running:
+        # consume() returns up to num_messages records, or fewer after the timeout.
+        msgs = consumer.consume(num_messages=500, timeout=1.0)
+        for msg in msgs:
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue  # informational, only when enable.partition.eof is set
+                raise KafkaException(msg.error())
+            event = json.loads(msg.value())
+            counts[event["article_id"]] += 1
+
+        if msgs:
+            save_counts(counts)          # write to the database first...
+            counts.clear()
+            consumer.commit(asynchronous=False)  # ...then commit the offsets
+finally:
+    # Leaves the group cleanly; with auto-commit off it commits nothing itself.
+    consumer.close()
+```
+
+`save_counts` is your database write, for example an `INSERT ... ON CONFLICT DO UPDATE` that adds the counts to the current minute's row. The order matters: write, then commit. If the process dies between the two, the batch is counted again on restart. For a trending box that is acceptable. For billing, you would make the write idempotent, for instance by storing the last processed offset per partition in the same database transaction (see [Idempotent Consumers and Deduplication](../9-kafka-patterns/4-kafka-idempotent-consumers.mdx)).
+
+`consume()` and `poll()` do the same work; `consume()` returns a list and suits batch processing, `poll()` returns one message or `None`. Either way, the gap between calls must stay below `max.poll.interval.ms` (five minutes by default), or librdkafka leaves the group and logs a "max poll interval exceeded" error.
+
+When `group.protocol` is `consumer`, some classic settings stop working: `session.timeout.ms` and `heartbeat.interval.ms` are now broker settings (`group.consumer.session.timeout.ms` and `group.consumer.heartbeat.interval.ms`), and `partition.assignment.strategy` is replaced by `group.remote.assignor`. librdkafka ignores the old keys, so leaving them in place gives no error, only settings that do nothing. Remove them to avoid confusion.
+
+## Asyncio Clients
+
+The classic `Producer` and `Consumer` are synchronous. Calling `poll()` or `flush()` inside a FastAPI or aiohttp handler blocks the event loop. Since version 2.13, confluent-kafka includes fully supported asyncio clients, `AIOProducer` and `AIOConsumer`, which run the blocking librdkafka calls on a small thread pool and hand results back as awaitables.
+
+```python
+from contextlib import asynccontextmanager
+import json
+import time
+
+from confluent_kafka.aio import AIOProducer
+from fastapi import FastAPI
+
+producer: AIOProducer | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global producer
+    producer = AIOProducer({"bootstrap.servers": "localhost:9092", "enable.idempotence": True})
+    yield
+    await producer.flush()
+    await producer.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/articles/{article_id}/view")
+async def view(article_id: str, user_id: str):
+    event = {"article_id": article_id, "user_id": user_id, "ts": int(time.time())}
+    # The first await queues the record; the second waits for the broker's ack.
+    delivery = await producer.produce("page-views", key=article_id, value=json.dumps(event))
+    msg = await delivery
+    return {"partition": msg.partition(), "offset": msg.offset()}
+```
+
+Awaiting the delivery inside the request handler adds a broker round trip to every request. For page views, a lost event or two is acceptable, so you could skip the second `await` and return immediately. For an order or a payment, keep it.
+
+## Choosing a Python Library
+
+| Library | Install | Implementation | Strengths | Weaknesses |
+| --- | --- | --- | --- | --- |
+| confluent-kafka | `pip install confluent-kafka` | librdkafka (C) | Fast, feature-complete, KIP-848, transactions, asyncio clients, Confluent-supported | Compiled dependency; librdkafka defaults differ from Java |
+| kafka-python | `pip install kafka-python` | Pure Python | No native code; familiar API; maintained again with a 3.x line in 2026 | Slower; new protocol features arrive later |
+| kafka-python-ng | `pip install kafka-python-ng` | Pure Python | Fork created while kafka-python was dormant | No release since 2024; prefer kafka-python or confluent-kafka for new code |
+| aiokafka | `pip install aiokafka` | Pure Python, asyncio | Native asyncio design | Smaller feature set; separate code base from the sync clients |
+| Quix Streams | `pip install quixstreams` | Built on confluent-kafka | Stream processing (windows, state) in Python | A framework, not a client; another layer to learn |
+
+For the news site, confluent-kafka is the default: the counter processes thousands of events per second, and the same team already runs librdkafka-based Go services, so configuration knowledge transfers. A pure Python library would make sense for a tiny script on a platform without wheels.
+
+## Worked Scenario: The Trending Box Lags at Lunchtime
+
+At noon, page views triple. The consumer lag dashboard (see [Consumer Lag](../10-kafka-operations/2-kafka-consumer-lag.mdx)) shows `trending-counter` falling behind by several minutes, so the trending box shows stale articles.
+
+```mermaid
+flowchart LR
+    A["Web servers"] --> B["page-views topic, 6 partitions"]
+    B --> C["trending-counter pod 1"]
+    B --> D["trending-counter pod 2"]
+    C --> E["Postgres: views per minute"]
+    D --> E
+    E --> F["Trending now box"]
+```
+
+The team works through the options in order of cost:
+
+1. **Check where time goes.** Profiling shows most time is spent in `save_counts`, one database round trip per batch of 500. Raising `num_messages` to 2000 cuts round trips by four with no code change.
+2. **Scale out.** The topic has six partitions and only two pods. Scaling the deployment to six pods spreads partitions across them. With the KIP-848 protocol, adding pods only moves the partitions that need moving, without pausing the others.
+3. **Avoid the GIL trap.** Parsing JSON in Python is CPU-bound. Running more threads in one process would not help much; more processes (pods) do.
+
+After step 1 and step 2, lag returns to near zero within ten minutes, and the team adds an alert on lag above 60 seconds.
+
+## Common Mistakes
+
+- **Never calling `poll()` on a producer.** Delivery callbacks never run and `produce()` eventually raises `BufferError`.
+- **Forgetting `flush()` before exit.** Records still in the local queue are lost when a script ends.
+- **Assuming Java defaults.** `enable.idempotence` is false and `isolation.level` is `read_committed` in librdkafka; check the [configuration reference](./6-kafka-client-configuration-reference.mdx).
+- **Mixing Python and Java producers on keyed topics.** librdkafka hashes keys with CRC32 by default, Java with murmur2; set `"partitioner": "murmur2_random"` in Python so the same key lands on the same partition.
+- **Calling the sync client from async code.** It blocks the event loop; use `AIOProducer` and `AIOConsumer`.
+- **Committing before processing.** A crash after the commit silently skips records.
+- **Tuning `session.timeout.ms` after switching to `group.protocol=consumer`.** librdkafka ignores it; the broker's `group.consumer.session.timeout.ms` applies.
+
+## Summary
+
+- Use `confluent-kafka` for most Python work: `pip install confluent-kafka` gives you a librdkafka-backed client with bundled binaries.
+- `produce()` is asynchronous; call `poll()` regularly to run delivery callbacks and `flush()` before exiting.
+- Set `enable.idempotence=True` explicitly, because librdkafka defaults it to false.
+- Consume with `poll()` or `consume()`, disable auto-commit for at-least-once, write results and then commit, and always `close()`.
+- `confluent_kafka.aio` provides `AIOProducer` and `AIOConsumer` for asyncio frameworks.
+- `kafka-python` is maintained again and works where native code is a problem; `kafka-python-ng` has gone quiet.
+
+## Further Reading
+
+- [confluent-kafka-python on GitHub](https://github.com/confluentinc/confluent-kafka-python) - source, examples (including the asyncio example) and the changelog.
+- [Confluent Python client documentation](https://docs.confluent.io/kafka-clients/python/current/overview.html) - API reference for Producer, Consumer, AdminClient and serializers.
+- [librdkafka CONFIGURATION.md](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md) - every configuration key the Python client accepts, with defaults.
+- [librdkafka KIP-848 migration notes](https://github.com/confluentinc/librdkafka/blob/master/INTRODUCTION.md#next-generation-consumer-group-protocol-kip-848) - what changes when you set `group.protocol=consumer`.
+- [Python tutorial](/docs/language/python) - a refresher on the language.

@@ -1,0 +1,250 @@
+---
+title: "Managing Topics with the Admin API"
+description: "Create, inspect, reconfigure and delete Kafka topics from code with the Java Admin client and confluent-kafka in Python, with safe patterns for automation."
+---
+
+# Managing Topics with the Admin API
+
+## Introduction
+
+The command-line tools are fine for a person at a terminal. As soon as topics need to be created by software, for example when a new customer signs up, when a test suite starts, or when a deployment pipeline reconciles the cluster with a file in Git, you need an API. Kafka's Admin API is that API. It is the same interface `kafka-topics.sh` and `kafka-configs.sh` use internally, exposed in every major client library.
+
+This page shows how to use it to create topics, inspect partitions and replicas, change configuration, add partitions, delete records and delete topics, with complete Java examples and Python equivalents. It also covers the patterns that make automation safe: idempotent creation, validate-only dry runs, incremental config changes, and handling the asynchronous results correctly. The worked scenario is a software-as-a-service company that provisions topics automatically for each new tenant.
+
+## The Admin Client
+
+In Java the entry point is `org.apache.kafka.clients.admin.Admin`, in the same `org.apache.kafka:kafka-clients` artifact as the producer and consumer. It needs only `bootstrap.servers` (plus security settings in a real cluster). Every method returns immediately with a result object holding `KafkaFuture` values; you call `get()` on them to wait.
+
+```java
+import org.apache.kafka.clients.admin.*;
+import org.apache.kafka.common.config.TopicConfig;
+import java.util.*;
+
+public class TopicAdmin {
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        // Overall time budget for each admin call, including retries.
+        props.put(AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 30000);
+
+        // Admin is thread-safe and meant to be long-lived; close it when done.
+        try (Admin admin = Admin.create(props)) {
+            Set<String> names = admin.listTopics().names().get();
+            System.out.println("Topics: " + names);
+        }
+    }
+}
+```
+
+Create one `Admin` instance per application and share it, just as with producers. Each instance holds network connections and a background thread.
+
+## Creating Topics
+
+A `NewTopic` describes the topic: name, partition count, replication factor and config overrides.
+
+```java
+NewTopic orders = new NewTopic("tenant-acme.orders", 12, (short) 3)
+    .configs(Map.of(
+        TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, "2",
+        TopicConfig.RETENTION_MS_CONFIG, "1209600000",   // 14 days
+        TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE));
+
+CreateTopicsResult result = admin.createTopics(List.of(orders));
+result.all().get();   // throws ExecutionException if creation failed
+System.out.println("Created with id " + result.topicId("tenant-acme.orders").get());
+```
+
+Pass `Optional.empty()` for the partition count and replication factor (`new NewTopic(name, Optional.empty(), Optional.empty())`) to use the broker's `num.partitions` and `default.replication.factor`. Explicit values are usually better: they make the intent visible in code.
+
+### Idempotent Creation
+
+Automation runs more than once. A provisioning job that crashes halfway and restarts should not fail because half its topics exist. Treat `TopicExistsException` as success, and then verify that the existing topic matches what you wanted:
+
+```java
+import java.util.concurrent.ExecutionException;
+import org.apache.kafka.common.errors.TopicExistsException;
+
+static void ensureTopic(Admin admin, NewTopic wanted) throws Exception {
+    try {
+        admin.createTopics(List.of(wanted)).all().get();
+        System.out.println("Created " + wanted.name());
+    } catch (ExecutionException e) {
+        if (!(e.getCause() instanceof TopicExistsException)) {
+            throw e;   // authorization failure, invalid config, timeout...
+        }
+        TopicDescription existing = admin.describeTopics(List.of(wanted.name()))
+            .allTopicNames().get().get(wanted.name());
+        if (existing.partitions().size() != wanted.numPartitions()) {
+            System.out.println("Warning: " + wanted.name() + " has "
+                + existing.partitions().size() + " partitions, expected " + wanted.numPartitions());
+        }
+    }
+}
+```
+
+Errors arrive wrapped in `ExecutionException`; the cause is the real Kafka exception. Common ones are `TopicExistsException`, `InvalidReplicationFactorException` (more replicas than brokers), `InvalidConfigurationException`, `PolicyViolationException` (rejected by a broker-side `create.topic.policy.class.name`) and `TopicAuthorizationException`.
+
+### Dry Runs
+
+`CreateTopicsOptions.validateOnly(true)` asks the controller to check everything (name, replication factor against live brokers, configs, policies, permissions) without creating anything. It is ideal for a pull-request check on topic definitions.
+
+```java
+admin.createTopics(List.of(orders), new CreateTopicsOptions().validateOnly(true)).all().get();
+```
+
+:::note
+`createTopics` returns once the controller has committed the topic to the cluster metadata. Brokers learn about it a moment later, so a producer started in the same millisecond can briefly see `UNKNOWN_TOPIC_OR_PARTITION`. Clients retry this automatically; it only matters in tests with very short timeouts.
+:::
+
+## Inspecting Topics
+
+`describeTopics` returns partitions with their leader, replicas and ISR, the same data `kafka-topics.sh --describe` prints:
+
+```java
+Map<String, TopicDescription> topics =
+    admin.describeTopics(List.of("tenant-acme.orders")).allTopicNames().get();
+
+for (TopicDescription td : topics.values()) {
+    System.out.println(td.name() + " id=" + td.topicId());
+    for (var p : td.partitions()) {
+        System.out.printf("  partition %d leader=%s replicas=%s isr=%s%n",
+            p.partition(), p.leader().id(), p.replicas().size(), p.isr().size());
+    }
+}
+```
+
+`describeConfigs` returns effective configuration with the source of each value, mirroring `kafka-configs.sh --describe --all`:
+
+```java
+import org.apache.kafka.common.config.ConfigResource;
+
+ConfigResource res = new ConfigResource(ConfigResource.Type.TOPIC, "tenant-acme.orders");
+Config config = admin.describeConfigs(List.of(res)).all().get().get(res);
+for (ConfigEntry entry : config.entries()) {
+    if (entry.source() == ConfigEntry.ConfigSource.DYNAMIC_TOPIC_CONFIG) {
+        System.out.println(entry.name() + " = " + entry.value());   // overrides only
+    }
+}
+```
+
+## Changing Configuration
+
+Use `incrementalAlterConfigs`. Each `AlterConfigOp` sets, deletes, appends to or subtracts from one setting, and settings you do not mention are left alone. The older `alterConfigs` method replaced the whole override set, so forgetting a key silently reset it; it has been deprecated since Kafka 2.3 and should not be used.
+
+```java
+ConfigResource res = new ConfigResource(ConfigResource.Type.TOPIC, "tenant-acme.orders");
+Collection<AlterConfigOp> ops = List.of(
+    new AlterConfigOp(new ConfigEntry(TopicConfig.RETENTION_MS_CONFIG, "2592000000"),
+        AlterConfigOp.OpType.SET),       // 30 days
+    new AlterConfigOp(new ConfigEntry(TopicConfig.MAX_MESSAGE_BYTES_CONFIG, ""),
+        AlterConfigOp.OpType.DELETE));   // fall back to the broker default
+
+admin.incrementalAlterConfigs(Map.of(res, ops)).all().get();
+```
+
+`APPEND` and `SUBTRACT` work on list-valued settings, for example adding `delete` to a `cleanup.policy` of `compact`.
+
+## Partitions, Records and Deletion
+
+**Adding partitions.** `createPartitions` grows a topic. It cannot shrink one, and growing a keyed topic changes which partition each key maps to, as explained in [Ordering Guarantees and Message Keys](./1-kafka-ordering-and-keys.mdx).
+
+```java
+admin.createPartitions(Map.of("tenant-acme.clicks", NewPartitions.increaseTo(24))).all().get();
+```
+
+**Deleting records.** `deleteRecords` moves a partition's log start offset forward, making everything before the given offset unreadable; whole segments below it are then removed. It is the tool for "purge everything before this point" without deleting the topic.
+
+```java
+import org.apache.kafka.common.TopicPartition;
+
+admin.deleteRecords(Map.of(
+    new TopicPartition("tenant-acme.orders", 0), RecordsToDelete.beforeOffset(150_000L)
+)).all().get();
+```
+
+**Deleting topics.** `deleteTopics` removes the topic and, asynchronously, its data on every broker. It requires `delete.topic.enable=true` on the brokers (the default). Deletion is irreversible, so production automation should require an explicit confirmation step or a separate privileged identity.
+
+```java
+admin.deleteTopics(List.of("tenant-acme.orders")).all().get();
+```
+
+## The Same Operations in Python
+
+`confluent-kafka` exposes the Admin API through `AdminClient`. Methods take lists and return a dictionary of futures, one per topic or resource.
+
+```python
+from confluent_kafka.admin import (
+    AdminClient, NewTopic, NewPartitions, ConfigResource, ConfigEntry,
+    AlterConfigOpType, ResourceType,
+)
+from confluent_kafka import KafkaError, KafkaException
+
+admin = AdminClient({"bootstrap.servers": "localhost:9092"})
+
+# Create topics; each future resolves to None on success.
+futures = admin.create_topics([
+    NewTopic("tenant-acme.orders", num_partitions=12, replication_factor=3,
+             config={"min.insync.replicas": "2", "retention.ms": "1209600000"}),
+])
+for topic, fut in futures.items():
+    try:
+        fut.result()
+        print(f"created {topic}")
+    except KafkaException as e:
+        err = e.args[0]                      # a KafkaError
+        if err.code() == KafkaError.TOPIC_ALREADY_EXISTS:
+            print(f"{topic} already exists")  # idempotent: treat as success
+        else:
+            raise
+
+# Change one setting incrementally.
+res = ConfigResource(ResourceType.TOPIC, "tenant-acme.orders", incremental_configs=[
+    ConfigEntry("retention.ms", "2592000000", incremental_operation=AlterConfigOpType.SET),
+])
+for r, fut in admin.incremental_alter_configs([res]).items():
+    fut.result()
+
+# Grow a topic and list what exists.
+admin.create_partitions([NewPartitions("tenant-acme.orders", 24)])["tenant-acme.orders"].result()
+print(sorted(admin.list_topics(timeout=10).topics))
+```
+
+## Worked Scenario: Provisioning Topics per Tenant
+
+A SaaS analytics company gives each enterprise customer its own set of topics: `tenant-<id>.events`, `tenant-<id>.orders` and a compacted `tenant-<id>.profiles`. Per-tenant topics let it apply per-tenant ACLs, quotas and retention (customers on the premium plan get 90 days), and delete a customer's data completely when they leave.
+
+**Provisioning.** When the billing system emits a `tenant.created` event, an onboarding service consumes it and calls `ensureTopic` for each of the three topics with settings from the customer's plan. Because creation is idempotent, a crash mid-way is fixed by simply processing the event again. A `validateOnly` call runs first so that a bad plan definition fails before anything is half-created.
+
+**Plan changes.** An upgrade to premium triggers `incrementalAlterConfigs` setting `retention.ms` to 90 days on the tenant's topics. Nothing else on the topic is touched.
+
+**Offboarding.** A `tenant.deleted` event, after a 30-day grace period, triggers `deleteTopics` for that tenant's topics, executed by a separate identity that is the only one with delete permission.
+
+**Reconciliation.** Once a night a job lists all `tenant-*` topics, compares them with the tenant database, and reports drift: topics for unknown tenants, missing topics, configs that differ from the plan. It reports rather than fixing automatically, because an automated delete triggered by a bug in the tenant database would be catastrophic.
+
+**The alternative not chosen.** The company first considered declaring all topics in Terraform or Strimzi `KafkaTopic` resources. That works well for a stable set of shared topics and is what it uses for its internal ones. For topics created by customer sign-ups at any hour, a code path driven by events was a better fit than a pull request per new customer. It also kept an eye on the cost of the pattern: three topics per tenant times 12 partitions times 2,000 tenants is 72,000 partitions before replication, so small tenants get fewer partitions, and the largest few hundred are the only ones with 12.
+
+## Common Mistakes
+
+- Forgetting to call `get()` on the result futures, so failures are never seen and the program exits before the request completes.
+- Catching `TopicExistsException` directly instead of unwrapping `ExecutionException.getCause()`.
+- Using the deprecated `alterConfigs`, which replaces all overrides and silently drops any you did not repeat.
+- Creating a new `Admin` client for every operation instead of reusing one.
+- Letting application code create topics with broker defaults on startup, inheriting one partition and whatever replication factor the broker has.
+- Running unguarded `deleteTopics` in automation, where one bad input can erase production data.
+- Creating per-entity topics (per user, per device) with the Admin API and running into partition count limits; per-entity data belongs in keys, not topic names.
+
+## Summary
+
+- The Admin API, `Admin` in Java and `AdminClient` in librdkafka-based clients, manages topics, configs, partitions and records from code.
+- Calls are asynchronous; wait on the futures and unwrap `ExecutionException` to see the real error.
+- Make creation idempotent by treating `TopicExistsException` as success and verifying the existing topic, and use `validateOnly` for dry runs.
+- Change settings with `incrementalAlterConfigs`; add partitions with `createPartitions`; purge with `deleteRecords`; remove topics with `deleteTopics` behind a guard.
+- Use the Admin API for dynamic, event-driven provisioning and declarative tools such as Strimzi or Terraform for stable shared topics.
+
+## Further Reading
+
+- [Admin API Javadoc](https://kafka.apache.org/documentation/#adminapi) is the starting point for the Java `Admin` interface and its options classes.
+- [KIP-339: Create a new IncrementalAlterConfigs API](https://cwiki.apache.org/confluence/display/KAFKA/KIP-339%3A+Create+a+new+IncrementalAlterConfigs+API) explains why incremental changes replaced `alterConfigs`.
+- [KIP-108: Create Topic Policy](https://cwiki.apache.org/confluence/display/KAFKA/KIP-108%3A+Create+Topic+Policy) describes broker-side policies that validate topic creation requests.
+- [confluent-kafka Python AdminClient](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#adminclient) documents the Python methods and their futures.
+- [KIP-107: Add deleteRecordsBefore API in AdminClient](https://cwiki.apache.org/confluence/display/KAFKA/KIP-107%3A+Add+deleteRecordsBefore%28%29+API+in+AdminClient) introduced record deletion by offset.

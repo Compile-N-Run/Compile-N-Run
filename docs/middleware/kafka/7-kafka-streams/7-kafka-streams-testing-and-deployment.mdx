@@ -1,0 +1,527 @@
+---
+title: "Testing and Deploying Kafka Streams Applications"
+description: "Test Kafka Streams topologies with TopologyTestDriver and Testcontainers, then deploy, scale, upgrade and monitor them safely in production on Kubernetes."
+---
+
+# Testing and Deploying Kafka Streams Applications
+
+## Introduction
+
+A Kafka Streams application looks like an ordinary Java service, and much of it is. But it has habits ordinary services do not: it keeps state on local disk, it creates topics behind your back, it reacts to timestamps inside the data rather than the clock on the wall, and renaming one operator can make it forget everything it knew. Teams that test only the happy path and deploy it like a stateless web app find these habits the hard way.
+
+This page covers both halves of getting an app to production. First, testing: fast, deterministic topology tests with `TopologyTestDriver`, and a few integration tests against a real broker. Second, running it: configuration, sizing, Kubernetes, upgrades that keep state, and the metrics that tell you it is healthy.
+
+After this page you will be able to:
+
+- unit-test a topology, including windows, late data and state stores, without a broker;
+- write an integration test against a real Kafka broker with Testcontainers;
+- choose production settings and deploy on Kubernetes with persistent state;
+- change a topology without losing state, and reset an app when you must;
+- monitor an app and recover from failures.
+
+## A Testing Strategy for Streams Apps
+
+| Level | Tool | Speed | What it catches |
+| --- | --- | --- | --- |
+| Unit | Plain JUnit on your functions | Milliseconds | Parsing, business rules in joiners and aggregators |
+| Topology | `TopologyTestDriver` | Milliseconds per test | Wiring, serdes, windows, late data, store contents |
+| Integration | Testcontainers with a real broker | Seconds | Config, topic creation, real serialization, commits |
+| System | Staging cluster, chaos tests | Minutes to hours | Rebalances, failover, performance, exactly-once under crashes |
+
+Keep logic that does not need Kafka in plain methods and test those directly. Write most of your Kafka-specific tests at the topology level, where they are fast and deterministic. Add a handful of integration tests per app to prove the pieces fit. See [Testing Kafka Applications](../13-kafka-best-practices/4-kafka-testing-strategies.mdx) for the broader picture beyond Kafka Streams.
+
+## TopologyTestDriver: Testing Without a Broker
+
+`TopologyTestDriver`, from the `kafka-streams-test-utils` artifact, runs your topology in the test's own thread with no broker, no network and no background threads. You pipe records into named input topics, and it processes each record synchronously, through every node, before `pipeInput` returns. You then read what arrived at the output topics and inspect the state stores directly.
+
+```xml
+<dependency>
+    <groupId>org.apache.kafka</groupId>
+    <artifactId>kafka-streams-test-utils</artifactId>
+    <version>4.3.1</version>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.junit.jupiter</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <version>5.14.4</version>
+    <scope>test</scope>
+</dependency>
+```
+
+The main pieces:
+
+- `new TopologyTestDriver(topology, props)` builds the driver. `bootstrap.servers` must be set but is never contacted.
+- `driver.createInputTopic(name, keySerializer, valueSerializer)` returns a `TestInputTopic`. `pipeInput(key, value, timestamp)` sends one record; the timestamp drives event time and therefore windows.
+- `driver.createOutputTopic(name, keyDeserializer, valueDeserializer)` returns a `TestOutputTopic`. `readKeyValuesToList()`, `readValue()` and `isEmpty()` read what was produced.
+- `driver.getKeyValueStore(name)`, `getWindowStore(name)` and friends return the stores for assertions.
+- `driver.advanceWallClockTime(duration)` fires wall-clock punctuators; event-time punctuators fire when piped timestamps advance stream time.
+- `driver.close()` cleans up, including the local state directory. Always call it, or state leaks into the next test.
+
+Structure your code so the topology is built by a plain static method, separate from `main`. That method is what tests call.
+
+### The Topology Under Test
+
+A factory monitors hydraulic presses. Each press reports its temperature, keyed by press ID. The app emits one alert per press per minute when the peak exceeds 90 C, waiting 10 seconds for late readings.
+
+```java
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.utils.Bytes;
+import org.apache.kafka.streams.KeyValue;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.Topology;
+import org.apache.kafka.streams.kstream.*;
+import org.apache.kafka.streams.state.WindowStore;
+
+import java.time.Duration;
+
+public final class OverheatAlerts {
+    public static final String INPUT = "machine-temperatures";
+    public static final String OUTPUT = "overheat-alerts";
+    public static final String STORE = "peak-temperature";
+    static final double LIMIT_CELSIUS = 90.0;
+
+    public static Topology build() {
+        StreamsBuilder builder = new StreamsBuilder();
+        builder.stream(INPUT, Consumed.with(Serdes.String(), Serdes.Double()))
+            .groupByKey(Grouped.with(Serdes.String(), Serdes.Double()))
+            .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofMinutes(1), Duration.ofSeconds(10)))
+            .emitStrategy(EmitStrategy.onWindowClose())          // one final result per window
+            .reduce(Math::max,
+                    Materialized.<String, Double, WindowStore<Bytes, byte[]>>as(STORE)
+                            .withKeySerde(Serdes.String())
+                            .withValueSerde(Serdes.Double()))
+            .toStream()
+            .filter((window, peak) -> peak > LIMIT_CELSIUS)
+            .map((window, peak) -> KeyValue.pair(window.key(), peak))
+            .to(OUTPUT, Produced.with(Serdes.String(), Serdes.Double()));
+        return builder.build();
+    }
+}
+```
+
+### The Tests
+
+```java
+import org.apache.kafka.common.serialization.*;
+import org.apache.kafka.streams.*;
+import org.apache.kafka.streams.state.WindowStore;
+import org.junit.jupiter.api.*;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Properties;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class OverheatAlertsTest {
+    private static final Instant T0 = Instant.parse("2026-10-17T10:00:00Z");
+
+    private TopologyTestDriver driver;
+    private TestInputTopic<String, Double> temperatures;
+    private TestOutputTopic<String, Double> alerts;
+
+    @BeforeEach
+    void setUp() {
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "overheat-alerts-test");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "unused:9092");  // never contacted
+        driver = new TopologyTestDriver(OverheatAlerts.build(), props);
+        temperatures = driver.createInputTopic(OverheatAlerts.INPUT,
+                new StringSerializer(), new DoubleSerializer());
+        alerts = driver.createOutputTopic(OverheatAlerts.OUTPUT,
+                new StringDeserializer(), new DoubleDeserializer());
+    }
+
+    @AfterEach
+    void tearDown() {
+        driver.close();   // also deletes the local state directory
+    }
+
+    @Test
+    void alertsOncePerWindowWithThePeak() {
+        temperatures.pipeInput("press-1", 85.0, T0.plusSeconds(5));
+        temperatures.pipeInput("press-1", 93.5, T0.plusSeconds(20));
+        temperatures.pipeInput("press-1", 91.0, T0.plusSeconds(50));
+        assertTrue(alerts.isEmpty(), "window is still open, nothing emitted yet");
+
+        // Stream time must pass window end + grace (10:01:10) to close the window
+        temperatures.pipeInput("press-1", 70.0, T0.plusSeconds(75));
+
+        assertEquals(List.of(KeyValue.pair("press-1", 93.5)), alerts.readKeyValuesToList());
+    }
+
+    @Test
+    void ignoresReadingsThatArriveAfterTheGracePeriod() {
+        temperatures.pipeInput("press-1", 80.0, T0.plusSeconds(5));
+        temperatures.pipeInput("press-1", 70.0, T0.plusSeconds(75));  // closes 10:00 window
+        temperatures.pipeInput("press-1", 99.0, T0.plusSeconds(30));  // too late, dropped
+        temperatures.pipeInput("press-1", 70.0, T0.plusSeconds(200)); // closes later windows
+
+        assertTrue(alerts.isEmpty());
+    }
+
+    @Test
+    void keepsPeaksPerMachineInTheStateStore() {
+        temperatures.pipeInput("press-1", 88.0, T0.plusSeconds(10));
+        temperatures.pipeInput("press-2", 61.0, T0.plusSeconds(12));
+
+        WindowStore<String, Double> store = driver.getWindowStore(OverheatAlerts.STORE);
+        assertEquals(88.0, store.fetch("press-1", T0.toEpochMilli()));
+        assertEquals(61.0, store.fetch("press-2", T0.toEpochMilli()));
+    }
+}
+```
+
+```text
+OverheatAlertsTest
+  keepsPeaksPerMachineInTheStateStore()            PASSED
+  ignoresReadingsThatArriveAfterTheGracePeriod()   PASSED
+  alertsOncePerWindowWithThePeak()                 PASSED
+3 tests successful, 0 tests failed
+```
+
+The three tests run in a few seconds, most of it RocksDB starting up. Notice how they use explicit timestamps: the first test documents that nothing is emitted until stream time passes 10:01:10, the second proves late data is dropped, and the third checks state directly instead of guessing from output.
+
+### Driver Tips and Limits
+
+- **Set timestamps explicitly** on every `pipeInput` when time matters. Without one, the driver uses an auto-advancing or current time, which makes window tests flaky.
+- **Send a tombstone** with `pipeInput("key", (String) null)`. The cast is needed because `pipeInput(K, V)` and `pipeInput(V, Instant)` are otherwise ambiguous.
+- **Turn off the record cache** (`statestore.cache.max.bytes=0`) when you assert on every intermediate update of a `KTable`.
+- **Fake Schema Registry**: with Confluent's Avro or Protobuf serdes, set `schema.registry.url=mock://test` to use an in-memory registry. See [Schema Registry](../6-kafka-schemas/1-kafka-schema-registry.mdx).
+- **What it cannot test**: multiple partitions and co-partitioning, rebalances, real commits and exactly-once behavior, broker-side configuration, and performance. The driver runs every task in one thread over a single logical partition per topic.
+
+## Integration Tests with Testcontainers
+
+For a few end-to-end checks, start a real broker in Docker with Testcontainers. Kafka's official `apache/kafka` image starts a single-node KRaft broker in a few seconds.
+
+```xml
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>testcontainers-kafka</artifactId>
+    <version>2.0.5</version>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>testcontainers-junit-jupiter</artifactId>
+    <version>2.0.5</version>
+    <scope>test</scope>
+</dependency>
+```
+
+```java
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.*;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.StreamsConfig;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.kafka.KafkaContainer;
+
+import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+@Testcontainers
+class OverheatAlertsIT {
+
+    @Container
+    static final KafkaContainer kafka = new KafkaContainer("apache/kafka:4.3.1");   // single KRaft broker
+
+    @TempDir
+    Path stateDir;
+
+    @Test
+    void producesAnAlertThroughARealBroker() throws Exception {
+        String bootstrap = kafka.getBootstrapServers();
+        try (Admin admin = Admin.create(Map.of("bootstrap.servers", bootstrap))) {
+            admin.createTopics(List.of(
+                    new NewTopic(OverheatAlerts.INPUT, 3, (short) 1),
+                    new NewTopic(OverheatAlerts.OUTPUT, 3, (short) 1))).all().get();
+        }
+
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "overheat-alerts-it");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
+        props.put(StreamsConfig.STATE_DIR_CONFIG, stateDir.toString());
+        props.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 100);
+
+        try (KafkaStreams streams = new KafkaStreams(OverheatAlerts.build(), props)) {
+            streams.start();
+
+            Instant t0 = Instant.parse("2026-10-17T10:00:00Z");
+            try (KafkaProducer<String, Double> producer = new KafkaProducer<>(
+                    Map.of("bootstrap.servers", bootstrap),
+                    new StringSerializer(), new DoubleSerializer())) {
+                producer.send(new ProducerRecord<>(OverheatAlerts.INPUT, null, t0.toEpochMilli(), "press-1", 95.0));
+                // a later reading closes the 10:00 window
+                producer.send(new ProducerRecord<>(OverheatAlerts.INPUT, null, t0.plusSeconds(90).toEpochMilli(), "press-1", 60.0));
+            }
+
+            Map<String, Object> consumerProps = Map.of(
+                    ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap,
+                    ConsumerConfig.GROUP_ID_CONFIG, "it-reader",
+                    ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+            try (KafkaConsumer<String, Double> consumer = new KafkaConsumer<>(
+                    consumerProps, new StringDeserializer(), new DoubleDeserializer())) {
+                consumer.subscribe(List.of(OverheatAlerts.OUTPUT));
+                List<ConsumerRecord<String, Double>> received = new ArrayList<>();
+                long deadline = System.currentTimeMillis() + 30_000;
+                while (received.isEmpty() && System.currentTimeMillis() < deadline) {
+                    consumer.poll(Duration.ofMillis(500)).forEach(received::add);
+                }
+                assertEquals(1, received.size());
+                assertEquals("press-1", received.get(0).key());
+                assertEquals(95.0, received.get(0).value());
+            }
+        }
+    }
+}
+```
+
+This test takes around ten seconds, including the container start. It proves things the driver cannot: the app connects, creates its internal changelog topic, commits, and produces readable output through a real broker. Both readings use the same key, so they land in the same partition and the window closes as expected; a test with records spread across partitions would need later readings in each partition. Use a `@TempDir` for `state.dir` so parallel test runs do not share RocksDB folders, and poll with a deadline instead of a fixed sleep.
+
+## Production Configuration
+
+Most defaults are tuned for a laptop. Review these before the first deploy:
+
+| Setting | Default | Production advice |
+| --- | --- | --- |
+| `application.id` | none | Stable, unique per app; changing it means a fresh start |
+| `replication.factor` | -1 (broker default) | 3, so internal topics survive a broker loss |
+| `state.dir` | `kafka-streams` under the temp directory | A persistent volume |
+| `num.stream.threads` | 1 | Cores available; total threads across instances should not exceed partitions |
+| `num.standby.replicas` | 0 | 1 for stateful apps with large stores |
+| `processing.guarantee` | `at_least_once` | `exactly_once_v2` where results must reconcile |
+| `commit.interval.ms` | 30000 (100 with EOS) | Lower for latency-sensitive apps |
+| `statestore.cache.max.bytes` | 10 MB | Raise for heavy aggregations; it is shared across threads |
+| `deserialization.exception.handler` | log and fail | Decide explicitly; add `errors.dead.letter.queue.topic.name` if you continue |
+
+**Sizing.** The maximum parallelism is the number of partitions of the input topics (more precisely, the number of tasks). With 12 partitions, 3 instances with 4 threads each use every task. A fourth instance would sit idle until partitions are added, and adding partitions to a stateful app's input topics breaks key-to-partition mapping for existing state. Choose partition counts with growth in mind; see [Choosing the Number of Partitions](../12-kafka-performance/4-kafka-partition-count.mdx).
+
+**Memory.** RocksDB uses off-heap memory: block cache, write buffers and index blocks per store and per partition. A JVM with a 2 GB heap can use far more RSS in total. Leave headroom in container limits, or configure a `rocksdb.config.setter` to bound RocksDB memory.
+
+## Deploying on Kubernetes
+
+Run stateful Kafka Streams apps as a **StatefulSet**, not a Deployment. Each pod then keeps a stable identity and its own persistent volume, so after a restart it finds its RocksDB files and only replays the changelog tail instead of everything.
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: overheat-alerts
+spec:
+  serviceName: overheat-alerts
+  replicas: 3
+  selector:
+    matchLabels:
+      app: overheat-alerts
+  template:
+    metadata:
+      labels:
+        app: overheat-alerts
+    spec:
+      terminationGracePeriodSeconds: 60     # time for close() to commit and leave the group
+      containers:
+        - name: app
+          image: registry.example.com/overheat-alerts:1.4.0
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka-bootstrap.kafka:9092
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=50"   # leave room for RocksDB off-heap memory
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /live, port: 8080 }
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "1", memory: 3Gi }
+            limits: { memory: 3Gi }
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/kafka-streams
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+```
+
+The application exposes the two probe endpoints from `KafkaStreams#state()` and replaces crashed stream threads instead of quietly running with fewer:
+
+```java
+import com.sun.net.httpserver.HttpServer;
+import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler.StreamThreadExceptionResponse;
+
+import java.net.InetSocketAddress;
+import java.util.Properties;
+
+public class OverheatAlertsApp {
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "overheat-alerts");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, System.getenv("KAFKA_BOOTSTRAP_SERVERS"));
+        props.put(StreamsConfig.STATE_DIR_CONFIG, "/var/lib/kafka-streams");   // the persistent volume
+        props.put(StreamsConfig.REPLICATION_FACTOR_CONFIG, 3);
+        props.put(StreamsConfig.NUM_STANDBY_REPLICAS_CONFIG, 1);
+
+        KafkaStreams streams = new KafkaStreams(OverheatAlerts.build(), props);
+
+        // A crashed stream thread is replaced instead of silently shrinking capacity
+        streams.setUncaughtExceptionHandler(e -> StreamThreadExceptionResponse.REPLACE_THREAD);
+
+        // Liveness: the process is not dead. Readiness: tasks are assigned and running.
+        HttpServer health = HttpServer.create(new InetSocketAddress(8080), 0);
+        health.createContext("/live", ex -> {
+            int code = streams.state() == KafkaStreams.State.ERROR
+                    || streams.state() == KafkaStreams.State.NOT_RUNNING ? 503 : 200;
+            ex.sendResponseHeaders(code, -1);
+            ex.close();
+        });
+        health.createContext("/ready", ex -> {
+            ex.sendResponseHeaders(streams.state() == KafkaStreams.State.RUNNING ? 200 : 503, -1);
+            ex.close();
+        });
+        health.start();
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            streams.close();   // leave the group cleanly so tasks move immediately
+            health.stop(0);
+        }));
+        streams.start();
+    }
+}
+```
+
+`REPLACE_THREAD` suits transient errors. For bugs that will fail on every retry, such as a poison record, it loops; `SHUTDOWN_CLIENT` stops this instance and `SHUTDOWN_APPLICATION` stops all instances of the app. Do not let the liveness probe fail during `REBALANCING`: a long state restore is normal, and restarting the pod would only start the restore again.
+
+The [Kubernetes tutorial](/docs/devops/kubernetes) covers StatefulSets in general, and [Kafka on Kubernetes with Strimzi](../10-kafka-operations/6-kafka-kubernetes-strimzi.mdx) covers running the brokers themselves.
+
+## Changing a Topology Without Losing State
+
+Kafka Streams links state to names: store names become changelog topic names, and the position of operators determines generated names such as `KSTREAM-AGGREGATE-STATE-STORE-0000000003`. Insert a `filter` early in the topology and every number after it shifts. The new version looks for a store that does not exist, starts with empty state, and creates a new changelog, while the old one lingers. Nothing fails; the counts just restart from zero.
+
+The defense is to **name everything stateful**: `Materialized.as("...")` for stores, `Grouped.as("...")` for repartition topics, `StreamJoined#withStoreName` and `Joined.as` for joins, `Named.as` for processors you might query. Since Kafka 4.1 (KIP-1111) you can make Kafka Streams refuse to build a topology with unnamed internal resources:
+
+```java
+Properties props = new Properties();
+props.put(StreamsConfig.APPLICATION_ID_CONFIG, "overheat-alerts");
+props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+props.put(StreamsConfig.ENSURE_EXPLICIT_INTERNAL_RESOURCE_NAMING_CONFIG, true);
+
+// The check runs when the builder is created with the topology config
+StreamsBuilder builder = new StreamsBuilder(new TopologyConfig(new StreamsConfig(props)));
+builder.stream("in", Consumed.with(Serdes.String(), Serdes.String())).groupByKey().count();
+builder.build();
+```
+
+```text
+org.apache.kafka.streams.errors.TopologyException: Invalid topology: Following changelog topic(s) has not been named: KSTREAM-AGGREGATE-STATE-STORE-0000000001-changelog
+Following state store(s) has not been named: KSTREAM-AGGREGATE-STATE-STORE-0000000001
+```
+
+Other changes need more care:
+
+| Change | Compatible with a rolling deploy? |
+| --- | --- |
+| Change logic inside a lambda (same types) | Yes |
+| Add a stateless operator, all stateful steps named | Yes |
+| Add a new aggregation or store | Yes, it starts empty |
+| Change a store's value format | Only if the new serde can read old data |
+| Change the key or partition count of a stateful step | No: reset or use a new `application.id` |
+| Remove a store | Yes, then delete the orphaned changelog topic |
+
+For incompatible changes, either deploy the new version under a new `application.id` (it reprocesses input from the beginning while the old version keeps serving, then you switch consumers over) or stop all instances and reset:
+
+```bash
+# Stop every instance first, then preview the reset
+kafka-streams-application-reset.sh --bootstrap-server localhost:9092 \
+  --application-id overheat-alerts --input-topics machine-temperatures --to-earliest --dry-run
+
+# Run it for real, then delete local state on each instance (or call KafkaStreams#cleanUp before start)
+kafka-streams-application-reset.sh --bootstrap-server localhost:9092 \
+  --application-id overheat-alerts --input-topics machine-temperatures --to-earliest
+```
+
+The tool resets input offsets and deletes internal topics. It does not touch output topics, so consumers will see results again.
+
+## Monitoring and Operations
+
+Kafka Streams exposes metrics through JMX (and through `KafkaStreams#metrics()`), which you can scrape into [Prometheus](/docs/observability/prometheus). The ones to alert on:
+
+| Metric | Level | Watch for |
+| --- | --- | --- |
+| Consumer `records-lag-max` | Main consumer | Lag growing: the app cannot keep up |
+| `process-rate`, `process-latency-avg` | Thread / task | Throughput drops, slow processing |
+| `commit-latency-avg` | Thread | Slow commits, especially under EOS |
+| `dropped-records-total` | Task | Late records outside grace, bad timestamps |
+| `restore-remaining-records-total` | Task | Long restores after failover |
+| `alive-stream-threads`, client `state` | Client | Threads dying, app stuck outside `RUNNING` |
+| RocksDB `block-cache-usage`, `size-all-mem-tables` | Store | Memory pressure |
+
+Consumer lag for the whole app is also visible from outside with the consumer group tools, as described in [Consumer Lag](../10-kafka-operations/2-kafka-consumer-lag.mdx).
+
+:::tip
+Since Kafka 4.2 the **streams rebalance protocol** (KIP-1071) is generally available for its core feature set. With `group.protocol=streams`, the broker computes task assignments, rebalances get faster and less disruptive, and you can inspect groups with `kafka-streams-groups.sh`. It is opt-in, and not every classic feature is supported yet (check the developer guide for your version before migrating an existing app). Applications on it reset offsets with the streams groups tool rather than `kafka-streams-application-reset.sh`.
+:::
+
+## Worked Scenario: Shipping the Overheat Alerts
+
+Putting it together for the press monitoring app:
+
+1. **Tests.** Three `TopologyTestDriver` tests cover peaks, late data and state, and run on every commit. One Testcontainers test runs in CI to prove connectivity and real serialization.
+2. **Topics.** `machine-temperatures` gets 12 partitions, keyed by press ID, replication factor 3. `overheat-alerts` is created by the platform team; the app's changelog topic is created by the app with replication factor 3.
+3. **Deployment.** A StatefulSet with 3 pods, 4 threads each, one standby replica, 20 GB volumes for RocksDB, readiness on `RUNNING`.
+4. **Upgrades.** Every store and repartition topic is named, so lambda changes ship as rolling restarts. When the team later changed the window size from 1 to 5 minutes, which is incompatible with the stored windows, they deployed under `overheat-alerts-v2`, let it catch up, and retired v1.
+5. **Alerts.** Lag over 10,000 records for 5 minutes, any `dropped-records-total` increase, fewer alive threads than configured, and the client leaving `RUNNING` for more than 10 minutes.
+
+## Common Mistakes
+
+- **Not closing the driver.** State directories and RocksDB handles leak between tests, and tests start failing in odd ways.
+- **Asserting on time-dependent output without explicit timestamps.** Window tests become flaky.
+- **Running stateful apps as a Deployment with `emptyDir`.** Every restart replays all changelogs.
+- **Container memory limits sized for the heap only.** RocksDB's off-heap use gets the pod OOM-killed.
+- **Unnamed stores and repartition topics.** A harmless-looking topology change silently resets state.
+- **Liveness probes that fail during restore.** Kubernetes kills the pod mid-restore, forever.
+- **Scaling beyond the partition count.** Extra instances or threads get no tasks.
+- **Resetting without stopping all instances.** A running instance keeps committing and fights the reset tool.
+
+## Summary
+
+- Test logic as plain functions, topologies with `TopologyTestDriver` using explicit timestamps, and a few integration paths with Testcontainers and the `apache/kafka` image.
+- `TopologyTestDriver` is fast and deterministic but cannot test partitions, rebalances or exactly-once.
+- In production set `replication.factor=3`, a persistent `state.dir`, standby replicas for large state, and explicit exception handling.
+- Deploy stateful apps as StatefulSets with persistent volumes, graceful shutdown and readiness tied to `RUNNING`.
+- Name all stateful resources; enforce it with `ensure.explicit.internal.resource.naming`. Use a new `application.id` or the reset tool for incompatible changes.
+- Monitor lag, processing rate, dropped records, restore progress and thread health.
+
+## Further Reading
+
+- [Testing a Streams application](https://kafka.apache.org/documentation/streams/developer-guide/testing.html): official guide to `TopologyTestDriver` and test utilities.
+- [Kafka Streams metrics](https://kafka.apache.org/documentation/#kafka_streams_monitoring): the full list of client, thread, task, store and RocksDB metrics.
+- [Application reset tool](https://kafka.apache.org/documentation/streams/developer-guide/app-reset-tool.html): reset options and caveats.
+- [Testcontainers Kafka module](https://java.testcontainers.org/modules/kafka/): running Kafka in Docker for tests.
+- [KIP-1111: Enforcing explicit naming for Kafka Streams internal topics](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1111%3A+Enforcing+Explicit+Naming+for+Kafka+Streams+Internal+Topics): the naming check.
+- [KIP-1071: Streams Rebalance Protocol](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1071%3A+Streams+Rebalance+Protocol): broker-side task assignment.

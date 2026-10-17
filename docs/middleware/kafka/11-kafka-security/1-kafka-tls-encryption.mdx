@@ -1,0 +1,278 @@
+---
+title: "TLS Encryption in Transit"
+description: "Set up TLS for Kafka brokers, controllers and clients: build a CA, create keystores, enable hostname verification, rotate certificates and test with openssl."
+---
+
+# TLS Encryption in Transit
+
+## Introduction
+
+Kafka's wire protocol is binary, but it is not secret. Run `tcpdump` on a host between a producer and a broker using `PLAINTEXT` and you can read customer names, card fingerprints and SCRAM handshakes as they go by. Inside a data center that might feel acceptable. Across availability zones, through a cloud load balancer or over a VPN to a partner, it is not.
+
+TLS fixes this. It is the same protocol that protects HTTPS, and Kafka supports it on every listener: client to broker, broker to broker, and broker to controller. TLS also lets the client verify that it is talking to the real broker, not an impostor, and optionally lets the broker verify the client (mutual TLS).
+
+After this page you will be able to:
+
+- explain what TLS gives you in Kafka and what it costs;
+- create a small certificate authority and per-node certificates with the right subject alternative names;
+- configure TLS on KRaft brokers, controllers and clients in Java, Python and the CLI;
+- verify the setup with `openssl` and rotate certificates without restarting brokers.
+
+## What TLS Does for Kafka
+
+TLS provides three properties:
+
+1. **Confidentiality.** Traffic is encrypted, so an eavesdropper sees noise.
+2. **Integrity.** Any tampering with bytes in flight breaks the connection.
+3. **Server authentication.** The client checks that the broker's certificate is signed by a trusted certificate authority (CA) and that the hostname it connected to appears in the certificate.
+
+A useful analogy is a sealed, tamper-evident envelope with a notarized return address. The seal is encryption and integrity; the notary is the CA vouching for the sender's identity.
+
+With `ssl.client.auth=required`, the broker also asks the client for a certificate. That is mutual TLS (mTLS), and it doubles as an authentication method. The [SASL page](./2-kafka-sasl-authentication.mdx) compares mTLS with password and token-based options.
+
+Kafka uses two Java concepts that confuse newcomers:
+
+| Store | Contains | Who needs it |
+| --- | --- | --- |
+| Keystore | This node's private key and its signed certificate chain | Every broker and controller; clients only when using mTLS |
+| Truststore | The CA certificates this node trusts | Every client, broker and controller |
+
+Since Kafka 2.7 you can skip Java keystore files entirely and supply PEM files, which is what most tooling (cert-manager, Vault, Let's Encrypt) produces. We show both.
+
+## Building a Certificate Authority and Node Certificates
+
+In production you will probably get certificates from an internal PKI such as HashiCorp Vault, AWS Private CA or cert-manager on Kubernetes. For learning, and for small on-premises clusters, `openssl` is enough. The steps below create one CA, then a certificate for one broker.
+
+```bash
+# 1. Create a CA key and a self-signed CA certificate valid for 5 years
+openssl req -x509 -new -nodes -newkey rsa:4096 -sha256 -days 1825 \
+  -keyout ca.key -out ca.crt -subj "/CN=Example Kafka CA/O=Example"
+
+# 2. Create a private key and a signing request for broker kafka-1
+openssl req -new -nodes -newkey rsa:2048 \
+  -keyout kafka-1.key -out kafka-1.csr \
+  -subj "/CN=kafka-broker/OU=Platform/O=Example"
+
+# 3. Sign it with the CA, adding every name clients will use to reach this broker
+cat > kafka-1.ext <<'EXT'
+subjectAltName=DNS:kafka-1.kafka.internal,DNS:kafka-1.example.com
+extendedKeyUsage=serverAuth,clientAuth
+EXT
+openssl x509 -req -in kafka-1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 397 -sha256 -extfile kafka-1.ext -out kafka-1.crt
+
+# 4. Optional: bundle into a PKCS12 keystore for JVM-style configuration
+openssl pkcs12 -export -in kafka-1.crt -inkey kafka-1.key -certfile ca.crt \
+  -name kafka-1 -out kafka-1.keystore.p12 -passout pass:changeit
+
+# 5. Truststore holding only the CA, shared by every node and client
+keytool -importcert -noprompt -alias example-ca -file ca.crt \
+  -keystore truststore.p12 -storetype PKCS12 -storepass changeit
+```
+
+Three details in this script matter more than they look.
+
+**Subject alternative names.** Clients verify the hostname against the certificate's SAN list, not the CN. Every name a client may use to reach this broker must be listed: the internal DNS name, the external DNS name, and the load balancer name if there is one. A missing SAN is the most common TLS failure in Kafka.
+
+**One certificate per node.** Each broker has its own `advertised.listeners` hostname, so each needs its own certificate. A wildcard certificate such as `*.kafka.internal` works too and simplifies operations, at the cost that one stolen key impersonates every broker.
+
+**`clientAuth` usage.** Brokers act as TLS clients when they replicate from other brokers and when they connect to controllers. Including `clientAuth` lets the same certificate serve both sides of mTLS.
+
+## Configuring Brokers and Controllers
+
+This broker serves mTLS on `INTERNAL` and `CONTROLLER`, and `SASL_SSL` on `EXTERNAL`. The `ssl.*` settings at the top level apply to every TLS listener unless a `listener.name.<name>.ssl.*` override exists.
+
+```properties
+# --- broker node kafka-1 ---
+listeners=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094
+advertised.listeners=INTERNAL://kafka-1.kafka.internal:9092,EXTERNAL://kafka-1.example.com:9094
+listener.security.protocol.map=INTERNAL:SSL,EXTERNAL:SASL_SSL,CONTROLLER:SSL
+inter.broker.listener.name=INTERNAL
+controller.listener.names=CONTROLLER
+
+# Identity and trust (PKCS12 files)
+ssl.keystore.type=PKCS12
+ssl.keystore.location=/etc/kafka/tls/kafka-1.keystore.p12
+ssl.keystore.password=changeit
+ssl.key.password=changeit
+ssl.truststore.type=PKCS12
+ssl.truststore.location=/etc/kafka/tls/truststore.p12
+ssl.truststore.password=changeit
+
+# Protocol versions; this is the default on modern JVMs, written out for clarity
+ssl.enabled.protocols=TLSv1.3,TLSv1.2
+
+# Require client certificates on the internal listener only (mTLS between brokers)
+listener.name.internal.ssl.client.auth=required
+```
+
+Controllers look similar but only have the controller listener:
+
+```properties
+# --- controller node ctrl-1 ---
+process.roles=controller
+node.id=1
+listeners=CONTROLLER://0.0.0.0:9093
+advertised.listeners=CONTROLLER://ctrl-1.kafka.internal:9093
+controller.listener.names=CONTROLLER
+listener.security.protocol.map=CONTROLLER:SSL
+ssl.client.auth=required
+ssl.keystore.type=PEM
+ssl.keystore.location=/etc/kafka/tls/ctrl-1.pem
+ssl.key.password=changeit
+ssl.truststore.type=PEM
+ssl.truststore.location=/etc/kafka/tls/ca.crt
+```
+
+The controller example uses PEM files: the keystore file contains the encrypted private key followed by the certificate chain, and the truststore file contains CA certificates. With PEM, `ssl.keystore.password` is not used; only `ssl.key.password` protects the key.
+
+:::warning
+Never set `ssl.endpoint.identification.algorithm=` (empty) to "fix" a hostname error. Hostname verification is what stops a man-in-the-middle with any certificate from your CA from impersonating a broker. Fix the SANs instead.
+:::
+
+## Configuring Clients
+
+A client needs the truststore, and a keystore only if the listener requires mTLS. Here is a Java producer for a listener mapped to `SSL` with client certificates, the way an internal service with its own certificate would connect. For a `SASL_SSL` listener you keep the truststore lines and add the SASL settings from the next page.
+
+```java
+import java.util.Properties;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.StringSerializer;
+
+public class TlsProducer {
+    public static void main(String[] args) {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka-1.kafka.internal:9092");
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+
+        // TLS: trust the cluster CA. Hostname verification is on by default.
+        props.put("security.protocol", "SSL");
+        props.put("ssl.truststore.type", "PEM");
+        props.put("ssl.truststore.location", "/etc/app/tls/ca.crt");
+
+        // Only needed if the listener requires client certificates (mTLS)
+        props.put("ssl.keystore.type", "PEM");
+        props.put("ssl.keystore.location", "/etc/app/tls/order-service.pem");
+        props.put("ssl.key.password", System.getenv("TLS_KEY_PASSWORD"));
+
+        try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+            producer.send(new ProducerRecord<>("orders.created", "order-42", "{\"total\": 99.5}"));
+        }
+    }
+}
+```
+
+The Python client, `confluent-kafka`, is built on librdkafka and uses OpenSSL-style file settings rather than Java stores:
+
+```python
+from confluent_kafka import Producer
+
+producer = Producer({
+    "bootstrap.servers": "kafka-1.kafka.internal:9092",
+    "security.protocol": "SSL",
+    "ssl.ca.location": "/etc/app/tls/ca.crt",               # CA bundle to trust
+    "ssl.certificate.location": "/etc/app/tls/order-service.crt",  # mTLS only
+    "ssl.key.location": "/etc/app/tls/order-service.key",          # mTLS only
+    # librdkafka verifies the broker hostname by default ("https")
+})
+producer.produce("orders.created", key="order-42", value='{"total": 99.5}')
+producer.flush()
+```
+
+For the CLI tools, put the same properties in a file and pass it with `--command-config` (or `--producer.config` / `--consumer.config` for the console clients):
+
+```bash
+cat > client-tls.properties <<'EOF'
+security.protocol=SSL
+ssl.truststore.type=PEM
+ssl.truststore.location=/etc/app/tls/ca.crt
+# This listener requires client certificates, so the CLI needs one too
+ssl.keystore.type=PEM
+ssl.keystore.location=/etc/kafka/tls/platform-admin.pem
+ssl.key.password=changeit
+EOF
+
+kafka-topics.sh --bootstrap-server kafka-1.kafka.internal:9092 \
+  --command-config client-tls.properties --list
+```
+
+## Verifying the Setup
+
+`openssl s_client` connects like a client and prints what the broker presents. It is the fastest way to debug TLS without involving Kafka at all.
+
+```bash
+openssl s_client -connect kafka-1.example.com:9094 \
+  -servername kafka-1.example.com -CAfile ca.crt </dev/null 2>/dev/null \
+  | grep -E "subject=|issuer=|Verify return code|Protocol"
+```
+
+```text
+subject=CN = kafka-broker, OU = Platform, O = Example
+issuer=CN = Example Kafka CA, O = Example
+    Protocol  : TLSv1.3
+Verify return code: 0 (ok)
+```
+
+To check the SAN list, pipe the certificate through `openssl x509 -noout -ext subjectAltName`. If the return code is not 0, or the hostname you use is missing from the SANs, Kafka clients will fail too, with errors such as `SSLHandshakeException: No subject alternative DNS name matching`.
+
+## Rotating Certificates Without Downtime
+
+Certificates expire, and short lifetimes (90 days or less) are good practice. Kafka brokers can reload keystores and truststores without a restart. Replace the file on disk, then ask the broker to reload by altering the listener config, even to the same path:
+
+```bash
+kafka-configs.sh --bootstrap-server kafka-1.example.com:9094 \
+  --command-config admin.properties \
+  --entity-type brokers --entity-name 1 --alter \
+  --add-config listener.name.external.ssl.keystore.location=/etc/kafka/tls/kafka-1.keystore.p12
+```
+
+The broker validates the new keystore before using it and rejects the change if, for example, the file cannot be loaded or the certificate's identity (its DN or SANs) no longer matches. Existing connections keep their session; new connections get the new certificate.
+
+Rotating the CA is the harder case. Do it in three passes: add the new CA to every truststore alongside the old one, then reissue node and client certificates from the new CA, then remove the old CA. Skipping the first pass breaks every connection at once.
+
+## The Cost of TLS
+
+Encryption is not free, and it is worth knowing where the cost lands.
+
+- **Lost zero-copy.** On `PLAINTEXT`, brokers serve consumers with `sendfile`, moving data from page cache to socket without copying it into the JVM. With TLS, data must be read into user space to be encrypted, so broker CPU usage for consumer traffic rises noticeably.
+- **Handshake cost.** Each new connection performs a TLS handshake. That matters for clients that reconnect constantly, such as short-lived serverless functions. Long-lived producers and consumers pay it once.
+- **Modern hardware helps.** AES-GCM with CPU instructions (AES-NI) is fast, and TLS 1.3 needs fewer round trips. In practice, many teams see 10 to 30 percent more broker CPU, not a collapse in throughput.
+
+Benchmark with your own record sizes before and after enabling TLS, using the tools in [Benchmarking](../12-kafka-performance/5-kafka-benchmarking.mdx).
+
+## A Worked Scenario: Clickstream Across Regions
+
+A retailer collects clickstream events in two cloud regions and mirrors them to a central analytics cluster with MirrorMaker 2. Traffic crosses the public internet through the cloud provider's backbone. The security team requires encryption for anything leaving a VPC.
+
+The team considered an IPsec VPN between regions, which would encrypt everything without touching Kafka configuration. They rejected it because the VPN would still terminate in a shared network where other workloads could sniff traffic, and because it did nothing to authenticate which cluster was which.
+
+Instead they enabled `SASL_SSL` on an external listener of the central cluster, issued certificates from their internal Vault PKI with SANs for both the internal and public DNS names, and configured MirrorMaker 2 with the CA in its truststore. Certificates are valid for 30 days; a cron job renews them through Vault and calls `kafka-configs.sh` to reload each broker. CPU on the central cluster rose by about 15 percent, which they absorbed with no extra brokers.
+
+## Common Mistakes
+
+- Missing SANs for load balancer or external DNS names, then disabling hostname verification instead of fixing the certificate.
+- Using the same keystore password everywhere and committing it to a Git repository alongside the configuration.
+- Letting a certificate expire because nobody monitored the expiry date. Alert at 30 and 7 days before expiry.
+- Enabling TLS on the client listener but leaving `INTERNAL` and `CONTROLLER` on `PLAINTEXT`.
+- Setting `ssl.client.auth=requested`, which allows clients without certificates to connect as `User:ANONYMOUS`. Use `required` or `none`.
+- Forgetting to put the full chain (node certificate plus intermediates) in the keystore, which breaks clients that only trust the root CA.
+
+## Summary
+
+- TLS gives Kafka confidentiality, integrity and server authentication; with `ssl.client.auth=required` it also authenticates clients.
+- Every broker and controller needs a keystore; every node and client needs a truststore. PEM files work as well as JKS or PKCS12.
+- Certificates must list every hostname clients use in their SANs; keep hostname verification enabled.
+- Configure TLS on all three listener types in a KRaft cluster: client, inter-broker and controller.
+- Brokers can reload certificates dynamically through `kafka-configs.sh`; rotate CAs in three passes.
+- Expect more broker CPU, mainly from losing zero-copy transfers, and measure it on your workload.
+
+## Further Reading
+
+- [Kafka documentation: Encryption and Authentication using SSL](https://kafka.apache.org/43/security/encryption-and-authentication-using-ssl/) - keystore creation, broker and client settings, and PEM support.
+- [KIP-651: Support PEM format for SSL certificates and private key](https://cwiki.apache.org/confluence/display/KAFKA/KIP-651+-+Support+PEM+format+for+SSL+certificates+and+private+key) - how PEM keystores and truststores work.
+- [KIP-226: Dynamic Broker Configuration](https://cwiki.apache.org/confluence/display/KAFKA/KIP-226+-+Dynamic+Broker+Configuration) - the mechanism behind reloading keystores without restarts.
+- [librdkafka configuration](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md) - TLS settings for `confluent-kafka` and other librdkafka-based clients.
+- [Authentication with SASL: SCRAM, OAUTHBEARER and mTLS](./2-kafka-sasl-authentication.mdx) - the next step after encryption.

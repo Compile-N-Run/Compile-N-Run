@@ -41,7 +41,7 @@ for (const width of [997, 1024, 1100, 1200, 1280, 1320, 1440, 1480]) {
       await expect(panel).not.toBeVisible();
       await expect(toggle).toBeFocused();
     }
-    expect(courseLinks).toBe(94); // 80 course links + 14 interview links
+    expect(courseLinks).toBe(95); // 81 course links (Kafka added) + 14 interview links
     await categoryToggles.nth(4).click();
     await expect(nav.locator('[data-tutorial-browse][open]')).toContainText('Databases');
     await categoryToggles.nth(5).click();

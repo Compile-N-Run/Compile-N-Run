@@ -1,0 +1,227 @@
+---
+title: "Authorization with ACLs"
+description: "Enable StandardAuthorizer on a KRaft cluster and write least-privilege ACLs for producers, consumers, transactions and Kafka Streams with kafka-acls.sh and the Admin API."
+---
+
+# Authorization with ACLs
+
+## Introduction
+
+Once clients authenticate, the broker knows *who* is connecting. Authorization decides *what* they may do. Without it, an authenticated analytics job could still delete the payments topic, and a compromised marketing service could write fake ledger entries.
+
+Kafka's built-in authorization uses access control lists (ACLs). Each ACL is a sentence: "principal P is ALLOWED (or DENIED) to perform operation O on resource R from host H". The broker checks every request against these rules before doing anything.
+
+After this page you will be able to:
+
+- enable `StandardAuthorizer` on a KRaft cluster without locking yourself out;
+- read and write ACLs for topics, consumer groups, transactional IDs and the cluster;
+- grant the minimum permissions for producers, consumers, transactional apps and Kafka Streams;
+- manage ACLs from scripts with `kafka-acls.sh` and from code with the Admin API;
+- debug authorization failures from the authorizer log.
+
+## The ACL Model
+
+Every ACL has five parts:
+
+| Part | Examples | Notes |
+| --- | --- | --- |
+| Principal | `User:payments-writer`, `User:*` | Comes from authentication |
+| Permission | `ALLOW`, `DENY` | DENY always wins over ALLOW |
+| Operation | `READ`, `WRITE`, `CREATE`, `DESCRIBE`, `ALTER`, `DELETE`, `ALL` | Not every operation applies to every resource |
+| Resource pattern | `TOPIC:payments.ledger` (literal), `TOPIC:payments.` (prefixed), `TOPIC:*` | Literal, prefixed, or the `*` wildcard |
+| Host | `*`, `10.0.4.17` | IP address of the client; rarely useful behind NAT or load balancers |
+
+The resource types are `Topic`, `Group` (consumer groups), `Cluster`, `TransactionalId`, `DelegationToken` and `User`. The operations include the obvious ones plus `IdempotentWrite`, `ClusterAction` (reserved for brokers), `DescribeConfigs`, `AlterConfigs`, `CreateTokens` and `DescribeTokens`.
+
+Two rules make the model predictable:
+
+1. **Default deny.** If no ALLOW ACL matches, the request is denied. (The exception is `allow.everyone.if.no.acl.found=true`, a migration aid that should not stay on.)
+2. **DENY beats ALLOW.** A matching DENY rejects the request even if an ALLOW also matches. Use DENY sparingly, for carve-outs such as "everyone in the team may read `payments.*` except `payments.pii`".
+
+Some operations imply others. Granting `READ`, `WRITE`, `DELETE` or `ALTER` on a topic also grants `DESCRIBE`, and `ALTER_CONFIGS` implies `DESCRIBE_CONFIGS`. That is why a producer ACL with only `WRITE` can still fetch metadata for its topic.
+
+## Enabling StandardAuthorizer on KRaft
+
+In a KRaft cluster ACLs are stored in the metadata log, and the authorizer that reads them is `StandardAuthorizer`. Set it on every node, controllers included, because admin requests such as CreateTopics are forwarded to and authorized on the active controller.
+
+```properties
+# On every broker and controller
+authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+
+# Principals that bypass ACL checks. Semicolon-separated because DNs contain commas.
+super.users=User:kafka-broker;User:kafka-controller;User:platform-admin
+
+# Default; keep it false outside a short migration window
+allow.everyone.if.no.acl.found=false
+```
+
+Brokers and controllers must be super users (or hold `CLUSTER_ACTION` and related ACLs), because they make inter-node requests that are themselves authorized. If you forget, brokers cannot register with the controller and the cluster never comes up.
+
+There is also a startup subtlety. The authorizer cannot answer questions until the node has loaded the metadata log, so non-controller listeners wait for it. Listeners named in `early.start.listeners` (by default, the controller listeners) start immediately and serve only super users until metadata is loaded. That is why controller traffic must authenticate as a super user.
+
+:::note
+ZooKeeper-era guides use `kafka.security.authorizer.AclAuthorizer` and `kafka-acls.sh --authorizer-properties zookeeper.connect=...`. Neither exists in Kafka 4.x. All ACL changes go through the Admin API, via `--bootstrap-server` or `--bootstrap-controller`.
+:::
+
+## Writing ACLs with kafka-acls.sh
+
+`kafka-acls.sh` talks to the cluster as an authenticated admin. Put that admin's credentials in a properties file:
+
+```bash
+cat > admin.properties <<'EOF'
+security.protocol=SASL_SSL
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="platform-admin" password="change-me-now";
+ssl.truststore.type=PEM
+ssl.truststore.location=/etc/kafka/tls/ca.crt
+EOF
+```
+
+Kafka ships convenience flags that expand into the right set of ACLs. `--producer` grants `WRITE`, `DESCRIBE` and `CREATE` on the topic; `--consumer` grants `READ` and `DESCRIBE` on the topic plus `READ` on the group.
+
+```bash
+BS="--bootstrap-server kafka-1.example.com:9094 --command-config admin.properties"
+
+# The payments service may produce to every topic starting with "payments."
+kafka-acls.sh $BS --add --allow-principal User:payments-writer \
+  --producer --topic payments. --resource-pattern-type prefixed
+
+# The fraud service may consume payments.ledger in group "fraud-detector"
+kafka-acls.sh $BS --add --allow-principal User:fraud-detector \
+  --consumer --topic payments.ledger --group fraud-detector
+
+# List what is on a resource
+kafka-acls.sh $BS --list --topic payments. --resource-pattern-type prefixed
+```
+
+```text
+Current ACLs for resource `ResourcePattern(resourceType=TOPIC, name=payments., patternType=PREFIXED)`:
+ 	(principal=User:payments-writer, host=*, operation=WRITE, permissionType=ALLOW)
+	(principal=User:payments-writer, host=*, operation=DESCRIBE, permissionType=ALLOW)
+	(principal=User:payments-writer, host=*, operation=CREATE, permissionType=ALLOW)
+```
+
+The `--producer` shortcut includes `CREATE`, which lets the producer auto-create topics. If topics are created only through your provisioning pipeline, grant `WRITE` and `DESCRIBE` explicitly instead with `--operation Write --operation Describe`.
+
+### Permissions Each Kind of Client Needs
+
+| Client | Resource | Operations |
+| --- | --- | --- |
+| Plain or idempotent producer | Topic | `WRITE` (implies `DESCRIBE`) |
+| Transactional producer | Topic; TransactionalId | `WRITE` on topic; `WRITE` and `DESCRIBE` on the transactional ID |
+| Consumer in a group | Topic; Group | `READ` on topic; `READ` on group |
+| Transactional producer that commits consumer offsets | Group | `READ` on the consumer group, because the producer sends the offsets |
+| Kafka Streams app with `application.id=fraud-app` | Topic and Group prefixed `fraud-app`; TransactionalId prefixed `fraud-app` with exactly-once | `ALL` on internal topics, `READ` on group, `WRITE` and `DESCRIBE` on transactional IDs |
+| Topic admin tooling | Topic; Cluster | `CREATE`, `DELETE`, `ALTER`, `DESCRIBE_CONFIGS`, `ALTER_CONFIGS` |
+
+Idempotent producers used to need `IDEMPOTENT_WRITE` on the cluster. Since Kafka 2.8, `WRITE` on any topic is enough, and idempotence is on by default in modern clients, so you rarely grant cluster-level permissions to applications.
+
+A transactional producer, such as the exactly-once order processor from [Transactions and Exactly-Once Producing](../3-kafka-producers/7-kafka-transactions.mdx), needs its transactional ID covered. The pattern type applies to every resource named in the command, so both the topic and the transactional ID below are prefixes:
+
+```bash
+kafka-acls.sh $BS --add --allow-principal User:order-processor \
+  --producer --topic orders. --transactional-id order-processor- \
+  --resource-pattern-type prefixed
+```
+
+For Kafka Streams, prefixed ACLs on the application ID cover internal repartition and changelog topics, which are named `fraud-app-...`:
+
+```bash
+kafka-acls.sh $BS --add --allow-principal User:fraud-app \
+  --operation All --topic fraud-app --resource-pattern-type prefixed
+kafka-acls.sh $BS --add --allow-principal User:fraud-app \
+  --operation Read --group fraud-app --resource-pattern-type prefixed
+```
+
+## Managing ACLs from Code
+
+Teams that manage topics as code usually manage ACLs the same way. The Admin API in `kafka-clients` exposes `createAcls`, `describeAcls` and `deleteAcls`:
+
+```java
+import java.util.List;
+import java.util.Properties;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.common.acl.AccessControlEntry;
+import org.apache.kafka.common.acl.AclBinding;
+import org.apache.kafka.common.acl.AclOperation;
+import org.apache.kafka.common.acl.AclPermissionType;
+import org.apache.kafka.common.resource.PatternType;
+import org.apache.kafka.common.resource.ResourcePattern;
+import org.apache.kafka.common.resource.ResourceType;
+
+public class GrantConsumerAcls {
+    public static void main(String[] args) throws Exception {
+        Properties props = new Properties();
+        props.load(GrantConsumerAcls.class.getResourceAsStream("/admin.properties"));
+
+        try (Admin admin = Admin.create(props)) {
+            String principal = "User:fraud-detector";
+
+            AclBinding readTopic = new AclBinding(
+                new ResourcePattern(ResourceType.TOPIC, "payments.ledger", PatternType.LITERAL),
+                new AccessControlEntry(principal, "*", AclOperation.READ, AclPermissionType.ALLOW));
+
+            AclBinding readGroup = new AclBinding(
+                new ResourcePattern(ResourceType.GROUP, "fraud-detector", PatternType.LITERAL),
+                new AccessControlEntry(principal, "*", AclOperation.READ, AclPermissionType.ALLOW));
+
+            // all() fails if any binding was rejected, for example for lack of ALTER on the cluster
+            admin.createAcls(List.of(readTopic, readGroup)).all().get();
+            System.out.println("ACLs created for " + principal);
+        }
+    }
+}
+```
+
+Creating ACLs requires `ALTER` on the `Cluster` resource, which normally only platform admins have. Reconciling ACLs from a Git repository is a good pattern: a CI job reads the desired ACLs, describes the current ones and creates or deletes the difference. Tools such as Julie Ops and the Strimzi `KafkaUser` resource do this for you.
+
+## Debugging Denials
+
+When a client lacks permission, it gets errors like `TopicAuthorizationException: Not authorized to access topics: [payments.ledger]` or `GroupAuthorizationException`. The broker side is more informative. The authorizer logs every denied request at INFO level to the `kafka.authorizer.logger` logger:
+
+```text
+INFO Principal = User:fraud-detector is Denied operation = READ from host = 10.0.4.17
+  on resource = Group:LITERAL:fraud-detector-v2 for request = JoinGroup with resourceRefCount = 1
+  based on rule DefaultDeny (kafka.authorizer.logger)
+```
+
+This one shows the classic case: the team renamed the consumer group to `fraud-detector-v2` but the ACL is still for `fraud-detector`. Send the authorizer log to its own file and your log pipeline; it is your best audit trail of who tried to do what.
+
+## A Worked Scenario: Moving a Live Cluster to Least Privilege
+
+An e-commerce company has a cluster with SCRAM authentication but no authorizer. Twelve services use it. Nobody is sure which service touches which topic.
+
+Turning on the authorizer with default deny would break production instantly. The team used a four-week migration instead:
+
+1. **Week 1: observe.** They enabled `StandardAuthorizer` with `allow.everyone.if.no.acl.found=true` and set `kafka.authorizer.logger` to DEBUG on one broker. Allowed decisions on resources without ACLs are logged, which gave them a map of principal, operation and resource for every service.
+2. **Week 2: write ACLs.** From the logs they generated prefixed ACLs per service, reviewed them with each team, and applied them through a CI job. As soon as a resource has any ACL, the fallback no longer applies to it, so each topic switched to strict mode the moment its ACLs were added.
+3. **Week 3: watch.** They alerted on any `Denied` line in the authorizer log and fixed two missed permissions, both for rarely used admin scripts.
+4. **Week 4: lock down.** They set `allow.everyone.if.no.acl.found=false` with a rolling restart.
+
+They considered deploying a proxy layer that enforces policy in front of Kafka. It would have avoided touching broker configuration, but added latency, another component to scale, and a single point of failure. Native ACLs were enough for their needs.
+
+## Common Mistakes
+
+- Enabling the authorizer before adding brokers and controllers to `super.users`, so the cluster cannot form.
+- Granting `--consumer` on the topic but forgetting the group, then seeing `GroupAuthorizationException` on the first poll.
+- Granting `ALL` on `TOPIC:*` to an application "to get it working" and never narrowing it.
+- Using host-based ACLs when clients sit behind NAT or a load balancer; every client appears to come from the same address.
+- Leaving `allow.everyone.if.no.acl.found=true` after the migration, so any new topic without ACLs is open to everyone.
+- Writing ACLs for a principal name that does not match what authentication produces, such as `User:order-service` when mTLS yields a full DN.
+
+## Summary
+
+- ACLs say which principal may perform which operation on which resource; requests with no matching ALLOW are denied, and DENY overrides ALLOW.
+- KRaft clusters use `org.apache.kafka.metadata.authorizer.StandardAuthorizer`, configured on every broker and controller.
+- Put broker and controller principals in `super.users`, separated by semicolons.
+- Use prefixed patterns (`payments.`, `fraud-app`) to keep ACLs short and match your naming conventions.
+- Producers need `WRITE` on topics; consumers need `READ` on topics and groups; transactional apps also need `WRITE` on their transactional ID.
+- Manage ACLs as code through the Admin API, and watch `kafka.authorizer.logger` for denials.
+
+## Further Reading
+
+- [Kafka documentation: Authorization and ACLs](https://kafka.apache.org/43/security/authorization-and-acls/) - every operation each protocol request requires, and the full `kafka-acls.sh` reference.
+- [KIP-801: StandardAuthorizer](https://cwiki.apache.org/confluence/display/KAFKA/KIP-801%3A+Implement+an+Authorizer+that+stores+metadata+in+__cluster_metadata) - how the KRaft authorizer stores ACLs and handles startup.
+- [KIP-290: Support for Prefixed ACLs](https://cwiki.apache.org/confluence/display/KAFKA/KIP-290%3A+Support+for+Prefixed+ACLs) - the design of prefixed resource patterns.
+- [KIP-679: Producer will enable the strongest delivery guarantee by default](https://cwiki.apache.org/confluence/display/KAFKA/KIP-679%3A+Producer+will+enable+the+strongest+delivery+guarantee+by+default) - why idempotent producers no longer need `IDEMPOTENT_WRITE`.
+- [Admin API Javadoc](https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/admin/Admin.html) - `createAcls`, `describeAcls` and `deleteAcls`.

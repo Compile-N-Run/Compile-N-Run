@@ -1,0 +1,245 @@
+---
+title: "Joins: Stream-Stream, Stream-Table and Table-Table"
+description: "Join KStreams, KTables and GlobalKTables in Kafka Streams: windowed stream joins, enrichment lookups, foreign-key joins, co-partitioning and timing pitfalls."
+---
+
+# Joins: Stream-Stream, Stream-Table and Table-Table
+
+## Introduction
+
+Data that belongs together rarely arrives together. An order event carries a customer ID but not the customer's tier. An ad click arrives minutes after the impression it belongs to. A shipment row points at a warehouse that lives in another table. In a database you would write a `JOIN` and let the query planner sort it out. In a streaming system both sides are moving, so a join has to answer extra questions: how long do we wait for the other side, which side triggers a result, and which version of the other side do we use?
+
+Kafka Streams offers several join types, each with different answers. Picking the wrong one does not usually fail loudly. It quietly produces missing or wrong results.
+
+After this page you will be able to:
+
+- choose the right join for a given pair of streams and tables;
+- explain co-partitioning and when a join needs a repartition;
+- write windowed stream-stream joins, enrichment joins, and foreign-key table joins;
+- avoid the timing traps that make joins drop or mislabel records.
+
+## Join Types at a Glance
+
+| Left side | Right side | Inner | Left | Outer | Windowed | Co-partitioning needed | Triggered by |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `KStream` | `KStream` | Yes | Yes | Yes | Yes, required | Yes | Records on either side |
+| `KStream` | `KTable` | Yes | Yes | No | No | Yes | Stream records only |
+| `KStream` | `GlobalKTable` | Yes | Yes | No | No | No | Stream records only |
+| `KTable` | `KTable` (same key) | Yes | Yes | Yes | No | Yes | Updates on either side |
+| `KTable` | `KTable` (foreign key) | Yes | Yes | No | No | No | Updates on either side |
+
+A quick way to choose:
+
+- **Two kinds of events that relate in time** (impression and click, payment request and payment confirmation): stream-stream.
+- **Events that need current reference data** (orders and customer profiles): stream-table, or stream-global-table if the reference data is small.
+- **Two sets of current facts** (customers and their addresses, shipments and warehouses): table-table, with a foreign-key join when the keys differ.
+
+## Co-Partitioning
+
+Kafka Streams runs joins locally inside a task. A task for partition 3 only sees partition 3 of each input. For a key-based join to work, records with the same key on both sides must land in the same partition number. That requires the inputs to be **co-partitioned**:
+
+1. both topics are keyed by the join key;
+2. both have the same number of partitions;
+3. both were written with the same partitioning strategy.
+
+Kafka Streams checks the partition count and refuses to start if it differs. It cannot check the other two. If a Go service wrote one topic with a different hash function than the Java default (murmur2), the join silently misses matches. See [Keys, Partitioners and Sticky Partitioning](../3-kafka-producers/1-kafka-producer-keys-and-partitioners.mdx).
+
+If a stream is not keyed by the join key, re-key it with `selectKey` or `map`. Kafka Streams then adds a repartition topic with the same partition count as the other side, so the data becomes co-partitioned automatically. `GlobalKTable` joins and foreign-key joins avoid the requirement altogether, at their own costs.
+
+## Stream-Stream Joins
+
+A stream-stream join pairs records from two streams that have the same key and timestamps within a window of each other. Both sides are buffered in window stores, because a match can arrive later on either side.
+
+```java
+KStream<String, String> attributed = impressions.leftJoin(clicks,
+        (impression, click) -> click == null ? impression + " (no click yet)" : impression + " -> clicked " + click,
+        JoinWindows.ofTimeDifferenceAndGrace(Duration.ofMinutes(10), Duration.ofMinutes(1)),
+        StreamJoined.with(Serdes.String(), Serdes.String(), Serdes.String())
+                    .withName("impression-click")
+                    .withStoreName("impression-click"));
+```
+
+Key facts:
+
+- `JoinWindows.ofTimeDifferenceAndGrace(10 min, 1 min)` matches records whose timestamps are at most 10 minutes apart, in either direction. Use `.before()` and `.after()` for asymmetric windows ("the click must come after the impression").
+- An **inner** join emits as soon as a pair is found, once per matching pair. If one impression gets two clicks, you get two results.
+- A **left** or **outer** join must also emit unmatched records, but it cannot know a record is unmatched until the window plus grace has passed. Kafka Streams therefore holds unmatched records and emits them with `null` only after the window closes. Matches are still emitted immediately.
+- State size is roughly "records per second times window size" on both sides. A 7-day join window on a busy stream stores 7 days of both topics on local disk.
+
+## Stream-Table Joins
+
+A stream-table join is a **lookup**. For each stream record, Kafka Streams looks up the table's current value for the same key and calls your joiner. The table side never triggers output: a customer changing tier does not re-emit old orders.
+
+```java
+KStream<String, String> enriched = orders.leftJoin(customers,
+        (order, tier) -> order + " tier=" + (tier == null ? "unknown" : tier),
+        Joined.with(Serdes.String(), Serdes.String(), Serdes.String()));
+```
+
+Use `join` to drop orders with no matching customer, `leftJoin` to keep them with a `null` table value. There is no outer variant, because a table row alone cannot produce a stream event.
+
+The hard part is **timing**. "Current value" means the value in the table at the moment the stream record is processed. If a customer's sign-up record and their first order are produced at almost the same time, the order may be processed first and find nothing. Kafka Streams helps by processing records across the partitions of a task roughly in timestamp order, but it cannot help if the table data is simply late.
+
+**Versioned tables** fix the opposite problem: reprocessing. If you replay last month's orders, a normal table gives every order today's customer tier. If the table is materialized in a versioned store, the join looks up the value **as of the order's timestamp**:
+
+```java
+KTable<String, String> customers = builder.table("customers",
+        Consumed.with(Serdes.String(), Serdes.String()),
+        Materialized.as(Stores.persistentVersionedKeyValueStore("customers-versioned", Duration.ofDays(7))));
+```
+
+With customer `c1` set to `silver` at 10:00 and `gold` at 11:00, an order stamped 10:30 that is processed afterwards gets `tier=gold` from a normal table but `tier=silver` from the versioned one. The `Duration` is the history retention: how far back lookups can go. `Joined#withGracePeriod` additionally buffers stream records for a while so late table updates can still be seen.
+
+## Stream-GlobalKTable Joins
+
+A join against a `GlobalKTable` is also a lookup, but every instance holds the whole table, so there is no co-partitioning and no repartition. You supply a function that picks the lookup key from the stream record:
+
+```java
+KStream<String, String> withProduct = orders.join(products,
+        (orderId, order) -> order.split(",")[0],        // productId from the value
+        (order, productName) -> productName + " x" + order.split(",")[1]);
+```
+
+The trade-off, as described in [KStream, KTable and GlobalKTable](./1-kafka-streams-kstream-ktable.mdx), is memory on every instance and no time synchronization: the global table is updated as fast as it can be read, independent of the stream's timestamps.
+
+## Table-Table Joins and Foreign-Key Joins
+
+Joining two tables produces a new table that is updated whenever **either** side changes. It is the streaming version of a materialized view.
+
+A **primary-key** join (`left.join(right, joiner)`) needs both tables keyed and partitioned the same way. Inner, left and outer variants exist.
+
+A **foreign-key** join handles the common case where the left table's value contains the key of the right table: each shipment points at a warehouse, each employee at a department. It is many-to-one and needs no co-partitioning.
+
+```java
+KTable<String, String> shipmentView = shipments.join(warehouses,
+        shipment -> shipment.split(",")[0],                  // extract warehouseId from the shipment value
+        (shipment, city) -> shipment.split(",")[1] + " from " + city);
+```
+
+Under the hood Kafka Streams sends subscription records from the left side to the partitions of the right side and responses back, through two internal topics. This makes it more expensive than a primary-key join, and results can arrive slightly later, but it updates correctly when either the shipment or the warehouse changes. Before foreign-key joins existed, teams had to re-key one table and hand-roll this logic.
+
+## Worked Scenario: Ads, Orders and Shipments
+
+One retail company, three join problems:
+
+1. **Ad attribution.** The marketing team wants to know which impressions led to a click within 10 minutes. Both are events, keyed by impression ID: a stream-stream left join.
+2. **Order enrichment.** Every order should carry the customer's tier for loyalty discounts. Orders are events keyed by customer ID, customers are a table keyed the same way: a stream-table left join.
+3. **Shipment view.** The support portal shows each shipment with its warehouse city. Shipments and warehouses are both tables with different keys: a foreign-key join.
+
+```java
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.Topology;
+import org.apache.kafka.streams.kstream.*;
+
+import java.time.Duration;
+
+public class RetailJoins {
+    static Topology build() {
+        StreamsBuilder builder = new StreamsBuilder();
+        var str = Serdes.String();
+
+        // 1. Stream-stream: impressions that led to a click within 10 minutes
+        KStream<String, String> impressions = builder.stream("ad-impressions", Consumed.with(str, str)); // key = impressionId
+        KStream<String, String> clicks = builder.stream("ad-clicks", Consumed.with(str, str));           // key = impressionId
+
+        impressions.leftJoin(clicks,
+                (impression, click) -> click == null ? impression + " (no click yet)" : impression + " -> clicked " + click,
+                JoinWindows.ofTimeDifferenceAndGrace(Duration.ofMinutes(10), Duration.ofMinutes(1)),
+                StreamJoined.with(str, str, str).withName("impression-click").withStoreName("impression-click"))
+            .to("ad-attribution", Produced.with(str, str));
+
+        // 2. Stream-table: enrich each order with the customer's current tier
+        KTable<String, String> customers = builder.table("customers", Consumed.with(str, str));      // key = customerId
+        KStream<String, String> orders = builder.stream("orders", Consumed.with(str, str));          // key = customerId
+
+        orders.leftJoin(customers,
+                (order, tier) -> order + " tier=" + (tier == null ? "unknown" : tier),
+                Joined.with(str, str, str))
+              .to("orders-enriched", Produced.with(str, str));
+
+        // 3. Table-table foreign-key join: each shipment points at a warehouse
+        KTable<String, String> shipments = builder.table("shipments", Consumed.with(str, str));   // value = "warehouseId,status"
+        KTable<String, String> warehouses = builder.table("warehouses", Consumed.with(str, str)); // value = city
+
+        shipments.join(warehouses,
+                shipment -> shipment.split(",")[0],                      // foreign key extractor
+                (shipment, city) -> shipment.split(",")[1] + " from " + city)
+            .toStream()
+            .to("shipment-view", Produced.with(str, str));
+
+        return builder.build();
+    }
+}
+```
+
+Running it with the record cache off:
+
+```text
+ad-impressions  12:00  imp-1 -> banner-A
+ad-impressions  12:01  imp-2 -> banner-B
+ad-clicks       12:03  imp-1 -> user-5
+ad-impressions  12:30  imp-3 -> banner-A     (moves stream time past imp-2's window)
+
+orders     c1 -> order-1 $40
+customers  c1 -> silver
+orders     c1 -> order-2 $90
+customers  c1 -> gold
+orders     c1 -> order-3 $15
+
+warehouses wh-1 -> Rotterdam
+shipments  sh-9 -> wh-1,packed
+shipments  sh-9 -> wh-1,shipped
+warehouses wh-1 -> Rotterdam-North
+```
+
+produces:
+
+```text
+ad-attribution:
+KeyValue(imp-1, banner-A -> clicked user-5)
+KeyValue(imp-2, banner-B (no click yet))
+
+orders-enriched:
+KeyValue(c1, order-1 $40 tier=unknown)
+KeyValue(c1, order-2 $90 tier=silver)
+KeyValue(c1, order-3 $15 tier=gold)
+
+shipment-view:
+KeyValue(sh-9, packed from Rotterdam)
+KeyValue(sh-9, shipped from Rotterdam)
+KeyValue(sh-9, shipped from Rotterdam-North)
+```
+
+What to take from it:
+
+- `imp-1` was emitted the moment its click arrived. `imp-2` appeared only after stream time passed 12:01 plus 10 minutes plus 1 minute of grace, which happened when `imp-3` arrived at 12:30. Without later traffic, the unmatched result would wait.
+- `order-1` arrived before the customer existed and got `tier=unknown`. Updating the customer to `gold` did not re-emit `order-2`; table updates never trigger a stream-table join.
+- The foreign-key join emitted on every change on **both** sides: two shipment updates and one warehouse rename.
+- `impressions` and `clicks` were already keyed by impression ID, and `orders` by customer ID, so no repartition topics were needed. If orders had been keyed by order ID, a `selectKey` before the join would have added one.
+
+## Common Mistakes
+
+- **Joining topics with different partition counts or partitioners.** Counts are checked; partitioners are not. Make every producer of a join input use the same key and the default partitioner.
+- **Expecting table updates to re-emit stream-table results.** Only the stream side triggers. If you need output on both sides, use a table-table join.
+- **Loading reference data after the events.** Bootstrap tables before starting producers of the stream side, or use a `leftJoin` and handle `null`.
+- **Huge join windows.** State grows with window size on both sides. Check the business need; a one-hour window is often enough where seven days was assumed.
+- **Forgetting that inner stream-stream joins multiply.** Three clicks on one impression give three results. Deduplicate if you need one.
+- **Using a `GlobalKTable` join for big or fast-changing data.** It copies everything to every instance and ignores time ordering.
+- **Leaving join stores unnamed.** Like other stores, generated join store names change when the topology changes. Use `StreamJoined#withStoreName` and `Joined#as`.
+
+## Summary
+
+- Stream-stream joins pair events within a time window, buffer both sides, and emit unmatched left/outer results only when the window closes.
+- Stream-table joins are lookups triggered by the stream side; use versioned tables to look up the value as of the event time.
+- Stream-GlobalKTable joins need no co-partitioning and let you pick the lookup key from the value.
+- Table-table joins maintain a joined view updated by either side; foreign-key joins handle many-to-one relations without co-partitioning.
+- Key-based joins require co-partitioned inputs; re-keying adds a repartition topic.
+
+## Further Reading
+
+- [Streams DSL: joining](https://kafka.apache.org/documentation/streams/developer-guide/dsl-api.html#joining): the full matrix of join types and semantics.
+- [KIP-213: Support non-key joining in KTable](https://cwiki.apache.org/confluence/display/KAFKA/KIP-213+Support+non-key+joining+in+KTable): the foreign-key join design.
+- [KIP-889: Versioned state stores](https://cwiki.apache.org/confluence/display/KAFKA/KIP-889%3A+Versioned+State+Stores): stores that keep history per key.
+- [KIP-914: DSL processor semantics for versioned stores](https://cwiki.apache.org/confluence/display/KAFKA/KIP-914%3A+DSL+Processor+Semantics+for+Versioned+Stores): how joins use versioned tables.
+- [Co-partitioning requirements](https://kafka.apache.org/documentation/streams/developer-guide/dsl-api.html#join-co-partitioning-requirements): the official rules and how to fix violations.

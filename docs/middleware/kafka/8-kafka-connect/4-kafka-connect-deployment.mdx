@@ -1,0 +1,242 @@
+---
+title: "Deploying and Operating Connect"
+description: "Learn how to run Kafka Connect in production: worker sizing, internal topics, plugin installation, secrets, Docker and Kubernetes deployment, monitoring and upgrades."
+---
+
+# Deploying and Operating Connect
+
+## Introduction
+
+Starting a Connect worker on a laptop takes a minute. Running Connect so that twenty pipelines owned by six teams keep flowing through broker upgrades, plugin updates, password rotations and node failures takes some planning. Connect is a distributed system in its own right, with its own group protocol, its own state topics and its own REST API that needs securing.
+
+This page covers the decisions you make once and live with for years: how many Connect clusters to run and who shares them, how to configure the internal topics, how to install and isolate plugins, how to keep credentials out of connector configs, how to package workers for Docker and Kubernetes, and what to monitor. The worked scenario follows a platform team turning an ad hoc Connect setup into a service that other teams can use safely.
+
+After reading it you will be able to stand up a production-grade Connect cluster and know which knobs matter when something goes wrong at 3 a.m.
+
+## Cluster Topology: One Big Cluster or Many Small Ones
+
+Workers in the same `group.id` form one Connect cluster and share everything: the JVM heap, the plugin classpath, the REST API and the rebalance protocol. A connector that leaks memory or a plugin with a conflicting library version affects every pipeline on those workers.
+
+| Topology | Pros | Cons |
+|---|---|---|
+| One shared cluster | Fewer machines, one place to operate | Noisy neighbours; one team's plugin upgrade is everyone's risk; rebalances touch all pipelines |
+| One cluster per team or domain | Isolation of failures, plugins and credentials; teams own their upgrade schedule | More clusters to run and monitor |
+| One cluster per critical connector | Maximum isolation for something like CDC from the payments database | Highest overhead |
+
+Most organisations settle on a cluster per domain, plus a dedicated cluster for anything whose outage is a business incident. Running several small clusters is cheap with containers; debugging a shared cluster where one connector's garbage collection pauses stall everyone else's tasks is not.
+
+Size workers by the work, not the connector count. A CDC connector is usually one task doing a lot; an S3 sink might be twelve tasks each buffering files in memory. Start with 2 to 4 CPU cores and 4 to 8 GB of heap per worker, at least three workers for failover, and adjust from metrics.
+
+## Internal Topics and Worker Configuration
+
+A distributed cluster keeps all its state in three topics. Create them yourself so their settings are deliberate:
+
+```bash
+# Configs: exactly one partition so the leader sees updates in order
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic connect-orders-configs \
+  --partitions 1 --replication-factor 3 --config cleanup.policy=compact
+
+# Source offsets
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic connect-orders-offsets \
+  --partitions 25 --replication-factor 3 --config cleanup.policy=compact
+
+# Connector and task status
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic connect-orders-status \
+  --partitions 5 --replication-factor 3 --config cleanup.policy=compact
+```
+
+Prefix the names with the cluster's purpose. Two clusters accidentally pointed at the same topics will overwrite each other's connectors.
+
+The worker settings that matter beyond the basics:
+
+```properties
+bootstrap.servers=kafka-1:9092,kafka-2:9092,kafka-3:9092
+group.id=connect-orders
+config.storage.topic=connect-orders-configs
+offset.storage.topic=connect-orders-offsets
+status.storage.topic=connect-orders-status
+
+# REST: what this worker listens on, and how other workers reach it
+listeners=https://0.0.0.0:8443
+rest.advertised.host.name=connect-1.internal
+rest.advertised.port=8443
+
+# How long a departed worker's tasks wait before being reassigned (default 5 minutes)
+scheduled.rebalance.max.delay.ms=300000
+
+# Faster startup: load plugins from manifests instead of scanning every jar
+plugin.path=/opt/connect/plugins
+plugin.discovery=service_load
+
+# Restrict which client settings connectors may override
+connector.client.config.override.policy=Allowlist
+
+# Secrets resolved at runtime instead of stored in connector configs
+config.providers=file,env
+config.providers.file.class=org.apache.kafka.common.config.provider.FileConfigProvider
+config.providers.env.class=org.apache.kafka.common.config.provider.EnvVarConfigProvider
+```
+
+`scheduled.rebalance.max.delay.ms` is part of incremental cooperative rebalancing, the default protocol since Kafka 2.3. When a worker disappears, its tasks are not moved immediately; the cluster waits up to this delay in case the worker comes back, as it does during a rolling restart. Tasks on other workers keep running throughout. Lower it if you would rather move tasks quickly after a real crash.
+
+`rest.advertised.host.name` must be reachable by the other workers. Followers forward requests to the leader using this address; a wrong value gives confusing timeouts on `POST /connectors` while `GET` requests work fine.
+
+## Installing Plugins
+
+A plugin is a directory (or an uber-jar) placed under one of the `plugin.path` directories. Each plugin is loaded in its own class loader, so two connectors can depend on different versions of the same library without conflict. Never put connector jars on the worker's main classpath, which defeats that isolation.
+
+```text
+/opt/connect/plugins/
+├── debezium-connector-postgres/
+│   ├── debezium-connector-postgres-3.7.0.Final.jar
+│   ├── debezium-core-3.7.0.Final.jar
+│   └── postgresql-42.7.x.jar
+└── confluentinc-kafka-connect-s3/
+    └── lib/
+        └── ...
+```
+
+Since Kafka 3.6 workers can discover plugins through Java service manifests instead of scanning every class in every jar, which can cut startup from minutes to seconds on workers with many plugins. `plugin.discovery` has four values: `only_scan` (old behaviour), `hybrid_warn` (the default: scan, and warn about plugins without manifests), `hybrid_fail` and `service_load` (manifests only). The bundled `connect-plugin-path.sh` tool lists your plugins and can add missing manifests:
+
+```bash
+bin/connect-plugin-path.sh list --worker-config config/connect-distributed.properties
+bin/connect-plugin-path.sh sync-manifests --worker-config config/connect-distributed.properties --dry-run
+```
+
+Install the same plugin versions on every worker. Any worker may be assigned any task, and a task landing on a worker that lacks the plugin fails.
+
+## Keeping Secrets Out of Connector Configs
+
+Connector configs are stored in the config topic and returned by `GET /connectors/NAME/config`. A password typed into the JSON is readable by anyone with access to either. Config providers solve this: the connector config holds a reference, and the worker resolves it when it starts the task.
+
+```json
+{
+  "connection.password": "${file:/opt/connect/secrets/orders-db.properties:password}",
+  "connection.user": "${env:ORDERS_DB_USER}"
+}
+```
+
+Kafka ships `FileConfigProvider` (a key in a properties file), `DirectoryConfigProvider` (one file per secret, matching how Kubernetes mounts Secrets) and `EnvVarConfigProvider`. Third-party providers read from HashiCorp Vault or cloud secret managers. Rotating a password then means updating the secret and restarting the connector, with no config change. More options are discussed in [Managing Secrets and Client Credentials](../11-kafka-security/5-kafka-secrets-and-credentials.mdx).
+
+## Packaging for Docker and Kubernetes
+
+Build an image with your plugins baked in, so every worker is identical and an upgrade is a new image tag. The Debezium Connect image is a convenient base because it is configured from environment variables:
+
+```dockerfile
+FROM quay.io/debezium/connect:3.7.0.Final
+# Add a non-Debezium plugin; /kafka/connect is the image's plugin directory
+COPY plugins/confluentinc-kafka-connect-s3 /kafka/connect/confluentinc-kafka-connect-s3
+```
+
+```yaml
+services:
+  connect:
+    build: .
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:19092
+      GROUP_ID: connect-local
+      CONFIG_STORAGE_TOPIC: connect-local-configs
+      OFFSET_STORAGE_TOPIC: connect-local-offsets
+      STATUS_STORAGE_TOPIC: connect-local-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1        # one-broker dev cluster only
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"   # any CONNECT_ variable becomes a worker property
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf localhost:8083/health || exit 1"]
+      interval: 10s
+      retries: 12
+```
+
+This joins the single-broker Compose file from [Running Kafka Locally with Docker Compose](../1-kafka-getting-started/0-kafka-docker-compose.mdx). The `GET /health` endpoint, added in Kafka 3.9, returns 200 only once the worker has finished starting and can serve requests, which makes it a much better readiness probe than "port 8083 is open".
+
+On Kubernetes, the Strimzi operator manages Connect clusters with a `KafkaConnect` resource and individual connectors with `KafkaConnector` resources, so pipelines live in Git and are applied like any other manifest:
+
+```yaml
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnector
+metadata:
+  name: orders-es-sink
+  labels:
+    strimzi.io/cluster: connect-orders     # the KafkaConnect resource this belongs to
+spec:
+  class: io.confluent.connect.elasticsearch.ElasticsearchSinkConnector
+  tasksMax: 3
+  state: running
+  config:
+    topics: shop.orders
+    connection.url: https://search.internal:9200
+    key.ignore: "false"
+```
+
+When the operator manages connectors, treat its resources as the source of truth: changes made directly through the REST API are reverted. See [Kafka on Kubernetes with Strimzi](../10-kafka-operations/6-kafka-kubernetes-strimzi.mdx) for the cluster side.
+
+## Securing the REST API
+
+Apache Kafka's REST API has no authentication by default. Anyone who can reach port 8083 can read configs, create a connector that writes arbitrary topics, or delete pipelines. At minimum:
+
+- Put workers on a private network and serve HTTPS with `listeners=https://...` and the `listeners.https.ssl.*` settings.
+- Turn on client authentication, either mutual TLS or the bundled `BasicAuthSecurityRestExtension` via `rest.extension.classes`, or front the API with a gateway that authenticates.
+- Give the worker's own Kafka principal only the ACLs it needs, and use `producer.override.sasl.jaas.config` per connector (allowed by your override policy) when pipelines must act as different principals.
+
+## Monitoring and Day-Two Operations
+
+Workers expose JMX metrics under the `kafka.connect` domain. The ones worth alerting on:
+
+| MBean type | Metric | Why it matters |
+|---|---|---|
+| `connect-worker-metrics` | `connector-startup-failure-total`, `task-startup-failure-total` | Configs that cannot start |
+| `connector-task-metrics` | `status` | A FAILED task copies nothing |
+| `task-error-metrics` | `total-record-errors`, `total-records-skipped`, `deadletterqueue-produce-requests` | Bad records being tolerated or routed |
+| `source-task-metrics` | `source-record-poll-rate`, `poll-batch-avg-time-ms` | A stalled source |
+| `sink-task-metrics` | `put-batch-avg-time-ms`, `offset-commit-completion-rate` | A slow target |
+| Consumer group `connect-NAME` | Lag | Sink falling behind |
+
+Export them with the Prometheus JMX exporter; see [Monitoring: The Metrics That Matter](../10-kafka-operations/1-kafka-monitoring-metrics.mdx). Debezium adds its own MBeans, covered in [Change Data Capture with Debezium](./5-kafka-connect-debezium-cdc.mdx).
+
+Two REST features help during incidents. `PUT /admin/loggers/LOGGER` changes a log level at runtime, for example to `DEBUG` for `io.debezium`, without restarting the worker. And `POST /connectors/NAME/restart?includeTasks=true&onlyFailed=true` restarts only what is broken.
+
+Upgrades are rolling: replace one worker at a time and wait for its tasks to be reassigned and running before moving on. Connect workers in Kafka 4.x require Java 17. Upgrade plugins the same way, after reading their release notes for config renames.
+
+## Worked Scenario: From a Pet Server to a Platform
+
+An insurance company's first Connect worker was a single VM that a data engineer set up for one S3 export. Two years later it ran 31 connectors for five teams, in standalone mode, with database passwords in plain text in config files. Every plugin upgrade was a negotiation, and when the VM's disk filled, every pipeline stopped at once.
+
+The platform team rebuilt it in a quarter. They created three distributed clusters, one each for the claims domain, the policy domain and a CDC cluster for core databases, each with three workers on Kubernetes managed by Strimzi. Each cluster has its own image with only the plugins its teams need, built in CI and tagged by date. Connectors are `KafkaConnector` resources in each team's repository; a pull request is the change process. Passwords moved to Kubernetes Secrets read by `DirectoryConfigProvider`. Dashboards show task status, error counts and sink lag per connector, and alerts route to the owning team, not the platform team.
+
+They evaluated Amazon MSK Connect as the managed alternative. It would remove the worker operations entirely, but it charges per worker-hour, and some of their plugins were awkward to package for it. They chose self-managed for now and wrote down the conditions under which they would revisit.
+
+## Common Mistakes
+
+- Sharing one Connect cluster across unrelated teams until a single plugin upgrade or memory leak takes everything down.
+- Letting the worker auto-create internal topics, then finding the config topic has several partitions or replication factor 1.
+- Putting connector jars on the main classpath or installing different plugin versions on different workers.
+- Leaving the REST API unauthenticated on a shared network.
+- Plain-text passwords in connector configs, visible through `GET /connectors/NAME/config`.
+- Changing Strimzi-managed connectors through the REST API and watching the operator revert the change.
+- Restarting all workers at once during an upgrade instead of rolling one at a time.
+
+## Summary
+
+- Prefer several small Connect clusters split by domain over one shared cluster; isolate critical pipelines.
+- Create the three internal topics yourself: compacted, replication factor 3, one partition for configs.
+- Install plugins under `plugin.path`, the same versions on every worker; `plugin.discovery=service_load` speeds up startup.
+- Keep credentials in config providers (`file`, `directory`, `env` or a vault), never in connector JSON.
+- Package workers as images with plugins baked in; on Kubernetes manage connectors as Strimzi resources.
+- Secure the REST API, use `GET /health` as a readiness probe, and alert on task status, error metrics and sink lag.
+
+## Further Reading
+
+- [Kafka Connect user guide](https://kafka.apache.org/documentation/#connect) - worker configuration, plugin discovery and the REST API.
+- [KIP-898: Modernize Connect plugin discovery](https://cwiki.apache.org/confluence/display/KAFKA/KIP-898%3A+Modernize+Connect+plugin+discovery) - `plugin.discovery` and the plugin path tool.
+- [KIP-415: Incremental cooperative rebalancing in Connect](https://cwiki.apache.org/confluence/display/KAFKA/KIP-415%3A+Incremental+Cooperative+Rebalancing+in+Kafka+Connect) - why rolling restarts no longer stop every task.
+- [KIP-297: Externalizing secrets for Connect configurations](https://cwiki.apache.org/confluence/display/KAFKA/KIP-297%3A+Externalizing+Secrets+for+Connect+Configurations) - the config provider mechanism.
+- [KIP-1017: Health check endpoint for Kafka Connect](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1017%3A+Health+check+endpoint+for+Kafka+Connect) - the `GET /health` endpoint.
+- [Strimzi documentation](https://strimzi.io/documentation/) - running Connect and connectors on Kubernetes.

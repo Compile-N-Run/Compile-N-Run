@@ -1,0 +1,220 @@
+---
+title: "Seeking, Resetting Offsets and Replaying"
+description: "Learn how to rewind or skip ahead in Kafka with seek, offsetsForTimes and kafka-consumer-groups.sh --reset-offsets, and how to replay data safely after a bug."
+---
+
+# Seeking, Resetting Offsets and Replaying
+
+## Introduction
+
+The feature that most separates Kafka from a traditional queue is that reading a record does not destroy it. As long as retention keeps the data, any consumer can go back and read it again. That turns many incidents from "the data is gone" into "rewind and run it again".
+
+Replay is powerful and also easy to get wrong. Rewinding the wrong group, rewinding past what retention still holds, or replaying into a consumer that is not idempotent can cause a bigger incident than the one you were fixing.
+
+By the end of this page you will be able to move a consumer's position from code with `seek()`, `seekToBeginning()`, `seekToEnd()` and `offsetsForTimes()`, reset a group's committed offsets from the command line with `kafka-consumer-groups.sh --reset-offsets`, and plan a replay that does not create new problems.
+
+The scenario is a **product search index**. A `catalog-changes` topic with 12 partitions carries every product update from the catalog database. A `search-indexer` group reads it and writes documents into a search cluster. On Tuesday at 09:00 a deployment shipped a bug that dropped the `price` field from every document it wrote. The bug was found and fixed at 15:00. Six hours of products in the index now have no price.
+
+## Two Levels of Rewinding
+
+There are two different things you can move:
+
+| What you move | Tool | Effect | When |
+| --- | --- | --- | --- |
+| A running consumer's **position** | `seek()` and friends in code | Changes where the next `poll()` reads; nothing persists until you commit | Application-controlled replay, custom offset storage, skipping a poison record |
+| A group's **committed offsets** | `kafka-consumer-groups.sh --reset-offsets` or the Admin API | Changes where the group resumes the next time members start | Operational replay after a bug, skipping a backlog |
+
+The command-line reset only works on a group with no active members. The coordinator refuses to change committed offsets underneath running consumers, because they would overwrite the reset with their next commit anyway.
+
+## Seeking From Code
+
+All seek methods change the in-memory position only, and only for partitions the consumer currently owns. With `subscribe()`, that means you cannot seek right after subscribing: the assignment does not exist until the first `poll()` completes a rebalance. The reliable place to seek is `onPartitionsAssigned`.
+
+```java
+// Replay everything from a point in time whenever this consumer is assigned partitions.
+long replayFrom = Instant.parse("2026-10-13T09:00:00Z").toEpochMilli();
+
+consumer.subscribe(List.of("catalog-changes"), new ConsumerRebalanceListener() {
+    @Override
+    public void onPartitionsRevoked(Collection<TopicPartition> partitions) { }
+
+    @Override
+    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+        Map<TopicPartition, Long> query = new HashMap<>();
+        partitions.forEach(tp -> query.put(tp, replayFrom));
+
+        // For each partition: the earliest offset whose timestamp is at or after replayFrom.
+        Map<TopicPartition, OffsetAndTimestamp> found = consumer.offsetsForTimes(query);
+
+        for (TopicPartition tp : partitions) {
+            OffsetAndTimestamp oat = found.get(tp);
+            if (oat != null) {
+                consumer.seek(tp, oat.offset());
+            } else {
+                // No record that new: nothing to replay on this partition.
+                consumer.seekToEnd(List.of(tp));
+            }
+        }
+    }
+});
+```
+
+The methods you will use:
+
+| Method | What it does |
+| --- | --- |
+| `seek(tp, offset)` | Next `poll()` on `tp` starts at `offset` |
+| `seekToBeginning(partitions)` | Move to the earliest retained offset (evaluated lazily on the next `poll()` or `position()`) |
+| `seekToEnd(partitions)` | Move to the log end offset, skipping everything currently in the partition |
+| `offsetsForTimes(map)` | Look up the first offset at or after a timestamp, per partition; `null` if none |
+| `beginningOffsets(partitions)` / `endOffsets(partitions)` | Read the current earliest and end offsets without moving |
+| `position(tp)` | The offset of the next record that will be fetched |
+
+`offsetsForTimes()` uses the record timestamp, which is the producer's `CreateTime` unless the topic uses `message.timestamp.type=LogAppendTime`. Producers with wrong clocks give wrong answers; for most topics written by well-behaved services it is accurate to within a second or so.
+
+With `assign()` instead of `subscribe()`, there is no rebalance, so you can seek right after assigning:
+
+```java
+List<TopicPartition> partitions = List.of(new TopicPartition("catalog-changes", 4));
+consumer.assign(partitions);
+consumer.seek(partitions.get(0), 1_204_550L);   // inspect from a known offset
+```
+
+That is how debugging tools and one-off scripts read a specific record without touching any group's offsets.
+
+## Resetting a Group From the Command Line
+
+For operational replay, resetting the group's committed offsets is usually simpler than changing code. The tool has three parts: what to reset (the scope), where to reset to (the scenario), and whether to actually do it.
+
+**Scope:** `--group` plus `--all-topics` or `--topic`. A topic can be narrowed to partitions with `--topic catalog-changes:0,1,2`.
+
+**Scenarios:**
+
+| Option | Moves each partition to |
+| --- | --- |
+| `--to-earliest` | The earliest retained offset |
+| `--to-latest` | The log end offset (skip everything) |
+| `--to-offset 5000` | A specific offset |
+| `--shift-by -1000` | The current committed offset plus or minus N |
+| `--to-datetime 2026-10-13T09:00:00.000` | The first offset at or after the timestamp |
+| `--by-duration PT6H` | The first offset at or after "now minus duration" |
+| `--to-current` | The current committed offset (useful to create offsets for a new group) |
+| `--from-file offsets.csv` | Values from a CSV of topic, partition, offset |
+
+**Execution:** without `--execute`, the tool only prints the plan. That dry run is the default and you should always look at it first. `--export` writes the plan as CSV, which doubles as a backup of the old offsets if you export with `--to-current` first.
+
+For the search indexer, the replay is:
+
+```bash
+# 1. Stop all search-indexer instances, then confirm the group is empty.
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group search-indexer --state
+```
+
+```text
+GROUP           COORDINATOR (ID)   ASSIGNMENT-STRATEGY   STATE   #MEMBERS
+search-indexer  kafka-1:9092 (1)                         Empty   0
+```
+
+```bash
+# 2. Save the current offsets in case we need to undo.
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group search-indexer \
+  --topic catalog-changes --reset-offsets --to-current --export > search-indexer-before.csv
+
+# 3. Preview the reset (no --execute yet). Datetimes are interpreted in the local time zone
+#    unless an offset such as Z or +02:00 is appended.
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group search-indexer \
+  --topic catalog-changes --reset-offsets --to-datetime 2026-10-13T09:00:00.000Z
+```
+
+```text
+GROUP           TOPIC            PARTITION  NEW-OFFSET
+search-indexer  catalog-changes  0          882104
+search-indexer  catalog-changes  1          879311
+search-indexer  catalog-changes  2          884590
+...
+```
+
+```bash
+# 4. Apply it, then restart the indexers.
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group search-indexer \
+  --topic catalog-changes --reset-offsets --to-datetime 2026-10-13T09:00:00.000Z --execute
+```
+
+If something goes wrong, `--reset-offsets --from-file search-indexer-before.csv --execute` puts the old offsets back.
+
+:::warning
+If the requested offset is older than what retention still holds, the tool moves to the earliest available offset instead and does not warn you loudly. Check `--to-datetime` results against the partition's start offset (from `kafka-get-offsets.sh --time earliest`) before assuming you replayed the whole window.
+:::
+
+## Replay Into a New Group Instead
+
+Resetting the production group means stopping it. The alternative is to leave the production group alone and start a **second group** that reads the same window:
+
+```properties
+group.id=search-indexer-backfill-2026-10-13
+auto.offset.reset=by_duration:PT8H
+```
+
+The backfill group starts from roughly eight hours ago (the `by_duration` reset is available from Kafka 4.0), processes the bad window alongside the live group, and is shut down and deleted when it catches up. The live indexer never pauses.
+
+The trade-off is concurrency. Two writers update the same documents at once, so an older replayed update could overwrite a newer live one. That is only safe if writes are idempotent and ordered, for example by using the record's offset or a version column as an optimistic-concurrency check in the search index. Resetting the production group avoids that problem at the cost of a short pause.
+
+| Approach | Downtime | Risk | Clean-up |
+| --- | --- | --- | --- |
+| Reset the production group | Minutes, while stopped | Replay order matches original order | None |
+| Separate backfill group | None | Concurrent writers must not clobber each other | Delete the backfill group afterwards |
+| Seek in code via a feature flag | A deployment | Code path that is rarely exercised | Remove the flag |
+
+## Other Uses of Seek and Reset
+
+**Skipping a backlog.** A metrics consumer that was down for a day may not care about stale data. `--to-latest` jumps to now. Make sure nobody downstream expected those records.
+
+**Skipping a poison record.** If a record cannot be deserialized, `seek(tp, badOffset + 1)` skips it, as shown on [Consumer Basics: The Poll Loop](./0-kafka-consumer-basics.mdx). Operationally, `--shift-by 1` on the single affected partition does the same with the group stopped.
+
+**Deleting committed offsets.** `kafka-consumer-groups.sh --delete-offsets --group G --topic T` removes the group's offsets for one topic, so the next start falls back to `auto.offset.reset`. Useful when a group stops reading a topic for good.
+
+**Reading one record for debugging.** The console consumer can read from an exact place without any group:
+
+```bash
+kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic catalog-changes --partition 4 --offset 1204550 --max-messages 1 \
+  --formatter-property print.key=true
+```
+
+## Worked Scenario: Restoring Prices in the Search Index
+
+With the fix deployed, the team planned the replay:
+
+1. **Check retention.** `catalog-changes` keeps 7 days, so the 09:00 data was still present. They confirmed the earliest offsets were well before the bug window.
+2. **Check idempotency.** The indexer writes whole documents keyed by product ID with the source record's offset as an external version, so replaying an old change cannot overwrite a newer one. Replays are safe.
+3. **Choose the approach.** A 10-minute indexing pause was acceptable on a Tuesday afternoon; running a separate backfill group would have added risk for no benefit. They reset the production group.
+4. **Export, preview, execute.** Exactly the four commands above.
+5. **Watch lag.** After restart, lag jumped to about 2.1 million records and drained in 18 minutes. Spot checks showed prices back on affected products.
+
+They kept `search-indexer-before.csv` until the next day in case they needed to roll back. Total customer impact after the fix: about half an hour of stale prices for products updated in the window, versus a full re-index from the database, which would have taken six hours.
+
+## Common Mistakes
+
+- Calling `seek()` straight after `subscribe()`, before any partitions are assigned, and getting `IllegalStateException`.
+- Running `--reset-offsets` with `--execute` without a dry run, or on the wrong group name.
+- Trying to reset a group with running members and wondering why the tool refuses.
+- Forgetting that `--to-datetime` interprets times in the local time zone unless an offset is given.
+- Replaying into a consumer whose writes are not idempotent, turning one incident into two.
+- Replaying further back than retention holds and assuming the whole window was covered.
+- Running a backfill group concurrently with the live group without version checks, so stale replayed updates overwrite fresh ones.
+
+## Summary
+
+- Kafka keeps records after they are read, so any consumer can rewind as far as retention allows.
+- `seek()`, `seekToBeginning()`, `seekToEnd()` and `offsetsForTimes()` move a running consumer's position; seek in `onPartitionsAssigned` when using `subscribe()`.
+- `kafka-consumer-groups.sh --reset-offsets` changes a stopped group's committed offsets; it dry-runs by default and needs `--execute` to apply.
+- Export the current offsets before a reset so you can undo it.
+- A separate backfill group avoids downtime but needs idempotent, version-checked writes.
+- Every replay depends on idempotent processing; check that before rewinding.
+
+## Further Reading
+
+- [Basic Kafka operations: managing consumer groups (4.3)](https://kafka.apache.org/43/operations/basic-kafka-operations/): every `--reset-offsets` scenario and execution option.
+- [KafkaConsumer Javadoc (4.3)](https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html): `seek`, `offsetsForTimes` and controlling the consumer's position.
+- [KIP-122: Add Reset Consumer Group Offsets tooling](https://cwiki.apache.org/confluence/display/KAFKA/KIP-122%3A+Add+Reset+Consumer+Group+Offsets+tooling): the design of the reset command.
+- [KIP-1106: Add duration based offset reset option](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1106%3A+Add+duration+based+offset+reset+option+for+consumer+clients): the `by_duration` value for `auto.offset.reset`.

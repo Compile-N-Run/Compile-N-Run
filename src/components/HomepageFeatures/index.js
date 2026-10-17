@@ -60,6 +60,7 @@ import htmlLogo from '@site/static/img/web-logo/html_logo.png';
 import cssLogo from '@site/static/img/web-logo/css_logo.png';
 import osLogo from '@site/static/img/fundamentals-logo/os_logo.png';
 import rabbitmqLogo from '@site/static/img/middleware-logo/rabbitmq_logo.png';
+import kafkaLogo from '@site/static/img/middleware-logo/kafka_logo.png';
 import zookeeperLogo from '@site/static/img/middleware-logo/zookeeper_logo.png';
 import wechatminiprogramLogo from '@site/static/img/framework-logo/wechatminiprogram_logo.png';
 import androidLogo from '@site/static/img/framework-logo/android_logo.png';
@@ -547,6 +548,15 @@ const middlewareList = [
         url: "/docs/middleware/rabbitmq",
         description: <>RabbitMQ is an open-source message-broker software that originally implemented the Advanced
             Message Queuing Protocol (AMQP).</>,
+    },
+    {
+        title: "Kafka",
+        Icon: (alt) => {
+            return <Image img={kafkaLogo} className={styles.featureImage} alt={alt.alt}/>;
+        },
+        url: "/docs/middleware/kafka",
+        description: <>Apache Kafka is a distributed event streaming platform: durable, replayable logs for
+            high-volume pipelines, with Kafka Streams and Connect.</>,
     },
 ];
 

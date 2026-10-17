@@ -622,6 +622,10 @@ const config = {
                                     label: 'RabbitMQ',
                                     to: "/docs/middleware/rabbitmq"
                                 },
+                                {
+                                    label: 'Kafka',
+                                    to: "/docs/middleware/kafka"
+                                },
 
                             ]
                         },

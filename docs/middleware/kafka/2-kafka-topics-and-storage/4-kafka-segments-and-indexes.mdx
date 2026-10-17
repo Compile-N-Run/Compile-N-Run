@@ -1,0 +1,173 @@
+---
+title: "Log Segments, Indexes and How Kafka Stores Data"
+description: "Look inside a Kafka partition directory: segment files, offset and time indexes, record batches, the page cache, and how brokers recover after a crash."
+---
+
+# Log Segments, Indexes and How Kafka Stores Data
+
+## Introduction
+
+Most of the time you can treat a partition as an abstract log and never think about files. Then a broker takes twenty minutes to restart, or a disk fills up faster than the retention settings suggest, or a consumer asking for "yesterday at 9:00" is slow, and suddenly the files matter. Kafka's storage layer is simple enough to understand completely in one sitting, and doing so explains a surprising number of its performance characteristics.
+
+This page walks through a partition directory on a real broker: the segment files, the two kinds of index, the record batch format, how a fetch for a given offset or timestamp is served, how the operating system's page cache does most of the heavy lifting, and what happens on restart after a crash. You will learn to inspect these files with `kafka-dump-log.sh` and to reason about settings such as `segment.bytes` and `index.interval.bytes` from first principles.
+
+The scenario is a fleet of 50,000 environmental sensors reporting to a `sensor-readings` topic, and an engineer investigating why one broker's disk usage and restart time differ from the others.
+
+## The Partition Directory
+
+Each broker stores data under the directories listed in `log.dirs`. Every partition replica the broker holds gets its own directory named `<topic>-<partition>`:
+
+```bash
+ls -l /var/lib/kafka/data/sensor-readings-3/
+```
+
+```text
+00000000000000000000.index
+00000000000000000000.log
+00000000000000000000.timeindex
+00000000000004718213.index
+00000000000004718213.log
+00000000000004718213.snapshot
+00000000000004718213.timeindex
+00000000000009436601.index
+00000000000009436601.log
+00000000000009436601.snapshot
+00000000000009436601.timeindex
+leader-epoch-checkpoint
+partition.metadata
+```
+
+Each group of files with the same number is a **segment**. The number is the segment's **base offset**, the offset of its first record, padded to 20 digits so that files sort correctly. The last segment, `00000000000009436601`, is the **active segment**: the only one being appended to. All others are closed and immutable.
+
+| File | What it holds |
+|---|---|
+| `.log` | The records themselves, as a sequence of record batches |
+| `.index` | Offset index: maps offsets to byte positions in the `.log` file |
+| `.timeindex` | Time index: maps timestamps to offsets |
+| `.snapshot` | Producer state (last sequence numbers per producer ID) used by idempotence and transactions |
+| `.txnindex` | Aborted transactions in this segment; only present when transactions were aborted |
+| `leader-epoch-checkpoint` | The start offset of each leader epoch, used to truncate correctly after leadership changes |
+| `partition.metadata` | The topic ID, so a recreated topic with the same name is not confused with the old one |
+
+At the root of each log directory you will also find `meta.properties` (the cluster and node ID) and checkpoint files such as `recovery-point-offset-checkpoint` and `replication-offset-checkpoint`, which record per-partition progress.
+
+## Why Segments Exist
+
+A single ever-growing file per partition would be simpler. Segments exist because the alternative makes two essential operations expensive.
+
+**Deletion.** Removing the oldest data from the front of one huge file means rewriting it. With segments, retention deletes a whole file, which is nearly free. That is why [retention](./3-kafka-retention-and-compaction.mdx) works segment by segment.
+
+**Compaction.** The log cleaner rewrites closed segments into new, smaller ones and swaps them in. It could not safely rewrite a file that is being appended to.
+
+A segment rolls (a new active segment starts) when any of these is true:
+
+- The active segment reaches `segment.bytes` (default 1 GiB).
+- The active segment is older than `segment.ms` (default seven days), minus a random `segment.jitter.ms` so that many partitions do not all roll at once.
+- The offset index or time index is full (`segment.index.bytes`, default 10 MiB each).
+- The next offset would not fit in the 32-bit relative offset used by the indexes.
+
+Smaller segments mean finer-grained deletion and faster compaction, at the cost of more open files and more index memory. With 1 GiB segments and a few thousand partitions per broker, open file counts already reach tens of thousands, which is why production brokers raise the operating system's file descriptor limit to 100,000 or more.
+
+## Record Batches: What Is Actually in a .log File
+
+Kafka does not store records one by one. Producers send **record batches**, and the broker writes each batch to the log largely as it arrived. A batch has a header followed by the records:
+
+- **Batch header:** base offset, length, partition leader epoch, magic byte (always 2 in Kafka 4.x, which removed the old v0 and v1 formats), a CRC-32C checksum, attributes (compression codec, timestamp type, transactional and control flags), the base and max timestamps, and producer ID, epoch and base sequence for idempotence.
+- **Records:** each stores only deltas against the header (offset delta, timestamp delta) as variable-length integers, followed by the key, value and headers.
+
+Two consequences matter in practice. Compression applies to the whole batch, so larger batches compress better; a batch compressed by the producer is stored compressed and sent to consumers compressed, and the broker does not have to decompress it unless the topic's `compression.type` differs from the producer's. And because records hold deltas, small records carry very little overhead inside a batch, but a batch of one record pays the full header cost of about 61 bytes.
+
+The broker can also serve a batch to consumers without inspecting it. On plaintext connections it uses the `sendfile` system call ("zero-copy") to move bytes from the page cache straight to the network socket. With TLS the data has to pass through user space to be encrypted, so that shortcut is lost, which is one reason TLS costs measurable CPU on brokers.
+
+## The Indexes: Finding an Offset Fast
+
+A consumer asks: "give me partition 3 from offset 7,200,000." The broker has to find that record without scanning gigabytes. It does it in three steps:
+
+1. Find the segment. The broker keeps an in-memory, sorted map of segment base offsets and picks the largest one not greater than 7,200,000, here `00000000000004718213`.
+2. Look up the offset index. The `.index` file is a sorted array of fixed 8-byte entries, each a pair of (offset relative to the base, byte position in the `.log` file). A binary search finds the largest indexed offset not greater than the target.
+3. Scan forward from that byte position in the `.log` file until the target batch is found.
+
+The index is **sparse**: Kafka adds an entry only after roughly every `index.interval.bytes` (default 4,096 bytes) of log data. A 1 GiB segment therefore needs around 260,000 entries, about 2 MB of index, small enough to stay in memory, and the forward scan in step 3 reads at most a few kilobytes.
+
+```mermaid
+flowchart LR
+  F["Fetch offset 7200000"] --> S["Segment map: pick base 4718213"]
+  S --> I[".index binary search: offset 7199980 at byte 512004096"]
+  I --> L[".log scan forward a few KB"]
+  L --> R["Return batches from 7200000"]
+```
+
+The **time index** answers a different question: "which offset was written at or after 09:00 yesterday?" Its 12-byte entries pair a timestamp with a relative offset, and the broker uses it to serve `offsetsForTimes` requests, the API behind `kafka-consumer-groups.sh --reset-offsets --to-datetime` and consumer `seek` by time. It is also what time-based retention consults to find a segment's newest timestamp. Timestamps in the time index only ever increase, so a record with an older timestamp than its predecessor does not get a new entry.
+
+:::tip
+Index files are preallocated to `segment.index.bytes` when a segment opens and trimmed to their real size when it closes. Seeing a 10 MiB `.index` file next to a small active segment is normal.
+:::
+
+## Inspecting Segments with kafka-dump-log.sh
+
+The engineer in our scenario wants to see what a segment actually contains:
+
+```bash
+kafka-dump-log.sh --print-data-log \
+  --files /var/lib/kafka/data/sensor-readings-3/00000000000009436601.log | head -5
+```
+
+```text
+Dumping /var/lib/kafka/data/sensor-readings-3/00000000000009436601.log
+Log starting offset: 9436601
+baseOffset: 9436601 lastOffset: 9436742 count: 142 baseSequence: 88120 lastSequence: 88261 producerId: 4011 producerEpoch: 0 partitionLeaderEpoch: 6 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1792224000512 size: 4980 magic: 2 compresscodec: zstd crc: 2214983317 isvalid: true
+| offset: 9436601 CreateTime: 1792224000488 keySize: 12 valueSize: 64 sequence: 88120 headerKeys: [] key: sensor-18822 payload: {"temp":21.4,"humidity":48,"pm25":7}
+| offset: 9436602 CreateTime: 1792224000490 keySize: 12 valueSize: 64 sequence: 88121 headerKeys: [] key: sensor-04417 payload: {"temp":19.9,"humidity":52,"pm25":11}
+```
+
+One batch of 142 readings compressed with zstd into under 5 KB, written by producer 4011 during leader epoch 6. The same tool reads indexes (`--files ...index`), producer snapshots, and the cluster metadata log. It also has `--index-sanity-check` and `--verify-index-only` options for investigating suspected corruption. For a size overview per partition and disk, use `kafka-log-dirs.sh --bootstrap-server localhost:9092 --describe`.
+
+## The Page Cache and Flushing
+
+Kafka writes to files but does not call `fsync` after each write. By default `log.flush.interval.messages` and `flush.ms` are effectively infinite: the broker leaves data in the operating system's page cache and lets the kernel write it to disk in the background. Reads of recent data, which is most reads, are served from the same cache without touching the disk.
+
+This sounds dangerous until you remember [replication](./2-kafka-replication.mdx). A record acknowledged with `acks=all` is in the memory of every in-sync replica. Losing it would require all of them to lose power before the kernel flushed, which is far less likely than one disk dying. Kafka relies on replication for durability rather than `fsync`, and gains a large throughput advantage. Forcing flushes (`flush.messages=1`) is possible per topic but rarely worth it.
+
+It also means a broker's memory sizing is mostly about the page cache. The JVM heap needs only a few gigabytes; the rest of the RAM should be left free so the kernel can cache the recent data consumers are reading. The [broker tuning page](../12-kafka-performance/3-kafka-broker-and-os-tuning.mdx) covers this in depth.
+
+## Recovery After a Crash
+
+On a clean shutdown the broker flushes everything and writes a marker. On restart after a crash it cannot trust segments written since the last recorded **recovery point**, so it re-reads them: it validates every batch's CRC, rebuilds the offset and time indexes for those segments, and truncates any partial batch at the tail. It also reloads producer state from the newest `.snapshot` and replays batches after it.
+
+Recovery time grows with the amount of unflushed data and the number of partitions. `num.recovery.threads.per.data.dir` (default 2 in Kafka 4.x, raised from 1) controls the parallelism. After the broker rejoins, followers also truncate any records beyond what the current leader agrees on, using the leader epoch checkpoint.
+
+## Worked Scenario: Why Is Broker 2 Different?
+
+The sensor cluster has three brokers with identical configuration, yet broker 2 uses 30% more disk and took eighteen minutes to restart last week while the others took four.
+
+**Disk.** `kafka-log-dirs.sh --describe` shows broker 2 holding more replicas of `sensor-readings` than the others, because it was added late and a reassignment moved extra partitions to it. Its partitions also contain more segments than retention should allow: inspecting the oldest segment with `kafka-dump-log.sh` reveals `CreateTime` values a year in the future, from a batch of sensors with a broken real-time clock, written while the cluster still ran Kafka 3.x and accepted any timestamp (Kafka 4.x rejects records more than an hour in the future by default). Since time retention uses a segment's largest timestamp, those segments will never expire. The fix is `message.timestamp.type=LogAppendTime` on the topic, plus a firmware patch.
+
+**Restart time.** The other brokers were stopped cleanly; broker 2 was killed by the out-of-memory killer, because its JVM heap had been set to 24 GB on a 32 GB machine, starving the page cache and leaving no headroom. It had to recover every partition from its recovery point. The fixes are a 6 GB heap and `num.recovery.threads.per.data.dir=8`, since its NVMe disk handles parallel reads easily.
+
+**The alternative not chosen.** The first suggestion was to call `fsync` more often to shorten recovery. That would have cut throughput substantially on every broker to optimize an event that should be rare. Fixing the cause of the unclean shutdown was cheaper and kept Kafka's write path fast.
+
+## Common Mistakes
+
+- Deleting segment files by hand to free disk space; the broker's in-memory state no longer matches the disk, and offsets disappear unpredictably. Lower retention or delete records with `kafka-delete-records.sh` instead.
+- Setting `segment.bytes` very small (a few MB) for faster deletion on a large topic, producing hundreds of thousands of files and exhausting file descriptors.
+- Giving the JVM most of the machine's RAM, starving the page cache that serves reads.
+- Forcing `flush.messages=1` for safety when replication with `acks=all` already provides durability.
+- Ignoring producer timestamps; a few records with future timestamps keep segments alive indefinitely.
+- Assuming TLS has no broker cost; it disables zero-copy transfer and adds CPU work for every fetch.
+
+## Summary
+
+- Each partition replica is a directory of segments named by base offset; only the last, active segment receives writes.
+- Segments make retention and compaction cheap; they roll on size, age, index capacity or offset range.
+- Records are stored in compressed batches with delta-encoded fields; the broker usually serves them without decompressing, using zero-copy on plaintext connections.
+- Sparse offset and time indexes let the broker find any offset or timestamp with a binary search and a short scan.
+- Kafka leaves flushing to the operating system and relies on replication for durability; RAM is mostly for the page cache.
+- After a crash, the broker revalidates segments written since the recovery point and rebuilds their indexes, so unclean shutdowns are slow to recover from.
+
+## Further Reading
+
+- [Kafka documentation: Log implementation](https://kafka.apache.org/documentation/#log) describes segments, reads, writes, deletion and recovery.
+- [Kafka documentation: Message format](https://kafka.apache.org/documentation/#messageformat) defines the record batch and record layout in full.
+- [Kafka documentation: Persistence](https://kafka.apache.org/documentation/#design_filesystem) explains why Kafka relies on the page cache and sequential I/O.
+- [KIP-724: Drop support for message formats v0 and v1](https://cwiki.apache.org/confluence/display/KAFKA/KIP-724%3A+Drop+support+for+message+formats+v0+and+v1) covers the format cleanup completed in Kafka 4.0.
+- [KIP-98: Exactly Once Delivery and Transactional Messaging](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging) introduced producer IDs, sequence numbers and the transaction index.
