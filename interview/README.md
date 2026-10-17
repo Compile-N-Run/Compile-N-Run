@@ -139,9 +139,11 @@ The editor starts from a stub that `hugo/scripts/interview_stubs.py` derives fro
 class and the public method signatures the tests call, bodies removed), so write solutions in LeetCode's shape:
 `class Solution` / the design class in Python, Java and C++; `var name = function (...)` and `Name.prototype.method`
 in JavaScript; `func name(...)` / `type Name struct` + `Constructor` in Go. Python and JavaScript run in the browser
-(Pyodide and a Worker, via `runner.js`) against `tests/<slug>/test.py` and `test.js`, which is why those two test
-files must only use the prelude helpers and `check`; the tests are shipped to the page, so keep them free of
-anything that should not be public. Java, C++ and Go can be written in the editor and pasted into LeetCode.
+(Pyodide and a Worker, via `runner.js`) against `tests/<slug>/test.py` and `test.js`: the page redefines
+`check(actual, expected, label)` to record every call, then shows each check with its expected and actual value,
+the program's stdout and any error. So those two test files must report through `check` (one call per case, with
+a label that names the input) and use only the prelude helpers; all five test files are shipped to the page, so
+keep them free of anything that should not be public. Java, C++ and Go can be written in the editor and pasted into LeetCode.
 
 ## Updating the company data
 

@@ -99,8 +99,7 @@
   tablist.setAttribute('role', 'tablist');
   tablist.setAttribute('aria-label', 'Language');
   const actions = el('div', 'cnr-iv-ws__actions');
-  const runButton = button('cnr-iv-ws__btn', '▶ Run code', () => run(false));
-  const testButton = button('cnr-iv-ws__btn cnr-iv-ws__btn--primary', '✓ Run tests', () => run(true));
+  const testButton = button('cnr-iv-ws__btn cnr-iv-ws__btn--primary', '▶ Run', () => run());
   const resetMenu = el('details', 'cnr-iv-ws__menu');
   const resetSummary = el('summary', 'cnr-iv-ws__btn', 'Reset ▾');
   const resetList = el('div', 'cnr-iv-ws__menu-list');
@@ -108,7 +107,7 @@
     button('cnr-iv-ws__menu-item', 'Starter code (write it yourself)', () => replaceCode(stub(), 'starter code')),
     button('cnr-iv-ws__menu-item', 'Reference solution', () => replaceCode(solutions[lang], 'reference solution')));
   resetMenu.append(resetSummary, resetList);
-  actions.append(runButton, testButton, resetMenu);
+  actions.append(testButton, resetMenu);
   bar.append(tablist, actions);
   const note = el('div', 'cnr-iv-ws__note');
   const editorWrap = el('div', 'cnr-iv-ws__editor');
@@ -117,7 +116,7 @@
   panelTabs.setAttribute('role', 'tablist');
   panelTabs.setAttribute('aria-label', 'Editor panel');
   const casesTab = el('button', 'cnr-iv-ws__panel-tab', 'Test cases');
-  const outputTab = el('button', 'cnr-iv-ws__panel-tab', 'Output');
+  const outputTab = el('button', 'cnr-iv-ws__panel-tab', 'Results');
   [casesTab, outputTab].forEach(t => { t.type = 'button'; t.setAttribute('role', 'tab'); panelTabs.appendChild(t); });
   const stopButton = button('cnr-iv-ws__link', 'Stop', () => { if (ui.onStop) ui.onStop(); });
   stopButton.hidden = true;
@@ -181,7 +180,7 @@
     focus() { (cm ? cm : textarea).focus(); },
   };
   textarea.addEventListener('keydown', event => {
-    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); if (!testButton.disabled) run(true); return; }
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); if (!testButton.disabled) run(); return; }
     const start = textarea.selectionStart, end = textarea.selectionEnd, value = textarea.value;
     if (event.key === 'Tab' && !event.shiftKey && start === end) {
       event.preventDefault();
@@ -211,7 +210,7 @@
     cmLang = new Compartment();
     cmTheme = new Compartment();
     const themeOf = () => isDark() ? m.dark.oneDark : EditorView.theme({});
-    const runKeys = keymap.of([{ key: 'Mod-Enter', run: () => { if (!testButton.disabled) run(true); return true; } }, indentWithTab]);
+    const runKeys = keymap.of([{ key: 'Mod-Enter', run: () => { if (!testButton.disabled) run(); return true; } }, indentWithTab]);
     const current = editor.value;
     cm = new EditorView({
       doc: current,
@@ -262,10 +261,10 @@
     tabs.forEach((tab, i) => { const on = LANGS[i][0] === lang; tab.setAttribute('aria-selected', String(on)); tab.tabIndex = on ? 0 : -1; });
     editor.value = store.get(draftKey(lang)) ?? solutions[lang];
     const runnable = !!ENGINE[lang];
-    runButton.disabled = testButton.disabled = !runnable || !window.CNRRunner;
-    note.textContent = !window.CNRRunner ? 'The in-browser runner did not load.' : runnable ? 'Runs in your browser (Ctrl+Enter runs the tests). Edit the reference solution or reset to the starter code to write your own.'
+    testButton.disabled = !runnable || !window.CNRRunner;
+    note.textContent = !window.CNRRunner ? 'The in-browser runner did not load.' : runnable ? 'Run executes the test cases in your browser (Ctrl+Enter). Edit the reference solution, or reset to the starter code to write your own.'
       : 'Java, C++ and Go do not run in the browser yet: edit here, then paste into LeetCode. The tests below are what CI runs.';
-    casesNote.textContent = runnable ? `The checks "Run tests" executes against your ${LANGS.find(([l]) => l === lang)[1]} code (check(actual, expected, label) stops at the first failure).`
+    casesNote.textContent = runnable ? `The checks Run executes against your ${LANGS.find(([l]) => l === lang)[1]} code; each check(actual, expected, label) call becomes one result.`
       : `The ${LANGS.find(([l]) => l === lang)[1]} test program for this problem, for reference.`;
     if (cm) {
       cm.dispatch({ effects: cmLang.reconfigure(cmLangs[lang]) });
@@ -290,15 +289,15 @@
 
   // --- Output (the interface runner.js expects) ---
   const MAX_OUTPUT = 100000;
-  let size_ = 0, lastText = null, sawError = false;
-  function clearOut() { pre.textContent = ''; extra.textContent = ''; status.hidden = true; size_ = 0; lastText = null; sawError = false; }
+  let size_ = 0, lastText = null, sawError = false, stdoutText = '', errText = '';
+  function clearOut() { pre.textContent = ''; extra.textContent = ''; status.hidden = true; size_ = 0; lastText = null; sawError = false; stdoutText = ''; errText = ''; }
   const ui = {
     onStop: null,
     stdin: () => '',
     status(text) { status.textContent = text; status.hidden = !text; },
     write(text, isErr) {
       if (!text || size_ > MAX_OUTPUT) return;
-      if (isErr) sawError = true;
+      if (isErr) { sawError = true; errText += text; } else stdoutText += text;
       size_ += text.length;
       if (size_ > MAX_OUTPUT) text = text.slice(0, Math.max(0, text.length - (size_ - MAX_OUTPUT))) + '\n[output cut off]';
       if (!lastText || lastText.err !== !!isErr) {
@@ -316,29 +315,41 @@
   let runtime = null, busy = false;
   const loadRuntime = () => runtime || (runtime = fetch('/interview-runtime.json').then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }).catch(err => { runtime = null; throw err; }));
   const learning = () => window.CNRLearning;
-  function assemble(prelude, tests) {
+  // The tests call check(actual, expected, label); in the browser check records each call instead of stopping,
+  // and the report comes back on stdout after a marker so every case can be shown with its expected and actual value.
+  const MARKER = '__CNR_RESULTS__';
+  function assemble(prelude) {
     const own = data.prelude[lang] || '';
     if (lang === 'python') {
-      return [prelude.python, own, editor.value].join('\n') + (tests ? `\n\n# --- tests ---\n${data.tests.python}\nprint("All tests passed.")\n` : '\n');
+      const shim = ['import json as _cnr_json', '_cnr_results = []',
+        'def _cnr_short(s):', '    return s if len(s) <= 400 else s[:400] + "…"',
+        'def check(actual, expected, label=""):',
+        '    _cnr_results.append({"label": str(label), "expected": _cnr_short(repr(expected)), "actual": _cnr_short(repr(actual)), "ok": bool(actual == expected)})',
+        'try:', `    exec(compile(${JSON.stringify(data.tests.python)}, "<tests>", "exec"), globals())`,
+        'finally:', `    print("\\n" + "${MARKER}" + _cnr_json.dumps(_cnr_results), flush=True)`, ''].join('\n');
+      return [prelude.python, own, editor.value, '', '# --- tests ---', shim].join('\n');
     }
-    const shim = 'var process = { exitCode: 0, exit: function () { var e = new Error("stopped at the first failing check"); e.name = "Tests failed"; throw e; } };\n';
-    return [prelude.javascript, own, editor.value].join('\n') + (tests ? `\n\n// --- tests ---\n${shim}${data.tests.javascript}\nconsole.log("All tests passed.");\n` : '\n');
+    const shim = ['var process = { exitCode: 0, exit: function () { var e = new Error("process.exit() was called"); e.name = "Tests stopped"; throw e; } };',
+      'var __cnr_results = [];',
+      'function __cnr_short(s) { s = s === undefined ? "undefined" : s; return s.length <= 400 ? s : s.slice(0, 400) + "…"; }',
+      'function check(actual, expected, label) { const a = JSON.stringify(actual), e = JSON.stringify(expected); __cnr_results.push({ label: String(label == null ? "" : label), expected: __cnr_short(e), actual: __cnr_short(a), ok: a === e }); }',
+      'try {', data.tests.javascript, '} finally {', `  console.log("\\n${MARKER}" + JSON.stringify(__cnr_results));`, '}', ''].join('\n');
+    return [prelude.javascript, own, editor.value, '', '// --- tests ---', shim].join('\n');
   }
-  async function run(tests) {
+  async function run() {
     if (busy || !window.CNRRunner || !ENGINE[lang]) return;
     busy = true;
     saveDraft();
     clearOut();
     setPanel('output');
-    [runButton, testButton].forEach(b => { b.disabled = true; });
+    testButton.disabled = true;
     stopButton.hidden = false;
     try {
       ui.status('Loading…');
       const prelude = await loadRuntime();
       ui.status('');
-      await window.CNRRunner[ENGINE[lang]](assemble(prelude, tests), ui);
-      if (!pre.textContent) ui.write('(no output)\n');
-      if (tests) finishTests(!sawError);
+      await window.CNRRunner[ENGINE[lang]](assemble(prelude), ui);
+      report();
     } catch (err) {
       ui.write(`Could not run: ${err && err.message ? err.message : err}\n`, true);
     } finally {
@@ -346,22 +357,63 @@
       busy = false;
       stopButton.hidden = true;
       ui.onStop = null;
-      [runButton, testButton].forEach(b => { b.disabled = false; });
+      testButton.disabled = false;
     }
   }
-  function finishTests(passed) {
-    const banner = el('div', `cnr-iv-ws__verdict ${passed ? 'cnr-iv-ws__verdict--pass' : 'cnr-iv-ws__verdict--fail'}`);
-    banner.setAttribute('role', 'status');
-    banner.append(passed ? 'All tests passed. ' : 'Some tests failed. Read the first failure above, fix the code and run the tests again.');
+  function report() {
+    const at = stdoutText.lastIndexOf(MARKER);
+    let results = null, stdout = stdoutText;
+    if (at >= 0) {
+      stdout = stdoutText.slice(0, at).replace(/\n$/, '');
+      try { results = JSON.parse(stdoutText.slice(at + MARKER.length).split('\n')[0]); } catch (_) { results = null; }
+    }
+    pre.textContent = '';
+    extra.textContent = '';
+    const view = el('div', 'cnr-iv-ws__results');
+    const passed = results ? results.filter(r => r.ok).length : 0;
+    const allPassed = !!results && results.length > 0 && passed === results.length && !sawError;
+    const verdict = el('div', `cnr-iv-ws__verdict ${allPassed ? 'cnr-iv-ws__verdict--pass' : 'cnr-iv-ws__verdict--fail'}`);
+    verdict.setAttribute('role', 'status');
+    verdict.append(!results ? (sawError ? 'The code stopped with an error before any check ran.' : 'No test results came back.')
+      : allPassed ? `All tests passed (${passed} of ${results.length} checks).`
+      : sawError ? `${passed} of ${results.length} checks passed before the code stopped with an error.`
+      : `Some tests failed: ${passed} of ${results.length} checks passed.`);
     let solved = false, canWrite = false;
     try { solved = !!learning().solvedAt(path); canWrite = learning().canWrite(); } catch (_) { /* no learning store */ }
-    if (passed && canWrite && !solved) {
-      banner.appendChild(button('cnr-iv-ws__btn cnr-iv-ws__btn--primary', 'Mark as solved', () => {
+    if (allPassed && canWrite && !solved) {
+      verdict.appendChild(button('cnr-iv-ws__btn cnr-iv-ws__btn--primary', 'Mark as solved', () => {
         try { learning().setSolved(path, true, title); } catch (_) { return; }
-        banner.replaceChildren('All tests passed. Marked as solved.');
+        verdict.replaceChildren(`All tests passed (${passed} of ${results.length} checks). Marked as solved.`);
       }));
-    } else if (passed && solved) banner.append('Already marked as solved.');
-    extra.prepend(banner);
+    } else if (allPassed && solved) verdict.append(' Already marked as solved.');
+    view.appendChild(verdict);
+    if (results && results.length) {
+      const list = el('ol', 'cnr-iv-ws__cases-list');
+      results.forEach((r, i) => {
+        const item = el('li', `cnr-iv-ws__case ${r.ok ? 'cnr-iv-ws__case--pass' : 'cnr-iv-ws__case--fail'}`);
+        const head = el('div', 'cnr-iv-ws__case-head');
+        head.append(el('span', 'cnr-iv-ws__case-mark', r.ok ? '✓' : '✗'), el('span', 'cnr-iv-ws__case-label', r.label || `Check ${i + 1}`));
+        item.appendChild(head);
+        if (!r.ok) {
+          const grid = el('dl', 'cnr-iv-ws__case-io');
+          grid.append(el('dt', null, 'Expected'), el('dd', null, r.expected), el('dt', null, 'Actual'), el('dd', null, r.actual));
+          item.appendChild(grid);
+        }
+        list.appendChild(item);
+      });
+      view.appendChild(list);
+    }
+    if (stdout.trim()) {
+      view.appendChild(el('h4', 'cnr-iv-ws__io-title', 'Stdout'));
+      view.appendChild(el('pre', 'cnr-iv-ws__io', stdout));
+    }
+    if (errText.trim()) {
+      view.appendChild(el('h4', 'cnr-iv-ws__io-title', 'Errors'));
+      const errPre = el('pre', 'cnr-iv-ws__io');
+      errPre.appendChild(el('span', 'cnr-iv-ws__err', errText.replace(/\s+$/, '')));
+      view.appendChild(errPre);
+    }
+    extra.appendChild(view);
   }
 
   selectPane('problem');

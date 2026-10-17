@@ -107,8 +107,10 @@ test('problem page is a workspace: tabbed write-up on the left, a highlighted ed
   await expect(workspace.locator('.cnr-iv-ws__cases-code .cm-content')).toContainText('check('); // test cases shown
   await tabs.nth(1).click();
   expect(await doc()).toMatch(/var twoSum = function \(nums, target\) \{/);
-  await workspace.locator('.cnr-iv-ws__btn--primary').click(); // Run tests on the reference solution
-  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('All tests passed');
+  await workspace.locator('.cnr-iv-ws__btn--primary').click(); // Run executes the test cases on the reference solution
+  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText(/All tests passed \(\d+ of \d+ checks\)/);
+  expect(await workspace.locator('.cnr-iv-ws__case--pass').count()).toBeGreaterThan(5);
+  await expect(workspace.locator('.cnr-iv-ws__case--fail')).toHaveCount(0);
   await page.waitForFunction(() => window.CNRLearning && window.CNRLearning.canWrite());
   await workspace.locator('.cnr-iv-ws__verdict button:has-text("Mark as solved")').click();
   await expect(page.locator('[data-iv-solve-toggle]')).toHaveAttribute('aria-pressed', 'true');
@@ -116,12 +118,23 @@ test('problem page is a workspace: tabbed write-up on the left, a highlighted ed
   await workspace.locator('.cnr-iv-ws__menu-item:has-text("Starter code")').click();
   expect(await doc()).toMatch(/^var twoSum = function \(nums, target\) \{\s*\/\/ your code here/);
   await workspace.locator('.cnr-iv-ws__btn--primary').click();
-  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText('Some tests failed');
-  await expect(workspace.locator('.cnr-iv-ws__err')).toContainText(/expected|TypeError/); // the stub returns nothing
+  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText(/stopped with an error|Some tests failed/); // the stub returns nothing
+  await expect(workspace.locator('.cnr-iv-ws__io-title').last()).toHaveText('Errors');
+  await expect(workspace.locator('.cnr-iv-ws__err')).toContainText('TypeError');
+  await page.locator('.cnr-iv-ws__editor .cm-content').click();
+  await page.keyboard.press('Control+a');
+  await page.keyboard.insertText('var twoSum = function (nums, target) { return [0, 1]; };');
+  await workspace.locator('.cnr-iv-ws__btn--primary').click();
+  await expect(workspace.locator('.cnr-iv-ws__verdict')).toContainText(/Some tests failed: \d+ of \d+ checks passed/);
+  const failed = workspace.locator('.cnr-iv-ws__case--fail').first();
+  await expect(failed.locator('dt')).toHaveText(['Expected', 'Actual']); // each failing check shows both values
+  await expect(failed.locator('dd').first()).toHaveText('[1,3]');
+  await expect(failed.locator('dd').last()).toHaveText('[0,1]');
+  await expect(workspace.locator('.cnr-iv-ws__case--pass').first()).toBeVisible(); // [2,7,11,15] 9 -> [0,1] passes
   await page.reload();
   await expect(workspace.locator('[role=tab][aria-selected=true].cnr-iv-ws__lang')).toHaveText('JavaScript'); // remembered
   await expect(page.locator('.cnr-iv-ws--cm .cnr-iv-ws__editor .cm-editor')).toBeVisible({ timeout: 30000 });
-  expect(await doc()).toMatch(/your code here/); // the draft survives a reload
+  expect(await doc()).toMatch(/return \[0, 1\]/); // the draft survives a reload
   await page.setViewportSize({ width: 820, height: 900 });
   const narrowText = await page.locator('.cnr-iv-split__text').boundingBox();
   const narrowAside = await workspace.boundingBox();
