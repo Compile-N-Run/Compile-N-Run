@@ -45,12 +45,19 @@ async function device(t,shared,options={}){
   if(!model.id)return reply({error:'authentication_required'},401);
   if(req.headers()['x-cnr-user']!==model.id)return reply({error:'account_changed'},409);
   const entry=shared[model.id]||(shared[model.id]={revision:0,data:null,updatedAt:null,writes:0,gets:0});
-  if(method==='GET'){entry.gets++;if(model.getHook)await model.getHook();if(model.status===429)return reply({error:'rate_limited'},429);return reply(entry);}
+  const capabilities=()=>options.protocol2?{syncProtocol:2,incremental:entry.incremental!==false}:{};
+  if(method==='GET'){entry.gets++;if(model.getHook)await model.getHook();if(model.status===429)return reply({error:'rate_limited'},429);if(options.protocol2&&req.headers()['x-cnr-revision']===String(entry.revision))return reply({revision:entry.revision,updatedAt:entry.updatedAt,unchanged:true,...capabilities()});return reply({...entry,...capabilities()});}
   if(model.putHook)await model.putHook(entry,body);
   if(model.status)return reply({error:model.status===413?'snapshot_too_large':'rate_limited'},model.status);
   if(req.headers()['x-csrf-token']!=='csrf-'+model.id)return reply({error:'csrf_failed'},403);
   if(body.revision!==entry.revision)return reply({error:'revision_conflict',revision:entry.revision},409);
-  entry.data=body.data;entry.revision++;entry.writes++;entry.updatedAt=new Date().toISOString();return reply({revision:entry.revision,updatedAt:entry.updatedAt});
+  if(method==='PATCH'){
+   assert(options.protocol2&&entry.incremental!==false,'PATCH must be negotiated');
+   const next=structuredClone(entry.data||blank()),maps={read:next.progress.done,course:next.progress.tuts,lesson:next.learning.lessons,draft:next.playground.drafts};
+   for(const row of body.changes){if(row.value===null)delete maps[row.kind][row.key];else maps[row.kind][row.key]=row.value;}
+   next.exportedAt=body.exportedAt;entry.data=next;
+  }else entry.data=body.data;
+  entry.incremental=true;entry.revision++;entry.writes++;entry.updatedAt=new Date().toISOString();return reply({revision:entry.revision,updatedAt:entry.updatedAt,...capabilities()});
  });
  const page=await context.newPage();await page.goto(origin+(options.route||'/learn/'));await page.waitForFunction(()=>window.CNRAuth&&window.CNRLearningSync);if(options.beforeReady)await options.beforeReady(page,model);await page.evaluate(()=>window.CNRAuth.ready());
  await page.waitForFunction(()=>window.CNRLearning.canWrite());await flush(page);return {page,context,model};
@@ -236,4 +243,56 @@ test('initial owner activation restores a safe HTML preview and keeps exercise a
  await page.frameLocator('iframe').getByRole('heading',{name:'Requested lesson draft'}).waitFor();
  assert.equal(await page.getByRole('combobox',{name:'Saved project',exact:true}).inputValue(),'lesson:'+PAGE);
  assert.equal(model.requests.filter(r=>r.p==='/api/learning').length,0);
+});
+
+test('record sync sends one PATCH without a preceding GET and uses revision-only refreshes',async t=>{
+ const shared={alice:cloud()}, {page,model}=await device(t,shared,{protocol2:true});
+ const before=model.requests.length,gets=shared.alice.gets;
+ await page.evaluate(p=>CNRLearning.saveNote(p,'Only this lesson changed'),PAGE);await flush(page);
+ const sent=model.requests.slice(before).filter(r=>r.p==='/api/learning');
+ assert.deepEqual(sent.map(r=>r.method),['PATCH']);assert.equal(shared.alice.gets,gets);
+ assert.equal(sent[0].body.data,undefined);assert.equal(sent[0].body.changes.length,1);
+ assert.equal(sent[0].body.changes[0].kind,'lesson');assert.equal(sent[0].body.changes[0].key,PAGE);
+ const writes=shared.alice.writes;await flush(page);
+ const refresh=model.requests.at(-1);assert.equal(refresh.method,'GET');assert.equal(refresh.headers['x-cnr-revision'],String(shared.alice.revision));
+ assert.equal(shared.alice.writes,writes);assert.equal((await state(page)).learning.lessons[PAGE].note.text,'Only this lesson changed');
+});
+
+test('a legacy snapshot converts with PUT once and subsequent edits use PATCH',async t=>{
+ const entry=cloud();entry.incremental=false;const shared={alice:entry};
+ const {page,model}=await device(t,shared,{protocol2:true});
+ await page.evaluate(p=>CNRLearning.saveNote(p,'First edit'),PAGE);await flush(page);
+ await page.evaluate(p=>CNRLearning.saveNote(p,'Second edit'),PAGE);await flush(page);
+ assert.deepEqual(model.requests.filter(r=>r.method==='PUT'||r.method==='PATCH').map(r=>r.method),['PUT','PATCH']);
+ assert.equal(shared.alice.data.learning.lessons[PAGE].note.text,'Second edit');
+});
+
+test('optimistic PATCH conflicts fetch the newer revision and merge independent device edits',async t=>{
+ const shared={alice:cloud()},one=await device(t,shared,{protocol2:true}),two=await device(t,shared,{protocol2:true});
+ await one.page.evaluate(p=>CNRLearning.saveNote(p,'First device'),PAGE);await flush(one.page);
+ await two.page.evaluate(p=>CNRLearning.saveNote(p,'Second device'),OTHER);const before=two.model.requests.length;
+ await flush(two.page);await flush(two.page);
+ assert.deepEqual(two.model.requests.slice(before).filter(r=>r.p==='/api/learning').map(r=>r.method),['PATCH','GET','PATCH']);
+ assert.equal(shared.alice.data.learning.lessons[PAGE].note.text,'First device');assert.equal(shared.alice.data.learning.lessons[OTHER].note.text,'Second device');
+});
+
+test('record sync coalesces edits and repeated focus events do not reread fresh data',async t=>{
+ const shared={alice:cloud()}, {page,model}=await device(t,shared,{protocol2:true});await page.clock.install();
+ const before=model.requests.length;
+ await page.evaluate(async p=>{for(let i=0;i<20;i++){await CNRLearning.saveNote(p,'Edit '+i);dispatchEvent(new Event('focus'));}},PAGE);
+ await page.clock.fastForward(20000);
+ assert.equal(model.requests.slice(before).filter(r=>r.p==='/api/learning').length,0);
+ await page.clock.fastForward(15000);await page.waitForFunction(()=>CNRLearningSync.getStatus().state==='saved');
+ assert.equal(shared.alice.writes,1);assert.equal(shared.alice.data.learning.lessons[PAGE].note.text,'Edit 19');
+ const saved=model.requests.length;
+ await page.evaluate(()=>{for(let i=0;i<20;i++)dispatchEvent(new Event('focus'));});await page.clock.fastForward(100000);
+ assert.equal(model.requests.slice(saved).filter(r=>r.p==='/api/learning').length,0);
+ await page.clock.fastForward(200000);await page.waitForTimeout(100);
+ assert.equal(model.requests.slice(saved).filter(r=>r.p==='/api/learning').length,1);
+});
+
+test('an open unsaved note is included in record sync despite a fresh clean cache',async t=>{
+ const shared={alice:cloud()}, {page}=await device(t,shared,{protocol2:true,route:PAGE});
+ await page.getByText('Your lesson notes',{exact:true}).click();await page.locator('[data-learning-note]').fill('Dirty editor text');await flush(page);
+ assert.equal(shared.alice.data.learning.lessons[PAGE].note.text,'Dirty editor text');
 });

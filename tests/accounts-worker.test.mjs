@@ -13,6 +13,7 @@ class D1 {
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-email-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-google-profile-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-github-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-learning-records-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -23,8 +24,12 @@ class D1 {
       return { success: true, meta: { ...result, changes } };
     };
     const statement = values => ({
+      sql,
       bind: (...args) => statement(args),
-      first: async () => native.get(...values) || null,
+      first: async () => {
+        if (sql.includes('AS rows_json')) this.learningQuery = { sql, values };
+        return native.get(...values) || null;
+      },
       run: async () => executeWithD1Changes(values),
       runSync: () => executeWithD1Changes(values),
       all: async () => ({ success: true, results: native.all(...values) }),
@@ -32,6 +37,7 @@ class D1 {
     return statement([]);
   }
   async batch(statements) {
+    if (this.beforeBatch) { const hook = this.beforeBatch; this.beforeBatch = null; hook(this.sqlite); }
     this.sqlite.exec('BEGIN');
     try {
       const results = [];
@@ -207,7 +213,7 @@ test('snapshots are isolated by identity and stale revisions cannot overwrite sa
   const alice = await login('alice');
   const bob = await login('bob');
   const read = async current => (await handleAccounts(request('/api/learning', { cookie: current.cookie, headers: { 'X-CNR-User': current.user.id } }), env));
-  assert.deepEqual(await (await read(alice)).json(), { revision: 0, data: null, updatedAt: null });
+  assert.deepEqual(await (await read(alice)).json(), { revision: 0, data: null, updatedAt: null, syncProtocol: 2, incremental: false });
   const saved = await handleAccounts(request('/api/learning', { method: 'PUT', cookie: alice.cookie, headers: authHeaders(alice), body: { revision: 0, data: snapshot('Alice note') } }), env);
   assert.equal(saved.status, 200); assert.equal((await saved.json()).revision, 1);
   assert.equal((await (await read(bob)).json()).data, null);
@@ -239,9 +245,122 @@ test('simultaneous saves from the same revision accept exactly one writer', asyn
     method: 'PUT', cookie: current.cookie, headers: authHeaders(current), body: { revision: 0, data: snapshot(note) },
   }), env)));
   assert.deepEqual(responses.map(result => result.status).sort(), [200, 409]);
-  const stored = db.sqlite.prepare('SELECT revision, data_json FROM cnr_account_learning WHERE user_id=?').get(current.user.id);
+  const stored = db.sqlite.prepare('SELECT revision FROM cnr_learning_state WHERE user_id=?').get(current.user.id);
   assert.equal(stored.revision, 1);
-  assert.match(stored.data_json, /first writer|second writer/);
+  const lesson = db.sqlite.prepare("SELECT data_json FROM cnr_learning_records WHERE user_id=? AND kind='lesson'").get(current.user.id);
+  assert.match(lesson.data_json, /first writer|second writer/);
+});
+
+const learningRead = (current, revision) => handleAccounts(request('/api/learning', { cookie: current.cookie,
+  headers: { 'X-CNR-User': current.user.id, ...(revision === undefined ? {} : { 'X-CNR-Revision': String(revision) }) } }), env);
+const learningPut = (current, revision, data) => handleAccounts(request('/api/learning', { method: 'PUT', cookie: current.cookie,
+  headers: authHeaders(current), body: { revision, data } }), env);
+const learningPatch = (current, revision, changes) => handleAccounts(request('/api/learning', { method: 'PATCH', cookie: current.cookie,
+  headers: authHeaders(current), body: { revision, changes, exportedAt: '2026-10-17T12:00:00.000Z' } }), env);
+const totalChanges = () => db.sqlite.prepare('SELECT total_changes() AS n').get().n;
+
+test('repeatable schema and lazy conversion preserve every legacy record and revision until a successful save', async () => {
+  const current = await login(), original = snapshot('Legacy note');
+  original.progress.done['/docs/language/css/'] = 123;
+  original.progress.tuts['language/css'] = { label: 'CSS', t: 123 };
+  original.playground.drafts.workspace = { html: '<p>Legacy draft</p>', css: '', js: '' };
+  db.sqlite.prepare('UPDATE cnr_account_learning SET revision=7, data_json=?, updated_at=100 WHERE user_id=?').run(JSON.stringify(original), current.user.id);
+  db.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-learning-records-schema.sql', import.meta.url), 'utf8'));
+  const before = totalChanges(), legacy = await (await learningRead(current)).json();
+  assert.deepEqual(legacy.data, original); assert.equal(legacy.revision, 7); assert.equal(legacy.incremental, false);
+  assert.equal(totalChanges(), before, 'Reading a legacy snapshot must not backfill rows');
+  assert.equal((await learningPatch(current, 7, [])).status, 409);
+  const saved = await learningPut(current, 7, original);
+  assert.equal(saved.status, 200); assert.equal((await saved.json()).revision, 8);
+  assert.equal(db.sqlite.prepare('SELECT data_json FROM cnr_account_learning WHERE user_id=?').get(current.user.id).data_json, null);
+  assert.deepEqual((await (await learningRead(current)).json()).data, original);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_learning_records WHERE user_id=?').get(current.user.id).n, 4);
+});
+
+test('one-record edits write two rows regardless of collection size; no-op saves and revision reads write zero', async () => {
+  const current = await login(), data = snapshot('Original');
+  for (let i = 0; i < 2000; i++) data.progress.done['/docs/lesson-' + i + '/'] = i + 1;
+  assert.equal((await learningPut(current, 0, data)).status, 200);
+  const before = totalChanges(), row = { ...data.learning.lessons['/docs/language/css/'], note: { text: 'Changed', updatedAt: 1 } };
+  const saved = await learningPatch(current, 1, [{ kind: 'lesson', key: '/docs/language/css/', value: row }]);
+  assert.equal(saved.status, 200); assert.equal((await saved.json()).revision, 2);
+  assert.equal(totalChanges() - before, 2);
+  const plan = db.sqlite.prepare('EXPLAIN QUERY PLAN ' + db.learningQuery.sql).all(...db.learningQuery.values);
+  assert(plan.some(row => /SEARCH r USING PRIMARY KEY \(user_id=\? AND kind=\? AND record_key=\?\)/.test(row.detail)), JSON.stringify(plan));
+  const after = totalChanges();
+  const unchanged = await (await learningRead(current, 2)).json();
+  assert.equal(unchanged.unchanged, true); assert.equal(Object.hasOwn(unchanged, 'data'), false);
+  assert.equal((await learningPatch(current, 2, [{ kind: 'lesson', key: '/docs/language/css/', value: row }])).status, 200);
+  const roundtrip = (await (await learningRead(current)).json()).data;
+  roundtrip.exportedAt = '2026-10-17T13:00:00.000Z';
+  assert.equal((await learningPut(current, 2, roundtrip)).status, 200);
+  assert.equal(totalChanges(), after);
+});
+
+test('full PUT remains compatible and deletes removed records while updating only changed rows', async () => {
+  const current = await login(), initial = snapshot('Original');
+  initial.progress.done['/docs/keep/'] = 1; initial.progress.done['/docs/delete/'] = 2;
+  await learningPut(current, 0, initial);
+  const changed = snapshot('Updated'); changed.progress.done['/docs/keep/'] = 1;
+  const before = totalChanges();
+  assert.equal((await learningPut(current, 1, changed)).status, 200);
+  assert.equal(totalChanges() - before, 3, 'One head, one changed lesson, and one deletion');
+  assert.deepEqual((await (await learningRead(current)).json()).data, changed);
+});
+
+test('a CAS loser cannot change records when a competing batch reaches the same next revision', async () => {
+  const current = await login(); await learningPut(current, 0, snapshot('Winner'));
+  db.beforeBatch = sqlite => sqlite.prepare("UPDATE cnr_learning_state SET revision=2, write_token='another-batch' WHERE user_id=?").run(current.user.id);
+  const result = await learningPatch(current, 1, [{ kind: 'lesson', key: '/docs/language/css/', value: snapshot('Loser').learning.lessons['/docs/language/css/'] }]);
+  assert.equal(result.status, 409); assert.equal((await result.json()).revision, 2);
+  assert.equal((await (await learningRead(current)).json()).data.learning.lessons['/docs/language/css/'].note.text, 'Winner');
+});
+
+test('failed record writes roll back the revision, accounting and lazy snapshot conversion together', async () => {
+  const current = await login(), data = snapshot('Preserved legacy');
+  db.sqlite.prepare('UPDATE cnr_account_learning SET data_json=? WHERE user_id=?').run(JSON.stringify(data), current.user.id);
+  db.sqlite.exec("CREATE TRIGGER fail_record BEFORE INSERT ON cnr_learning_records BEGIN SELECT RAISE(ABORT, 'test failure'); END;");
+  assert.equal((await learningPut(current, 0, data)).status, 503);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_learning_state').get().n, 0);
+  assert.deepEqual((await (await learningRead(current)).json()).data, data);
+});
+
+test('patches enforce aggregate byte and record limits, reject duplicate or unsafe keys, and preserve deletions', async () => {
+  const current = await login(); await learningPut(current, 0, snapshot());
+  const large = { html: '界'.repeat(250000) };
+  assert.equal((await learningPatch(current, 1, [{ kind: 'draft', key: 'one', value: large }])).status, 200);
+  assert.equal((await learningPatch(current, 2, [{ kind: 'draft', key: 'two', value: large }])).status, 200);
+  const before = totalChanges();
+  assert.equal((await learningPatch(current, 3, [{ kind: 'draft', key: 'three', value: large }])).status, 413);
+  for (const changes of [
+    [{ kind: 'unknown', key: 'x', value: {} }],
+    [{ kind: 'lesson', key: '__proto__', value: {} }],
+    [{ kind: 'read', key: '/docs/x/', value: -1 }],
+    [{ kind: 'draft', key: 'x', value: {} }, { kind: 'draft', key: 'x', value: null }],
+  ]) assert.equal((await learningPatch(current, 3, changes)).status, 400);
+  assert.equal(totalChanges(), before);
+  assert.equal((await learningPatch(current, 3, [{ kind: 'draft', key: 'one', value: null }])).status, 200);
+  const data = (await (await learningRead(current)).json()).data;
+  assert.equal(data.playground.drafts.one, undefined); assert.deepEqual(data.playground.drafts.two, large);
+  const reads = Array.from({ length: 20000 }, (_, i) => ({ kind: 'read', key: '/docs/' + i + '/', value: 1 }));
+  assert.equal((await learningPatch(current, 4, reads)).status, 200);
+  assert.equal((await learningPatch(current, 5, [{ kind: 'read', key: '/docs/extra/', value: 1 }])).status, 400);
+});
+
+test('PATCH keeps account, origin and CSRF boundaries and cannot recreate revoked or deleted data', async () => {
+  const current = await login(); await learningPut(current, 0, snapshot('Private'));
+  const bob = await login('bob');
+  const changes = [{ kind: 'read', key: '/docs/a/', value: 1 }];
+  for (const changed of [{ Origin: 'https://evil.invalid' }, { 'X-CSRF-Token': 'wrong' }, { 'X-CNR-User': bob.user.id }]) {
+    const result = await handleAccounts(request('/api/learning', { method: 'PATCH', cookie: current.cookie,
+      headers: { ...authHeaders(current), ...changed }, body: { revision: 1, changes, exportedAt: snapshot().exportedAt } }), env);
+    assert([403, 409].includes(result.status));
+  }
+  db.beforeBatch = sqlite => sqlite.prepare('DELETE FROM cnr_account_sessions WHERE user_id=?').run(current.user.id);
+  assert.equal((await learningPatch(current, 1, changes)).status, 401);
+  db.sqlite.prepare('DELETE FROM cnr_account_users WHERE id=?').run(current.user.id);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_learning_state WHERE user_id=?').get(current.user.id).n, 0);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_learning_records WHERE user_id=?').get(current.user.id).n, 0);
 });
 
 test('invalid provider identity and duplicate callback cookies cannot create a login', async () => {
@@ -255,7 +374,9 @@ test('invalid provider identity and duplicate callback cookies cannot create a l
 
 test('snapshot shape, unsafe keys, nesting and streamed byte limits reject input without writes', async () => {
   const current = await login();
-  for (const data of [{}, { ...snapshot(), version: 2 }, JSON.parse(JSON.stringify(snapshot()).replace('"done":{}', '"done":{"__proto__":{}}'))]) {
+  const nullLesson = snapshot(); nullLesson.learning.lessons['/docs/a/'] = null;
+  const falseRead = snapshot(); falseRead.progress.done['/docs/a/'] = false;
+  for (const data of [{}, { ...snapshot(), version: 2 }, nullLesson, falseRead, JSON.parse(JSON.stringify(snapshot()).replace('"done":{}', '"done":{"__proto__":{}}'))]) {
     const result = await handleAccounts(request('/api/learning', { method: 'PUT', cookie: current.cookie, headers: authHeaders(current), body: { revision: 0, data } }), env);
     assert.equal(result.status, 400);
   }
@@ -288,11 +409,7 @@ test('logout revokes only its session; deletion cascades all account sessions an
 
 test('revocation between authentication and a write cannot recreate or overwrite account data', async () => {
   const current = await login();
-  const originalPrepare = db.prepare.bind(db);
-  db.prepare = sql => {
-    if (sql.startsWith('UPDATE cnr_account_learning')) db.sqlite.prepare('DELETE FROM cnr_account_users WHERE id=?').run(current.user.id);
-    return originalPrepare(sql);
-  };
+  db.beforeBatch = sqlite => sqlite.prepare('DELETE FROM cnr_account_users WHERE id=?').run(current.user.id);
   const result = await handleAccounts(request('/api/learning', { method: 'PUT', cookie: current.cookie, headers: authHeaders(current), body: { revision: 0, data: snapshot('No resurrection') } }), env);
   assert.equal(result.status, 401);
   assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_learning').get().n, 0);

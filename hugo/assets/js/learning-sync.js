@@ -7,7 +7,8 @@
   var CLOUD_LIMIT = 1800000, LOCK = 'cnr-learning-state', dbPromise;
   var owner = null, auth = null, phase = true, ready = false, hasActivated = false, generation = 0, applying = false, draining = false, lastSyncError = null;
   var timer = null, controller = null, lastAttempt = 0, backoff = 0, nextAllowedAttempt = 0, localQueue = Promise.resolve(), running = null;
-  var authObserved = false;
+  var authObserved = false, efficientSync = false, refreshRequired = false;
+  var REFRESH_INTERVAL = 300000;
   var status = { state: 'loading', message: 'Loading your learning…' }, lastView = null;
   function empty() { return { format: 'cnr-learning-backup', version: 1, exportedAt: new Date().toISOString(), progress: { v: 1, done: {}, tuts: {} }, learning: { v: 1, lessons: {} }, playground: { version: 1, drafts: {} } }; }
   function copy(value) { return JSON.parse(JSON.stringify(value)); }
@@ -102,6 +103,16 @@
     Object.keys(out.progress.tuts).forEach(function (id) { var t = out.progress.tuts[id]; t.done = Math.min(t.total, Object.keys(out.progress.done).filter(function (p) { return p.indexOf('/docs/' + id + '/') === 0; }).length); });
     return normal(out);
   }
+  function changes(before, after) {
+    var previous = { read: before.progress.done, course: before.progress.tuts, lesson: before.learning.lessons, draft: before.playground.drafts };
+    var next = { read: after.progress.done, course: after.progress.tuts, lesson: after.learning.lessons, draft: after.playground.drafts }, result = [];
+    Object.keys(next).forEach(function (kind) {
+      union(previous[kind], next[kind]).forEach(function (key) {
+        if (!equal(previous[kind][key], next[kind][key])) result.push({ kind: kind, key: key, value: next[kind][key] === undefined ? null : next[kind][key] });
+      });
+    });
+    return result;
+  }
   function disk() { return api.readDiskSnapshot(); }
   async function flushOwner(id, includeEditor) {
     var cached = await partition(id), activeDisk = marker() === id ? disk() : cached.local;
@@ -170,7 +181,7 @@
         var outgoing = await flushOwner(existing, existing === owner), incoming = target === existing ? outgoing : await partition(target);
         await dbPut(target, incoming);
         await install(target, incoming.local, existing, outgoing.local, target !== owner);
-        if (owner !== target) { lastAttempt = 0; nextAllowedAttempt = 0; backoff = 0; }
+        if (owner !== target) { lastAttempt = 0; nextAllowedAttempt = 0; backoff = 0; efficientSync = false; refreshRequired = false; }
         owner = target; incoming.detachedBase = null; await dbPut(target, incoming);
       });
       phase = false; ready = true; renderGuard();
@@ -234,11 +245,12 @@
     return commitMutation(before, after);
   }
   function active(token, id) { return token === generation && owner === id && auth && auth.user && sessionOwner(auth) === id && marker() === id && !phase; }
-  async function request(method, body, token, id, login) {
+  async function request(method, body, token, id, login, revision) {
     if (!active(token, id)) throw new Error('scope_changed');
     controller = new AbortController(); var timeout = setTimeout(function () { controller.abort(); }, 15000);
     var headers = { Accept: 'application/json', 'X-CNR-User': login.user.id };
-    if (method === 'PUT') { headers['X-CSRF-Token'] = login.csrfToken; headers['Content-Type'] = 'application/json'; }
+    if (method === 'GET' && Number.isSafeInteger(revision)) headers['X-CNR-Revision'] = String(revision);
+    if (method === 'PUT' || method === 'PATCH') { headers['X-CSRF-Token'] = login.csrfToken; headers['Content-Type'] = 'application/json'; }
     try {
       var response = await fetch('/api/learning', { method: method, headers: headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal, ...(body ? { body: JSON.stringify(body) } : {}) });
       var reader = response.body.getReader(), chunks = [], size = 0, decoder = new TextDecoder();
@@ -249,7 +261,7 @@
       return data;
     } finally { clearTimeout(timeout); controller = null; }
   }
-  async function synchronize() {
+  async function synchronize(forceRead) {
     if (running) return running;
     if (!mayView() || !auth || !auth.user) return; if (Date.now() < nextAllowedAttempt) { schedule(false); return; }
     var token = generation, id = owner, login = copy(auth); lastSyncError = null; lastAttempt = Date.now();
@@ -257,9 +269,29 @@
       await localQueue;
       await locked(async function () {
         if (!active(token, id)) return;
-        var cached = await partition(id), remote = await request('GET', null, token, id, login);
-        if (!Number.isSafeInteger(remote.revision) || remote.revision < 0 || !Object.prototype.hasOwnProperty.call(remote, 'data')) throw new Error('invalid_cloud');
+        var cached = await partition(id);
+        // A known revision lets pending edits go straight to one CAS request.
+        // On conflict the next attempt fetches and uses the existing three-way merge.
+        var hasChanges = cached.pending || signature(currentSnapshot()) !== signature(cached.base);
+        var optimistic = cached.incremental === true && hasChanges && !refreshRequired;
+        if (!hasChanges && cached.protocol2 === true && !forceRead && !refreshRequired &&
+            Date.now() - (cached.lastReadAt || 0) < REFRESH_INTERVAL) {
+          tell('saved', 'Progress saved to your account.');
+          schedule(true, REFRESH_INTERVAL - (Date.now() - cached.lastReadAt)); return;
+        }
+        var remote = optimistic ? { revision: cached.revision, data: cached.base, syncProtocol: 2, incremental: true } :
+          await request('GET', null, token, id, login, cached.cloudKnown || cached.revision > 0 ? cached.revision : undefined);
+        if (!Number.isSafeInteger(remote.revision) || remote.revision < 0) throw new Error('invalid_cloud');
+        if (remote.unchanged === true) {
+          if (remote.revision !== cached.revision) throw new Error('invalid_cloud');
+          remote.data = cached.base;
+        }
+        if (!Object.prototype.hasOwnProperty.call(remote, 'data')) throw new Error('invalid_cloud');
         var remoteData; try { remoteData = remote.data === null ? empty() : normal(remote.data); } catch (_) { throw new Error('invalid_cloud'); }
+        efficientSync = remote.syncProtocol === 2;
+        cached.protocol2 = efficientSync;
+        cached.incremental = efficientSync && remote.incremental === true;
+        if (!optimistic) { cached.cloudKnown = true; cached.lastReadAt = Date.now(); refreshRequired = false; }
         var current = currentSnapshot(); if (cached.detachedBase) current = threeWay(cached.detachedBase, current, cached.local); var merged = threeWay(cached.base, current, remoteData);
         var needsInstall = signature(normal(disk())) !== signature(merged);
         if (needsInstall) { localStorage.setItem(TRANSITION, '1'); renderGuard(); current = currentSnapshot(); if (cached.detachedBase) current = threeWay(cached.detachedBase, current, cached.local); merged = threeWay(cached.base, current, remoteData); }
@@ -277,11 +309,14 @@
         if (!cached.pending) { backoff = 0; nextAllowedAttempt = 0; tell('saved', 'Progress is up to date.'); return; }
         var raw = JSON.stringify(merged);
         if (new Blob([raw]).size > CLOUD_LIMIT) { var tooLarge = new Error('snapshot_too_large'); tooLarge.status = 413; throw tooLarge; }
-        var sent = copy(merged), result = await request('PUT', { revision: remote.revision, data: sent }, token, id, login);
-        if (!Number.isSafeInteger(result.revision) || result.revision <= remote.revision) throw new Error('invalid_cloud');
+        var sent = copy(merged), incremental = remote.syncProtocol === 2 && remote.incremental === true;
+        var body = incremental ? { revision: remote.revision, exportedAt: sent.exportedAt, changes: changes(remoteData, sent) } : { revision: remote.revision, data: sent };
+        var result = await request(incremental ? 'PATCH' : 'PUT', body, token, id, login);
+        if (!Number.isSafeInteger(result.revision) || result.revision < remote.revision) throw new Error('invalid_cloud');
         if (!active(token, id)) return;
         // Only acknowledge the payload actually sent; edits during PUT remain pending.
         var latest = normal(disk()); cached = await partition(id); cached.base = sent; cached.revision = result.revision; cached.local = latest; cached.pending = signature(latest) !== signature(sent); cached.detachedBase = null;
+        cached.incremental = result.syncProtocol === 2 && result.incremental === true; cached.lastReadAt = Date.now();
         await dbPut(id, cached); backoff = 0; nextAllowedAttempt = 0;
         tell(cached.pending ? 'syncing' : 'saved', cached.pending ? 'Saving your latest changes…' : 'Progress saved to your account.');
         if (cached.pending) schedule(false);
@@ -289,7 +324,7 @@
     })().catch(function (e) {
       lastSyncError = e;
       if (token !== generation || e.message === 'scope_changed' || e.name === 'AbortError') return;
-      if (e.status === 409 && e.message !== 'account_changed') { tell('syncing', 'Combining changes from another device…'); schedule(false); }
+      if (e.status === 409 && e.message !== 'account_changed') { refreshRequired = true; tell('syncing', 'Combining changes from another device…'); schedule(false); }
       else if (e.status === 401 || e.message === 'account_changed' || e.status === 403) { tell('offline', 'Reconnect your account to continue syncing. Your changes are kept on this device.'); setTimeout(function () { if (window.CNRAuth) window.CNRAuth.refresh().catch(function () {}); }, 0); }
       else if (e.status === 413) tell('error', 'This learning collection is too large to sync. Your changes are kept here; download a backup and reduce large playground drafts.');
       else if (e.status === 429) { backoff = Math.min(backoff ? backoff * 2 : 30000, 300000); nextAllowedAttempt = Date.now() + backoff; tell('offline', 'Sync will retry shortly. Your changes are kept on this device.'); schedule(false, backoff); }
@@ -300,7 +335,7 @@
   }
   function schedule(immediate, delay) {
     clearTimeout(timer);
-    var wait = Math.max(delay || 0, immediate ? 0 : 1200, 6000 - (Date.now() - lastAttempt), nextAllowedAttempt - Date.now());
+    var wait = Math.max(delay || 0, immediate ? 0 : efficientSync ? 10000 : 1200, (efficientSync ? 30000 : 6000) - (Date.now() - lastAttempt), nextAllowedAttempt - Date.now());
     timer = setTimeout(function () { timer = null; synchronize(); }, wait);
   }
   window.addEventListener('cnr:learning-updated', captureChange);
@@ -354,10 +389,10 @@
   window.addEventListener('online', function () { if (auth && auth.user) schedule(true); });
   window.addEventListener('focus', function () { if (auth && auth.user) schedule(true); });
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible' && auth && auth.user) schedule(true); });
-  setInterval(function () { if (document.visibilityState === 'visible' && auth && auth.user && mayWrite()) schedule(true); }, 60000);
+  setInterval(function () { if (document.visibilityState === 'visible' && auth && auth.user && mayWrite()) schedule(true); }, REFRESH_INTERVAL);
   document.querySelectorAll('[data-learning-sync-retry]').forEach(function (b) { b.addEventListener('click', function () { if (window.CNRAuth) window.CNRAuth.refresh({ force: true }).then(function (s) { return transition(s); }).catch(function () { tell('offline', 'Account connection unavailable. Your existing browser workspace is preserved.'); }); }); });
   document.querySelectorAll('[data-learning-sync-export]').forEach(function (b) { b.addEventListener('click', function () { try { var data = api.captureSnapshot(true), url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' })), a = document.createElement('a'); a.href = url; a.download = 'learning-recovery.json'; a.click(); setTimeout(function () { URL.revokeObjectURL(url); }, 1000); } catch (_) { tell('error', 'This data needs recovery before it can be exported. Existing device copies have not been replaced.'); } }); });
-  window.CNRLearningSync = Object.freeze({ getStatus: function () { return copy(status); }, commitMutation: commitMutation, commitPlayground: commitPlayground, flush: async function () { await localQueue; if (running) await running; return synchronize(); }, threeWay: threeWay, getOwner: function () { return owner; } });
+  window.CNRLearningSync = Object.freeze({ getStatus: function () { return copy(status); }, commitMutation: commitMutation, commitPlayground: commitPlayground, flush: async function () { await localQueue; if (running) await running; return synchronize(true); }, threeWay: threeWay, getOwner: function () { return owner; } });
   bootPromise.then(function () { if (!authObserved && window.CNRAuth) return window.CNRAuth.ready().then(function (value) { if (!authObserved) return transition(value); }); }).catch(function () {});
   bootPromise.catch(function () { tell('error', 'Device storage is unavailable. Account learning is paused to protect existing data.'); });
 })();

@@ -50,8 +50,21 @@ npx wrangler@4 d1 execute compilenrun-data --remote --command \
 Use wrangler 4: the repo's own wrangler 3 drops the `ratelimits` bindings, and the Worker then fails on every request.
 Logs: `npx wrangler@4 tail compilenrun-worker`.
 
+For the learning-record update, apply `accounts-learning-records-schema.sql` before deploying this Worker (see below).
+
 Test the widget locally against production:
 `HUGO_PARAMS_ASKAI_ENDPOINT=https://www.compilenrun.com/api/ask hugo server`
+
+## Source modules
+
+`src/index.js` dispatches requests to `ai/ask.js`, `ai/quiz.js`, `feedback.js`, and `auth/routes.js`.
+`auth/core.js` owns OAuth/session helpers; authenticated learning requests are delegated to `learning/routes.js`.
+`learning/records.js` handles record conversion and accounting; `learning/snapshot.js` validates backup envelopes.
+Email authentication, password hashing, and mail delivery retain their existing dedicated modules. `accounts.js`
+re-exports the existing public imports for compatibility. Shared body, HTTP, and Turnstile helpers live in `lib/`.
+
+Wrangler bundles these modules for upload, so Cloudflare's code editor can still show one generated script.
+Inspect it without deploying with `npx wrangler@4 deploy --dry-run --outdir /tmp/cnr-worker-bundle`.
 
 ## Accounts and synchronized learning
 
@@ -77,6 +90,7 @@ The flow uses a random state nonce bound to a separate HttpOnly cookie, S256 PKC
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-email-schema.sql
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-google-profile-schema.sql
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-github-schema.sql
+   npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-learning-records-schema.sql
    ```
 
 4. Deploy with Wrangler 4 after validating the migration, secret, and Worker changes. The configuration adds only the auth, learning, and Google callback routes (patterns end in `*`: Cloudflare skips the Worker for a wildcard-less pattern once a query string is present) plus the `AUTH_LIMIT` binding (60 account requests per minute per IP). It preserves existing AI/quiz/feedback routes and bindings.
@@ -91,18 +105,49 @@ Every account response uses `Cache-Control: no-store, private`; redirects also u
 | --- | --- |
 | `GET /api/auth/session` | `{configured, providers: {google,email}, googleConfigured, emailConfigured, user, csrfToken?}`. Signed-in user fields are `id`, `name`, `email`, `emailVerified`, `hasPassword`, and `googleLinked`; `id` is an opaque internal UUID and `name` is at most 100 characters. |
 | `GET /api/auth/google` | Redirects to Google; successful callback redirects to `/learn/`, failures to `/learn/?auth=error`. |
-| `GET /api/learning` | `{revision, data, updatedAt}`; an empty account starts with revision `0`, `data: null`, `updatedAt: null`. |
-| `PUT /api/learning` | Body `{revision, data}`; success `{revision, updatedAt}`. |
+| `GET /api/learning` | `{revision, data, updatedAt, syncProtocol: 2, incremental}`; an empty account starts with revision `0`, `data: null`, `updatedAt: null`. With `X-CNR-Revision` matching the current revision, returns `{revision, updatedAt, unchanged: true, syncProtocol: 2, incremental}` without reading the record collection. |
+| `PUT /api/learning` | Compatible full-backup body `{revision, data}`; converts legacy storage on the first save. Later full saves compare records and write only changes. |
+| `PATCH /api/learning` | After `incremental: true`, body `{revision, exportedAt, changes: [{kind, key, value}]}`; kinds are `read`, `course`, `lesson`, and `draft`. `value: null` deletes a record. Success `{revision, updatedAt, syncProtocol: 2, incremental: true}`. Identical saves keep the revision unchanged. |
 | `POST /api/auth/logout` | `{ok: true}` and expires the session cookie. |
 | `DELETE /api/auth/account` | `{ok: true}`; permanently deletes this account, its snapshot, and every associated session, then expires cookies. Local browser notes and unrelated feedback are untouched. |
 
 All learning requests and logout/deletion require `X-CNR-User` equal to the user ID returned by session discovery. Mutations additionally require `Origin: https://www.compilenrun.com` and `X-CSRF-Token` from the current session response. This prevents a stale tab from reading or writing a different account after an account switch. Authentication and snapshot reads use the D1 primary; SQL mutations recheck the live session so concurrent revocation cannot recreate deleted data.
 
-Snapshots use the existing `cnr-learning-backup` version-1 JSON envelope. The server checks the envelope, bounded depth/entry counts, unsafe keys, and a **1,800,000-byte UTF-8 limit** (below D1's 2 MB row limit). The body is read incrementally with a byte limit; a missing or false Content-Length does not bypass it. Browser import validation still checks individual lesson and draft records before a user explicitly merges them.
+Imports, exports, and full API responses use the existing `cnr-learning-backup` version-1 JSON envelope. The server checks the envelope, bounded depth/entry counts, unsafe keys, and a **1,800,000-byte UTF-8 limit** (below D1's 2 MB row limit). Normalized storage also caps the sum of UTF-8 encoded `[kind,key,value]` records at 1,800,000 bytes; record overhead can make this slightly stricter than the old snapshot limit. The body is read incrementally with a byte limit; a missing or false Content-Length does not bypass it. Browser import validation still checks individual lesson and draft records before a user explicitly merges them.
 
 Writes use an atomic compare-and-swap revision. `409 {error: "revision_conflict", revision}` means another device saved first; clients must retrieve that newer state, merge it against their last acknowledged state, and retry using the current revision. A stale whole-state overwrite is never accepted. `409 {error: "account_changed"}` means the expected identity no longer matches the session. Other errors include `401 authentication_required`, `403 csrf_failed`/`origin_not_allowed`, `400 invalid_snapshot`, `413 snapshot_too_large`, `415 json_required`, `429 rate_limited`, and `503 accounts_not_configured`/`accounts_unavailable`.
 
 The website automatically synchronizes the signed-in learner’s state through these revision-checked endpoints; each browser keeps separate guest and account caches. Account deletion removes application data, not the user's Google account or local browser backup. To revoke the Google app authorization itself, the user can remove it in their Google account's third-party connections settings. Signing in again after application-account deletion creates a new internal account without restoring the deleted snapshot.
+
+### Learning records and free-plan operation
+
+For an existing deployment that already has the account migrations, run only this new migration from the Worker directory:
+
+```sh
+npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-learning-records-schema.sql
+```
+
+This repeatable migration creates two tables and does not scan or backfill existing snapshots:
+
+- `cnr_learning_state`: one revision/accounting row per converted account.
+- `cnr_learning_records`: one row per read mark, course, lesson, or playground draft, keyed by `(user_id, kind, record_key)`. Nested notes and exercise results remain together in their lesson row to avoid writes for every field. `WITHOUT ROWID` primary keys avoid duplicate key indexes; no secondary indexes are added.
+
+Roll out the additive schema first, publish the updated Hugo frontend, then deploy the updated Worker. The frontend understands the old Worker while deployment is in progress; existing open tabs can continue using full PUTs against the new Worker. Publishing the frontend is necessary to enable its reduced polling and PATCH requests.
+
+Until the first successful full save, reads use the old `cnr_account_learning.data_json`. That save atomically inserts the records and new state and clears the legacy JSON. Later saves update the new tables only. Account deletion cascades to both tables. Keep the new schema and record-aware Worker together: an old snapshot-only Worker cannot read converted accounts. For rollback, restore a record-aware Worker version; returning to a snapshot-only version requires reconstructing snapshots from records first.
+
+The browser negotiates the protocol, so it also works while an older Worker is deployed. After conversion, a normal edit sends one PATCH without a preliminary GET. A CAS conflict triggers a fresh read and the existing three-way merge, including preserved conflicting note/draft versions. A unique write nonce gates every SQL statement inside one transactional D1 batch, so a losing writer cannot change records. Session revocation is rechecked inside the batch.
+
+For quota control:
+
+- Saves wait for 10 seconds of inactivity and are spaced at least 30 seconds apart. Local edits remain durable immediately; explicit flushing before account changes bypasses the normal debounce.
+- Fresh device caches suppress repeated reads on focus and page navigation. Visible tabs check for remote changes about every five minutes; unchanged revision checks read no learning records. Web Locks serialize tabs sharing the same device cache.
+- A changed record plus its revision costs two SQLite row mutations; unchanged saves cost zero. Multiple changed records are sent in one request and one batch, but D1 still counts every changed row. Row storage alone does not reduce writes relative to the old single-row snapshot: batching and avoiding unchanged writes provide the savings.
+- PATCH reads use the composite primary key to fetch only affected records. Full downloads and legacy full PUTs necessarily read the user's complete collection. Authentication checks still query the primary database so revocation remains immediate.
+- D1 assembles the JSON for full downloads and the Worker forwards it directly, avoiding a full parse/rebuild/serialization pass in the Worker. Conditional reads skip that aggregation entirely.
+- There are no new cron jobs, queues, KV counters, Workers, paid bindings, or background database migrations. The first conversion writes one row per existing record once; it happens on demand instead of for every account at deployment.
+
+Cloudflare's [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/) lists the free daily allowance as 5 million rows read and 100,000 rows written; [Workers limits](https://developers.cloudflare.com/workers/platform/limits/) list 100,000 requests/day and 10 ms CPU/request. Actual D1 row metrics also include query scans and index work; inspect D1 Metrics rather than treating request/batch counts as usage. Existing AI and email budgets remain configured separately.
 
 References: [Google OpenID Connect](https://developers.google.com/identity/openid-connect/openid-connect), [Google discovery endpoints and PKCE methods](https://accounts.google.com/.well-known/openid-configuration), [D1 primary/session behavior](https://developers.cloudflare.com/d1/worker-api/d1-database/), and [D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
 
