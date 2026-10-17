@@ -140,7 +140,7 @@ test('mobile popup and account menu fit 320px and native dialog keeps keyboard f
 
 test('auth-changing waits before login and a delayed old session response cannot replace the new identity',async t=>{
  const account=state();const{page}=await setup(t,account,()=>{window.addEventListener('cnr:auth-changing',event=>{if(event.detail.action==='login')event.detail.waitUntil(new Promise(resolve=>{window.finishBeforeLogin=resolve;}));});});
- await open(page);
+ await open(page);await page.evaluate(()=>CNRAuth.refresh({force:false})); // the popup's own provider check must finish before the held one starts, or refresh() would just join it
  let releaseOld,oldStarted;const started=new Promise(resolve=>{oldStarted=resolve;});account.holdSession=()=>{oldStarted();return new Promise(resolve=>{releaseOld=resolve;});};
  await page.evaluate(()=>{window.oldCheck=CNRAuth.refresh().catch(error=>({code:error.code}));});await started;
  await login(page);await page.waitForFunction(()=>typeof finishBeforeLogin==='function');
