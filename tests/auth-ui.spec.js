@@ -291,6 +291,7 @@ test('guests are invited to sign in after a second page, once, and snoozed after
  await page.locator('[data-auth-dialog]').waitFor({state:'visible'});
  assert.match(await page.locator('[data-auth-message]').innerText(),/free account/);
  await page.keyboard.press('Escape');assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false);
+ await page.waitForFunction(()=>localStorage.getItem('cnr-auth-invite')!==null); // the close event is dispatched asynchronously
  const snooze=await page.evaluate(()=>JSON.parse(localStorage.getItem('cnr-auth-invite')));assert.equal(snooze.dismissed,1);assert.ok(snooze.until>Date.now()+13*86400000);
  await page.goto(page.url().replace('/next/','/third/'));await page.evaluate(()=>CNRAuth.ready());await page.waitForTimeout(600);
  assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false,'snoozed after a dismissal');
