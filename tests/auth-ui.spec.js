@@ -20,6 +20,7 @@ async function setup(t,account=state(),init,pagePath='/'){
  const context=await browser.newContext();t.after(()=>context.close());
  await context.addInitScript(()=>{window.authChanges=[];window.authChanging=[];window.addEventListener('cnr:auth-changed',event=>authChanges.push({session:event.detail.session,reason:event.detail.reason,previousUserId:event.detail.previousUserId}));window.addEventListener('cnr:auth-changing',event=>authChanging.push(event.detail.action));});
  if(init)await context.addInitScript(init);
+ if(account.user)await context.addInitScript(()=>{document.cookie='cnr_signed_in=1; Path=/';}); // the Worker sets this hint beside the session cookie
  await context.route('**/api/**',async route=>{
   const request=route.request(),url=new URL(request.url()),body=request.postData()?JSON.parse(request.postData()):null;
   account.calls.push({path:url.pathname,method:request.method(),headers:request.headers(),body});
@@ -58,7 +59,7 @@ async function open(page){await page.locator('[data-auth-open]').click();await p
 async function login(page){const form=page.locator('[data-auth-form="login"]');await form.locator('[name="email"]').fill('alex@example.invalid');await form.locator('[name="password"]').fill('a secure sample passphrase');await form.getByRole('button',{name:'Sign in',exact:true}).click();}
 
 test('one shared discovery, native dialog focus, provider switches, and safe form methods',async t=>{
- const{page,account,errors}=await setup(t);assert.equal(account.calls.length,1);
+ const{page,account,errors}=await setup(t);assert.equal(account.calls.length,0); // a guest page makes no session request
  await Promise.all([page.evaluate(()=>CNRAuth.ready()),page.evaluate(()=>CNRAuth.refresh({force:false}))]);assert.equal(account.calls.length,1);
  await open(page);assert.equal(account.calls.length,1);assert.equal(await page.locator('[data-auth-google]').getAttribute('href'),'/api/auth/google');assert.equal(await page.locator('[data-auth-github]').getAttribute('href'),'/api/auth/github');assert.equal(await page.locator('[data-auth-github]').isVisible(),true);
  for(const form of await page.locator('[data-auth-form]').all())assert.equal(await form.getAttribute('method'),'post');
@@ -188,6 +189,7 @@ test('Google navigation waits for the same outgoing-learning gate',async t=>{
 
 test('unconfigured providers offer a retry without exposing nonfunctional forms',async t=>{
  const account=state();account.configured=false;const{page}=await setup(t,account);await open(page);
+ await page.locator('[data-auth-retry]').waitFor({state:'visible'}); // the popup asks the server when it opens
  assert.equal(await page.locator('[data-auth-google]').isVisible(),false);assert.equal(await page.locator('[data-auth-email]').isVisible(),false);assert.equal(await page.locator('[data-auth-retry]').isVisible(),true);
  account.configured=true;await page.locator('[data-auth-retry]').click();await page.locator('[data-auth-email]').waitFor({state:'visible'});
  assert.equal(await page.evaluate(()=>CNRAuth.getSession().configured),true);

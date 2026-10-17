@@ -154,3 +154,14 @@ References: [OWASP password storage](https://cheatsheetseries.owasp.org/cheatshe
 Observability (invocation logs, traces, full sampling, persisted) is enabled and mirrors the dashboard settings in `wrangler.jsonc`. Invocation logs include query strings, so the OAuth callback's short-lived `state`/`code` parameters appear in logs: codes are single-use and exchanged immediately, but treat log access as sensitive. Explicit operational warnings omit recipients, passwords, tokens, and provider responses.
 
 Provider requests use `redirect: "manual"` and reject redirects through explicit status checks. The deployed Workers runtime rejects `redirect: "error"`; do not replace manual handling with redirect following, which could forward provider credentials.
+
+## Session checks and the signed-in hint cookie
+
+`/api/auth/session` is only called by pages that may have a session: the Worker sets a readable `cnr_signed_in=1`
+cookie (no secret, same lifetime) next to the HttpOnly `__Host-cnr_session` cookie on login and clears both on
+logout, account deletion, or when a session check finds the session invalid. Guests never call the endpoint on page
+load; the sign-in popup asks when it opens and remembers the configured providers in `localStorage`. This keeps the
+request count on the free plan proportional to signed-in traffic, not page views.
+
+Observability is sampled at 10% of requests (logs only, no traces) in `wrangler.jsonc`: the free plan allows
+200,000 events a day and an unsampled day produced about two events per request.

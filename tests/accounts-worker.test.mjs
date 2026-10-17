@@ -494,3 +494,18 @@ test('linking GitHub to a Google account makes Google unlinkable; the last sign-
   const taken = await callbackGithub(await beginGithub(existing.cookie, authHeaders(existing)), existing.cookie);
   assert.equal(taken.headers.get('location'), SITE + '/profile/?auth=error', 'a GitHub identity already attached to another account cannot be moved');
 });
+
+test('a readable signed-in hint cookie accompanies the session cookie, is cleared on logout, and a stale hint is cleared by the session check', async () => {
+  const alice = await login('alice');
+  const hint = alice.response.headers.getSetCookie().find(value => value.startsWith('cnr_signed_in='));
+  assert.match(hint, /^cnr_signed_in=1; Path=\/; Max-Age=2592000; Secure; SameSite=Lax$/);
+  assert.doesNotMatch(hint, /HttpOnly/); // readable by the page: its presence is the only information it carries
+  const logout = await handleAccounts(request('/api/auth/logout', { method: 'POST', cookie: alice.cookie, headers: authHeaders(alice) }), env);
+  assert.match(logout.headers.getSetCookie().find(value => value.startsWith('cnr_signed_in=')), /^cnr_signed_in=; Path=\/; Max-Age=0/);
+  const stale = await handleAccounts(request('/api/auth/session', { cookie: alice.cookie + '; cnr_signed_in=1' }), env);
+  assert.equal((await stale.json()).user, null);
+  assert.match(stale.headers.getSetCookie().find(value => value.startsWith('cnr_signed_in=')), /Max-Age=0/);
+  assert.match(stale.headers.getSetCookie().find(value => value.startsWith('__Host-cnr_session=')), /Max-Age=0/);
+  const guest = await handleAccounts(request('/api/auth/session'), env);
+  assert.equal(guest.headers.getSetCookie().length, 0); // a plain guest check sets nothing
+});

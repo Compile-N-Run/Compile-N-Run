@@ -61,6 +61,20 @@ const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/acco
 const encoder = new TextEncoder();
 const now = () => Math.floor(Date.now() / 1000);
 
+// A readable "signed in" hint next to the HttpOnly session cookie, so pages only ask /api/auth/session when a
+// session may exist (guests skip the request entirely). It carries no secret: only the presence matters.
+const HINT_COOKIE = 'cnr_signed_in';
+function withHint(cookies) {
+  const out = [];
+  for (const value of cookies) {
+    out.push(value);
+    if (!value.startsWith(`${SESSION_COOKIE}=`)) continue;
+    out.push(value.includes('Max-Age=0') ? `${HINT_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Lax`
+      : `${HINT_COOKIE}=1; Path=/; Max-Age=${SESSION_SECONDS}; Secure; SameSite=Lax`);
+  }
+  return out;
+}
+
 function response(status, body, cookies = []) {
   const headers = new Headers({
     'content-type': 'application/json; charset=utf-8',
@@ -69,7 +83,7 @@ function response(status, body, cookies = []) {
     'referrer-policy': 'no-referrer',
     'cross-origin-resource-policy': 'same-origin',
   });
-  for (const value of cookies) headers.append('set-cookie', value);
+  for (const value of withHint(cookies)) headers.append('set-cookie', value);
   return new Response(JSON.stringify(body), { status, headers });
 }
 
@@ -79,7 +93,7 @@ function cookie(name, value, seconds) {
 
 function redirect(target, cookies = []) {
   const headers = new Headers({ location: target, 'cache-control': 'no-store, private', 'referrer-policy': 'no-referrer' });
-  for (const value of cookies) headers.append('set-cookie', value);
+  for (const value of withHint(cookies)) headers.append('set-cookie', value);
   return new Response(null, { status: 303, headers });
 }
 
@@ -376,7 +390,8 @@ export async function handleAccounts(request, env, ctx) {
     const login = await session(request, env.DB);
     if (url.pathname === '/api/auth/session') return response(200, { configured: true,
       providers: providerFlags(env), googleConfigured: googleConfigured(env), emailConfigured: emailConfigured(env),
-      user: login?.user || null, ...(login ? { csrfToken: login.csrfToken } : {}) });
+      user: login?.user || null, ...(login ? { csrfToken: login.csrfToken } : {}) },
+    !login && /(?:^|;\s*)(?:__Host-cnr_session|cnr_signed_in)=/.test(request.headers.get('cookie') || '') ? [cookie(SESSION_COOKIE, '', 0)] : []);
     if (!login) return response(401, { error: 'authentication_required' });
     if (request.headers.get('X-CNR-User') !== login.user.id) return response(409, { error: 'account_changed' });
     if (request.method !== 'GET' && (origin !== ACCOUNT_SITE || !sameToken(request.headers.get('X-CSRF-Token'), login.csrfToken))) {

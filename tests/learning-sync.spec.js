@@ -32,6 +32,7 @@ async function device(t,shared,options={}){
  const context=await browser.newContext();t.after(()=>context.close());
  const model={id:options.id===undefined?'alice':options.id,offline:false,status:0,sessionDelay:options.sessionDelay||0,requests:[],putHook:null};
  const initial=options.local||blank();
+ if(model.id)await context.addInitScript(()=>{document.cookie='cnr_signed_in=1; Path=/';}); // the Worker sets this hint beside the session cookie; without it pages assume a guest
  await context.addInitScript(({initial,owner})=>{if(!localStorage.getItem('__seed__')){localStorage.setItem('__seed__','1');for(const [k,v]of Object.entries({cnr_progress:initial.progress,cnr_learning_v1:initial.learning,cnr_playground_v1:initial.playground}))localStorage.setItem(k,JSON.stringify(v));if(owner)localStorage.setItem('cnr_learning_owner_v1',JSON.stringify({v:1,owner}));}}, {initial,owner:options.owner});
  await context.route('**/api/**',async route=>{
   const req=route.request(),p=new URL(req.url()).pathname,method=req.method(),body=req.postData()?req.postDataJSON():null;model.requests.push({p,method,body,headers:req.headers()});

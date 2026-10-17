@@ -14,10 +14,20 @@
   const forms = dialog ? Array.from(dialog.querySelectorAll('[data-auth-form]')) : [];
   const titles = { login: 'Sign in', register: 'Create an account', forgot: 'Reset your password', resend: 'Verify your email' };
   let current = null, known = false, published = false, transitionFailed = false, actionPending = false, capabilities = { google: false, github: false, email: false };
-  let inFlight = null, refreshController = null, initial = null, mutation = null;
+  let inFlight = null, refreshController = null, initial = null, mutation = null, answered = false; // answered: a real server answer was validated
   let lastAttempt = 0, requestEpoch = 0, stateEpoch = 0, transition = Promise.resolve(), transitioning = false;
   let syncNotice = '', busy = false, mode = 'login', returnFocus = null, focusAvatarOnClose = false;
   const clone = value => value === null ? null : JSON.parse(JSON.stringify(value));
+  // The Worker sets a readable cnr_signed_in=1 cookie next to the HttpOnly session cookie. Without it the page
+  // is a guest and never asks /api/auth/session (one request per page view otherwise); the sign-in options are
+  // remembered from the last real answer so the popup can render before it asks.
+  const HINT='cnr_signed_in', PROVIDERS_KEY='cnr-auth-providers';
+  const hinted=()=>new RegExp('(?:^|;\\s*)'+HINT+'=1(?:;|$)').test(document.cookie);
+  function setHint(on){try{document.cookie=HINT+'='+(on?'1':'')+'; Path=/; Max-Age='+(on?2592000:0)+'; SameSite=Lax'+(location.protocol==='https:'?'; Secure':'');}catch(_){}}
+  function rememberProviders(p){try{localStorage.setItem(PROVIDERS_KEY,JSON.stringify({google:p.google===true,github:p.github===true,email:p.email===true}));}catch(_){}}
+  function guestSession(){let p=null;try{p=JSON.parse(localStorage.getItem(PROVIDERS_KEY));}catch(_){p=null;}
+    return {configured:true,providers:p&&typeof p==='object'?{google:p.google===true,github:p.github===true,email:p.email===true}:{google:true,github:true,email:true},user:null};}
+  const mustCheck=()=>hinted()||/^\/profile\//.test(location.pathname)||/[?&#]auth=/.test(location.search+location.hash);
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const plain = (value, max, empty = false) => typeof value === 'string' && (empty || value.length > 0) && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
   function fault(code, text) { const error = new Error(text); error.code = code; return error; }
@@ -87,9 +97,16 @@
   }
   async function accept(next, reason) {
     if(published&&!actionPending&&!transitionFailed&&JSON.stringify(current)===JSON.stringify(next)){await transition;return clone(current);}
+    // Guest before and after: only the sign-in options changed (the guess made without a request versus the
+    // server's answer). Ownership is unchanged, so update the popup without a learning transition.
+    if(published&&!actionPending&&!transitionFailed&&next&&current&&current.user===null&&next.user===null&&current.configured===next.configured){
+      await transition;current=next;known=true;capabilities={...next.providers};if(next.configured)rememberProviders(next.providers);setHint(false);render();
+      if(dialog?.open&&!busy&&message?.textContent==='Checking sign-in options…')say('');
+      return clone(current);
+    }
     const previousUserId=current?.user?.id||null;
     current=next;published=true;actionPending=false;
-    if(next){known=true;capabilities={...next.providers};}
+    if(next){known=true;capabilities={...next.providers};if(reason!=='initial'||mustCheck()){setHint(!!next.user);if(next.configured)rememberProviders(next.providers);}}
     clearPasswords();
     const epoch=++stateEpoch, waits=[];
     transitioning=true;
@@ -170,6 +187,7 @@
       try{
         const value=validate(await request('/api/auth/session','GET',undefined,undefined,controller.signal));
         if(epoch!==requestEpoch)throw fault('superseded','A newer account action replaced this connection check.');
+        answered=true;
         return await accept(value,reason);
       }catch(error){
         if(epoch!==requestEpoch)throw fault('superseded','A newer account action replaced this connection check.');
@@ -308,7 +326,8 @@
       session.set('shown','1');invited=true;
       openDialog('login',document.activeElement);say(text);
     }
-    function later(ms,text){clearTimeout(timer);timer=setTimeout(()=>{if(document.visibilityState!=='visible'){document.addEventListener('visibilitychange',()=>later(1500,text),{once:true});return;}initial.then(()=>show(text)).catch(()=>{});},ms);}
+    function later(ms,text){clearTimeout(timer);timer=setTimeout(()=>{if(document.visibilityState!=='visible'){document.addEventListener('visibilitychange',()=>later(1500,text),{once:true});return;}
+      initial.then(()=>eligible()&&!answered?fetchSession({force:true,reason:'invite'}):null).then(()=>show(text)).catch(()=>{});},ms);}
     if(pages>=2)later(delay,'Create a free account to keep your progress, bookmarks and solved problems on every device. You can keep learning without one.');
     window.addEventListener('cnr:learning-updated',event=>{if(event.detail?.persistent&&!current?.user)later(1500,'Saved on this device. Sign in to keep your progress on every device, or close this to keep going as a guest.');});
     dialog.addEventListener('close',()=>{
@@ -320,13 +339,14 @@
   })();
   window.addEventListener('cnr:auth-changing',()=>{actionPending=true;invalidateRefresh();});
   window.addEventListener('cnr:sync-status',event=>{if(typeof event.detail?.message==='string'){syncNotice=event.detail.message.slice(0,400);if(menuStatus&&!busy&&!transitionFailed)menuStatus.textContent=syncNotice;}});
-  function checkCurrentSession(){if(document.visibilityState==='visible'&&!mutation&&!actionPending)refresh({force:false}).catch(()=>{});}
+  function checkCurrentSession(){if(document.visibilityState==='visible'&&!mutation&&!actionPending&&(hinted()||current?.user))refresh({force:false}).catch(()=>{});}
   window.addEventListener('focus',checkCurrentSession);
-  window.addEventListener('online',()=>{if(document.visibilityState==='visible'&&!mutation&&!actionPending)refresh({force:current===null}).catch(()=>{});});
+  window.addEventListener('online',()=>{if(document.visibilityState==='visible'&&!mutation&&!actionPending&&(hinted()||current?.user||current===null))refresh({force:current===null}).catch(()=>{});});
   document.addEventListener('visibilitychange',checkCurrentSession);
   window.addEventListener('pageshow',event=>{if(event.persisted){busy=false;actionPending=true;invalidateRefresh();closeMenu();if(dialog?.open)say('Checking sign-in options…');render();refresh({force:true,reason:'return'}).catch(()=>{});}});
   // No interval, localStorage token, or per-keystroke request. One deduplicated
   // initial discovery; focus/visibility checks are throttled for 30 seconds.
   // A recovered network immediately retries an unknown/failed session check.
-  initial=Promise.resolve().then(()=>fetchSession({force:true,reason:'initial'})).catch(()=>clone(current));
+  // Guests (no hint cookie) start from a synthetic guest session and only ask the server when the popup opens.
+  initial=Promise.resolve().then(()=>mustCheck()?fetchSession({force:true,reason:'initial'}):accept(guestSession(),'initial')).catch(()=>clone(current));
 })();
