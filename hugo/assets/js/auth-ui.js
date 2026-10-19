@@ -28,6 +28,13 @@
   function guestSession(){let p=null;try{p=JSON.parse(localStorage.getItem(PROVIDERS_KEY));}catch(_){p=null;}
     return {configured:true,providers:p&&typeof p==='object'?{google:p.google===true,github:p.github===true,email:p.email===true}:{google:true,github:true,email:true},user:null};}
   const mustCheck=()=>hinted()||/^\/profile\//.test(location.pathname)||/[?&#]auth=/.test(location.search+location.hash);
+  // Sign-in invitations (the popup and Google One Tap) share one snooze record.
+  const INVITE_KEY='cnr-auth-invite',DAY=86400000;
+  const inviteStore={get(){try{return JSON.parse(localStorage.getItem(INVITE_KEY))||{};}catch(_){return{};}},set(v){try{localStorage.setItem(INVITE_KEY,JSON.stringify(v));}catch(_){}}};
+  const inviteSnoozed=()=>inviteStore.get().until>Date.now();
+  function snoozeInvite(){const state=inviteStore.get(),dismissed=(state.dismissed||0)+1;inviteStore.set({dismissed,until:Date.now()+(dismissed>=3?90:14)*DAY});}
+  const quietPage=()=>/^\/(profile|auth|reset-password|verify-email)\//.test(location.pathname)||location.pathname==='/';
+  let oneTapDisplayed=false;
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const plain = (value, max, empty = false) => typeof value === 'string' && (empty || value.length > 0) && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
   function fault(code, text) { const error = new Error(text); error.code = code; return error; }
@@ -80,7 +87,7 @@
     }
     if(!dialog)return;
     dialog.setAttribute('aria-busy',String(busy||transitioning));
-    dialog.querySelector('[data-auth-google]').hidden=!capabilities.google||(Boolean(user)&&transitionFailed);
+    dialog.querySelector('[data-auth-google]').hidden=!capabilities.google||(Boolean(user)&&transitionFailed)||gsiButton;
     dialog.querySelector('[data-auth-google]').setAttribute('aria-disabled',String(busy||transitioning||transitionFailed));
     dialog.querySelector('[data-auth-github]').hidden=!capabilities.github||(Boolean(user)&&transitionFailed);
     dialog.querySelector('[data-auth-github]').setAttribute('aria-disabled',String(busy||transitioning||transitionFailed));
@@ -313,14 +320,13 @@
   // pages (or right after they save something as a guest that an account would keep across devices), never on
   // the home, profile or auth pages, and snoozed for two weeks after a dismissal (three months after the third).
   (function invite(){
-    if(!dialog||!widget||/^\/(profile|auth|reset-password|verify-email)\//.test(location.pathname)||location.pathname==='/')return;
-    const KEY='cnr-auth-invite',DAY=86400000;
-    const local={get(){try{return JSON.parse(localStorage.getItem(KEY))||{};}catch(_){return{};}},set(v){try{localStorage.setItem(KEY,JSON.stringify(v));}catch(_){}}};
+    if(!dialog||!widget||quietPage())return;
+    const KEY=INVITE_KEY;
     const session={get(k){try{return sessionStorage.getItem(KEY+':'+k);}catch(_){return null;}},set(k,v){try{sessionStorage.setItem(KEY+':'+k,v);}catch(_){}}};
     const pages=Number(session.get('pages')||0)+1;session.set('pages',String(pages));
     const delay=typeof window.CNR_INVITE_DELAY_MS==='number'?window.CNR_INVITE_DELAY_MS:25000;
     let invited=false,timer=null;
-    const eligible=()=>!session.get('shown')&&!(local.get().until>Date.now())&&known&&!current?.user&&!transitionFailed&&!busy&&!dialog.open&&document.visibilityState==='visible'&&(capabilities.google||capabilities.github||capabilities.email);
+    const eligible=()=>!session.get('shown')&&!inviteSnoozed()&&!oneTapDisplayed&&known&&!current?.user&&!transitionFailed&&!busy&&!dialog.open&&document.visibilityState==='visible'&&(capabilities.google||capabilities.github||capabilities.email);
     function show(text){
       if(!eligible())return;
       session.set('shown','1');invited=true;
@@ -333,10 +339,82 @@
     dialog.addEventListener('close',()=>{
       if(!invited)return;invited=false;
       if(current?.user)return;
-      const state=local.get(),dismissed=(state.dismissed||0)+1;
-      local.set({dismissed,until:Date.now()+(dismissed>=3?90:14)*DAY});
+      snoozeInvite();
     });
   })();
+
+  // Google Identity Services: One Tap for guests, automatic sign-in for readers who signed in with Google here
+  // before, and Google's own button (personalized when the browser has a matching session) in the popup. All
+  // three hand the page a signed credential that the Worker verifies at /api/auth/google/credential.
+  const GSI_CLIENT_ID=document.querySelector('meta[name="cnr-google-client-id"]')?.content||'';
+  let gsiPromise=null,gsiNonce=null,gsiInitialized=false,gsiPrompted=false,gsiBusy=false,gsiButton=false;
+  function gsiLoad(){
+    if(gsiPromise)return gsiPromise;
+    gsiPromise=new Promise((resolve,reject)=>{
+      if(window.google?.accounts?.id)return resolve(window.google.accounts.id);
+      const script=document.createElement('script');script.src='https://accounts.google.com/gsi/client';script.async=true;script.defer=true;
+      script.onload=()=>window.google?.accounts?.id?resolve(window.google.accounts.id):reject(fault('gsi_unavailable','Google sign-in did not load.'));
+      script.onerror=()=>reject(fault('gsi_unavailable','Google sign-in did not load.'));
+      document.head.appendChild(script);
+    }).catch(error=>{gsiPromise=null;throw error;});
+    return gsiPromise;
+  }
+  function gsiNonceValue(){if(!gsiNonce){const bytes=crypto.getRandomValues(new Uint8Array(32));gsiNonce=btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}return gsiNonce;}
+  async function gsiInit(){
+    const id=await gsiLoad();
+    if(!gsiInitialized){
+      id.initialize({client_id:GSI_CLIENT_ID,callback:gsiCredential,nonce:gsiNonceValue(),auto_select:true,cancel_on_tap_outside:true,itp_support:true,use_fedcm_for_prompt:true,context:'signin'});
+      gsiInitialized=true;
+    }
+    return id;
+  }
+  async function gsiCredential(credentialResponse){
+    if(gsiBusy||busy||transitioning||transitionFailed||!object(credentialResponse)||typeof credentialResponse.credential!=='string')return;
+    gsiBusy=true;busy=true;clearPasswords();render();if(dialog?.open)say('Signing in with Google…');
+    try{
+      invalidateRefresh();
+      await beforeAction('google');
+      const result=await request('/api/auth/google/credential','POST',{credential:credentialResponse.credential,nonce:gsiNonceValue()});
+      if(!object(result)||result.ok!==true)throw fault('invalid_response','Google sign-in could not be verified. Please try again.');
+      const next=await fetchSession({force:true,reason:'login'});
+      if(!next?.user)throw fault('authentication_required','Sign-in could not be confirmed. Please try again.');
+      if(dialog?.open)closeDialog(true);
+    }catch(error){
+      if(dialog?.open)say(error.message,true);
+      if(error.code==='learning_transition_failed'){transitionFailed=true;render();if(dialog)dialog.querySelector('[data-auth-retry]').hidden=false;}
+      else{try{await fetchSession({force:true,reason:'login-failed'});}catch(_){}}
+    }finally{busy=false;gsiBusy=false;render();}
+  }
+  const gsiEligible=()=>!!GSI_CLIENT_ID&&!!dialog&&!current?.user&&!hinted()&&!quietPage()&&capabilities.google&&!inviteSnoozed()&&!transitionFailed&&document.visibilityState==='visible';
+  function gsiPrompt(){
+    if(gsiPrompted||!gsiEligible())return;
+    gsiPrompted=true;
+    gsiInit().then(id=>id.prompt(notification=>{
+      try{
+        if(notification?.isDismissedMoment?.()){const reason=notification.getDismissedReason?.();if(reason&&reason!=='credential_returned')snoozeInvite();}
+        else oneTapDisplayed=true; // shown (or decided by the browser); the popup invitation stays quiet this visit
+      }catch(_){}
+    })).catch(()=>{gsiPrompted=false;});
+  }
+  // Google renders its own button in the popup; the plain link stays as the fallback when the script is unavailable.
+  function gsiRenderButton(){
+    const box=dialog?.querySelector('[data-auth-google-gsi]');
+    if(!box||gsiButton||!GSI_CLIENT_ID||!capabilities.google||current?.user)return;
+    gsiInit().then(id=>{
+      if(gsiButton||!dialog.open)return;
+      box.hidden=false;
+      id.renderButton(box,{type:'standard',theme:'outline',size:'large',text:'continue_with',shape:'pill',logo_alignment:'left',width:Math.min(400,Math.max(200,Math.round(box.clientWidth||320)))});
+      gsiButton=!!box.childElementCount;
+      if(!gsiButton)box.hidden=true;
+      render();
+    }).catch(()=>{});
+  }
+  function gsiSignedOut(){gsiLoad().then(id=>{try{id.disableAutoSelect();}catch(_){}}).catch(()=>{});}
+  if(GSI_CLIENT_ID&&dialog){
+    dialog.addEventListener('toggle',()=>{if(dialog.open)gsiRenderButton();});
+    queueMicrotask(()=>initial?.then(()=>{setTimeout(gsiPrompt,typeof window.CNR_ONE_TAP_DELAY_MS==='number'?window.CNR_ONE_TAP_DELAY_MS:2000);})); // initial is created at the end of this module
+    window.addEventListener('cnr:auth-changed',event=>{if(event.detail?.reason==='logout')gsiSignedOut();});
+  }
   window.addEventListener('cnr:auth-changing',()=>{actionPending=true;invalidateRefresh();});
   window.addEventListener('cnr:sync-status',event=>{if(typeof event.detail?.message==='string'){syncNotice=event.detail.message.slice(0,400);if(menuStatus&&!busy&&!transitionFailed)menuStatus.textContent=syncNotice;}});
   function checkCurrentSession(){if(document.visibilityState==='visible'&&!mutation&&!actionPending&&(hinted()||current?.user))refresh({force:false}).catch(()=>{});}

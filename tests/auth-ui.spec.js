@@ -11,16 +11,24 @@ let browser,server,origin;
 before(async()=>{
  server=http.createServer((req,res)=>{
   if(['/auth-ui.js','/auth-ui.css','/learning.js','/learning-sync.js'].includes(req.url)){const ext=req.url.endsWith('.js')?'js':'css';res.setHeader('Content-Type',ext==='js'?'text/javascript':'text/css');res.end(fs.readFileSync(path.join(root,'hugo/assets',ext,req.url.slice(1))));return;}
-  res.setHeader('Content-Type','text/html');res.end(`<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auth UI test</title><style>*{box-sizing:border-box}body{margin:0;font:16px/1.5 system-ui}:root{--ifm-font-family-base:system-ui;--ifm-color-primary:#176647;--ifm-background-color:white;--ifm-background-surface-color:white;--ifm-font-color-base:#20313e;--ifm-navbar-background-color:white;--ifm-color-emphasis-100:#f4f6f8;--ifm-color-emphasis-200:#dce2e8;--ifm-color-emphasis-300:#adb9c5;--ifm-color-emphasis-700:#52606d}header{display:flex;align-items:center;justify-content:space-between;padding:12px;gap:12px}main{padding:2rem}</style><link rel="stylesheet" href="/auth-ui.css"></head><body><header><a href="/">Compile N Run</a>${partial}</header><main><h1>Keep learning</h1><button id="outside">Outside control</button></main>${req.url.startsWith('/integrated')?'<script>window.CNR_SYNC_ENABLED=true;window.CNR_PAGE={};</script><script src="/learning.js" defer></script><script src="/learning-sync.js" defer></script>':''}<script src="/auth-ui.js" defer></script></body></html>`);
+  res.setHeader('Content-Type','text/html');res.end(`<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auth UI test</title><meta name="cnr-google-client-id" content="test-client.apps.googleusercontent.com"><style>*{box-sizing:border-box}body{margin:0;font:16px/1.5 system-ui}:root{--ifm-font-family-base:system-ui;--ifm-color-primary:#176647;--ifm-background-color:white;--ifm-background-surface-color:white;--ifm-font-color-base:#20313e;--ifm-navbar-background-color:white;--ifm-color-emphasis-100:#f4f6f8;--ifm-color-emphasis-200:#dce2e8;--ifm-color-emphasis-300:#adb9c5;--ifm-color-emphasis-700:#52606d}header{display:flex;align-items:center;justify-content:space-between;padding:12px;gap:12px}main{padding:2rem}</style><link rel="stylesheet" href="/auth-ui.css"></head><body><header><a href="/">Compile N Run</a>${partial}</header><main><h1>Keep learning</h1><button id="outside">Outside control</button></main>${req.url.startsWith('/integrated')?'<script>window.CNR_SYNC_ENABLED=true;window.CNR_PAGE={};</script><script src="/learning.js" defer></script><script src="/learning-sync.js" defer></script>':''}<script src="/auth-ui.js" defer></script></body></html>`);
  });
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));origin='http://127.0.0.1:'+server.address().port;browser=await chromium.launch({headless:true});
 });
 after(async()=>{await browser.close();await new Promise(resolve=>server.close(resolve));});
+const FAKE_GSI=`window.__gsi={initialize:[],prompts:0,buttons:0,disabled:0};
+window.google={accounts:{id:{
+  initialize(config){window.__gsi.config=config;window.__gsi.initialize.push(config);},
+  prompt(cb){window.__gsi.prompts++;window.__gsi.promptCallback=cb;if(window.__gsiNotification&&cb)cb(window.__gsiNotification);},
+  renderButton(el,opts){if(window.__gsiNoButton)return;window.__gsi.buttons++;window.__gsi.buttonOptions=opts;const b=document.createElement('div');b.className='fake-gsi-button';b.textContent='Continue with Google';el.appendChild(b);},
+  disableAutoSelect(){window.__gsi.disabled++;},
+}}};`;
 async function setup(t,account=state(),init,pagePath='/'){
  const context=await browser.newContext();t.after(()=>context.close());
  await context.addInitScript(()=>{window.authChanges=[];window.authChanging=[];window.addEventListener('cnr:auth-changed',event=>authChanges.push({session:event.detail.session,reason:event.detail.reason,previousUserId:event.detail.previousUserId}));window.addEventListener('cnr:auth-changing',event=>authChanging.push(event.detail.action));});
  if(init)await context.addInitScript(init);
  if(account.user)await context.addInitScript(()=>{document.cookie='cnr_signed_in=1; Path=/';}); // the Worker sets this hint beside the session cookie
+ await context.route('https://accounts.google.com/**',route=>route.fulfill({contentType:'text/javascript',body:FAKE_GSI}));
  await context.route('**/api/**',async route=>{
   const request=route.request(),url=new URL(request.url()),body=request.postData()?JSON.parse(request.postData()):null;
   account.calls.push({path:url.pathname,method:request.method(),headers:request.headers(),body});
@@ -44,6 +52,11 @@ async function setup(t,account=state(),init,pagePath='/'){
   if(url.pathname==='/api/auth/login'){
    if(account.loginError)return reply({error:'invalid_credentials'},401);
    account.user=user();account.csrfToken='csrf-new';return reply({ok:true});
+  }
+  if(url.pathname==='/api/auth/google/credential'){
+   if(account.credentialError)return reply({error:'invalid_credential'},401);
+   if(!/^[A-Za-z0-9_-]{43}$/.test(body?.nonce||'')||typeof body?.credential!=='string')return reply({error:'invalid_request'},400);
+   account.user=user();account.csrfToken='csrf-google';return reply({ok:true});
   }
   if(url.pathname==='/api/auth/logout'){
    if(request.headers()['x-cnr-user']!==account.user?.id)return reply({error:'account_changed'},409);
@@ -180,7 +193,7 @@ test('actual auth and learning-sync modules keep account A protected when a quot
 
 
 test('Google navigation waits for the same outgoing-learning gate',async t=>{
- const{page,account}=await setup(t,state(),()=>{window.addEventListener('cnr:auth-changing',event=>{if(event.detail.action==='google')event.detail.waitUntil(new Promise(resolve=>{window.finishGoogleGate=resolve;}));});});
+ const{page,account}=await setup(t,state(),()=>{window.__gsiNoButton=true;window.addEventListener('cnr:auth-changing',event=>{if(event.detail.action==='google')event.detail.waitUntil(new Promise(resolve=>{window.finishGoogleGate=resolve;}));});}); // the plain OAuth link stays when Google draws no button
  await open(page);await page.locator('[data-auth-google]').click();await page.waitForFunction(()=>typeof finishGoogleGate==='function');
  assert.equal(account.calls.some(call=>call.path==='/api/auth/google'),false);assert.equal(new URL(page.url()).pathname,'/');
  await page.evaluate(()=>finishGoogleGate());await page.waitForURL('**/api/auth/google');
@@ -313,4 +326,48 @@ test('a guest who saves progress is invited right away; signed-in and unconfigur
  const off=state();off.configured=false;off.providers={google:false,github:false,email:false};const third=await setup(t,off,()=>{window.CNR_INVITE_DELAY_MS=100;},'/docs/python/intro/');
  await third.page.goto(third.page.url().replace('/intro/','/next/'));await third.page.evaluate(()=>CNRAuth.ready());await third.page.waitForTimeout(500);
  assert.equal(await third.page.locator('[data-auth-dialog]').isVisible(),false,'nothing to invite to when sign-in is unavailable');
+});
+
+test('Google One Tap prompts guests, signs them in through the credential endpoint, and a dismissal snoozes invitations',async t=>{
+ const{page,account,errors}=await setup(t,state(),()=>{window.CNR_ONE_TAP_DELAY_MS=50;},'/docs/python/intro/');
+ await page.waitForFunction(()=>window.__gsi&&window.__gsi.prompts===1);
+ const config=await page.evaluate(()=>({client:__gsi.config.client_id,auto:__gsi.config.auto_select,fedcm:__gsi.config.use_fedcm_for_prompt,nonce:__gsi.config.nonce}));
+ assert.equal(config.client,'test-client.apps.googleusercontent.com');assert.equal(config.auto,true);assert.equal(config.fedcm,true);assert.match(config.nonce,/^[A-Za-z0-9_-]{43}$/);
+ assert.equal(account.calls.filter(call=>call.path==='/api/auth/session').length,0,'a guest still makes no session request before One Tap');
+ await page.evaluate(()=>__gsi.config.callback({credential:'header.payload.signature',select_by:'user'}));
+ await page.locator('[data-auth-avatar]').waitFor({state:'visible'});
+ const post=account.calls.find(call=>call.path==='/api/auth/google/credential');
+ assert.equal(post.method,'POST');assert.equal(post.body.credential,'header.payload.signature');assert.equal(post.body.nonce,config.nonce);
+ assert.deepEqual(await page.evaluate(()=>authChanging),['google'],'learning waits for the same gate as the Google button');
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-a');
+ assert.equal(await page.evaluate(()=>document.cookie.includes('cnr_signed_in=1')),true);
+ // Signing out tells Google not to sign this reader back in automatically.
+ await page.evaluate(()=>CNRAuth.signOut());
+ await page.waitForFunction(()=>__gsi.disabled===1);
+ assert.deepEqual(errors,[]);
+ // A dismissed prompt snoozes both One Tap and the popup invitation.
+ const second=await setup(t,state(),()=>{window.CNR_ONE_TAP_DELAY_MS=50;window.__gsiNotification={isDismissedMoment:()=>true,getDismissedReason:()=>'user_cancel'};},'/docs/python/intro/');
+ await second.page.waitForFunction(()=>window.__gsi&&window.__gsi.prompts===1);
+ await second.page.waitForFunction(()=>JSON.parse(localStorage.getItem('cnr-auth-invite')||'{}').dismissed===1);
+ await second.page.goto(second.page.url().replace('/intro/','/next/'));await second.page.evaluate(()=>CNRAuth.ready());await second.page.waitForTimeout(400);
+ assert.equal(await second.page.evaluate(()=>window.__gsi?window.__gsi.prompts:0),0,'snoozed: Google is not even loaded on the next page');
+});
+
+test('the popup shows the Google-rendered button when the script loads, and the plain link stays as the fallback otherwise',async t=>{
+ const{page}=await setup(t);
+ await open(page);
+ await page.locator('[data-auth-google-gsi] .fake-gsi-button').waitFor({state:'visible'});
+ assert.equal(await page.locator('[data-auth-google]').isVisible(),false,'the plain link hides once Google draws its button');
+ assert.equal(await page.evaluate(()=>__gsi.buttonOptions.text),'continue_with');
+ await page.evaluate(()=>__gsi.config.callback({credential:'c.d.e'}));
+ await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-a');
+ const context=await browser.newContext();t.after(()=>context.close());
+ await context.route('https://accounts.google.com/**',route=>route.abort());
+ await context.route('**/api/**',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({configured:true,providers:{google:true,github:true,email:true},user:null})}));
+ const blocked=await context.newPage();await blocked.goto(origin+'/');await blocked.evaluate(()=>CNRAuth.ready());
+ await blocked.locator('[data-auth-open]').click();await blocked.locator('[data-auth-dialog]').waitFor({state:'visible'});
+ await blocked.waitForTimeout(300);
+ assert.equal(await blocked.locator('[data-auth-google]').isVisible(),true,'without the Google script the OAuth link remains');
+ assert.equal(await blocked.locator('[data-auth-google-gsi]').isVisible(),false);
 });

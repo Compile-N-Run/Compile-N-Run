@@ -1,5 +1,7 @@
 // OAuth identities (Google, GitHub) are verified through each provider's authenticated user endpoint.
-// Provider tokens never reach the browser or persist in D1. No ID token is trusted.
+// Provider tokens never reach the browser or persist in D1. The one ID token that is accepted is the Google
+// Identity Services credential (One Tap, automatic sign-in, the personalized button): its RS256 signature is
+// checked against Google's published keys, and its issuer, audience, expiry and nonce are all verified.
 import { emailConfigured } from '../email-accounts.js';
 import { limitedJSON } from '../lib/body.js';
 export const ACCOUNT_SITE = 'https://www.compilenrun.com';
@@ -56,6 +58,57 @@ export const PROVIDERS = {
   },
 };
 const providerFor = (pathname, field) => Object.values(PROVIDERS).find(p => p[field] === pathname) || null;
+export const GOOGLE_CREDENTIAL_ROUTE = '/api/auth/google/credential';
+const GOOGLE_JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
+const GOOGLE_ISSUERS = new Set(['accounts.google.com', 'https://accounts.google.com']);
+let googleKeys = { keys: null, expires: 0 };
+
+function decodeSegment(segment) {
+  const padded = segment.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - segment.length % 4) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function googleSigningKeys(force = false) {
+  if (!force && googleKeys.keys && googleKeys.expires > Date.now()) return googleKeys.keys;
+  const res = await fetch(GOOGLE_JWKS_URL, { signal: AbortSignal.timeout(10000), headers: { accept: 'application/json' } });
+  if (!res.ok) throw new Error('jwks_' + res.status);
+  const body = await limitedJSON(res, 65536);
+  const keys = Array.isArray(body.keys) ? body.keys.filter(k => k && k.kty === 'RSA' && typeof k.kid === 'string' && (!k.alg || k.alg === 'RS256')) : [];
+  if (!keys.length) throw new Error('jwks_empty');
+  const maxAge = /max-age=(\d+)/.exec(res.headers.get('cache-control') || '');
+  googleKeys = { keys, expires: Date.now() + Math.min(Math.max(maxAge ? Number(maxAge[1]) : 3600, 300), 86400) * 1000 };
+  return keys;
+}
+
+// Verifies a Google Identity Services ID token and returns the identity it asserts, or null.
+// Reference: https://developers.google.com/identity/gsi/web/guides/verify-google-id-token
+async function verifyGoogleCredential(env, credential, nonce) {
+  if (typeof credential !== 'string' || credential.length > 4096 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(credential)) return null;
+  const [headerPart, payloadPart, signaturePart] = credential.split('.');
+  let header, payload;
+  try {
+    header = JSON.parse(new TextDecoder().decode(decodeSegment(headerPart)));
+    payload = JSON.parse(new TextDecoder().decode(decodeSegment(payloadPart)));
+  } catch (_) { return null; }
+  if (!header || header.alg !== 'RS256' || typeof header.kid !== 'string' || !payload || typeof payload !== 'object') return null;
+  const time = now();
+  if (!GOOGLE_ISSUERS.has(payload.iss) || payload.aud !== PROVIDERS.google.clientId(env) || typeof payload.sub !== 'string' ||
+      !Number.isFinite(payload.exp) || payload.exp <= time || !Number.isFinite(payload.iat) || payload.iat > time + 300 ||
+      typeof payload.nonce !== 'string' || !sameToken(payload.nonce, nonce)) return null;
+  let verified = false;
+  for (const force of [false, true]) {  // an unknown kid once: Google rotates keys, so refresh and retry
+    const jwk = (await googleSigningKeys(force)).find(k => k.kid === header.kid);
+    if (!jwk) continue;
+    const key = await crypto.subtle.importKey('jwk', { kty: jwk.kty, n: jwk.n, e: jwk.e }, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+    verified = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, decodeSegment(signaturePart), encoder.encode(headerPart + '.' + payloadPart));
+    break;
+  }
+  if (!verified) return null;
+  return { subject: payload.sub, name: clean(payload.name, 100), email: cleanEmail(payload.email), emailVerified: payload.email_verified === true, login: null };
+}
 const encoder = new TextEncoder();
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -280,6 +333,12 @@ async function finishOAuth(p, request, env) {
     await saveProfile(p, env.DB, identity, stamp);
     return redirect(ACCOUNT_SITE + '/profile/?auth=linked', [cookie(OAUTH_COOKIE, '', 0)]);
   }
+  const sessionCookie = await signInIdentity(p, request, env, identity, user, stamp);
+  return sessionCookie ? redirect(ACCOUNT_SITE + '/learn/', [cookie(OAUTH_COOKIE, '', 0), sessionCookie]) : oauthError();
+}
+
+// Find or create the account behind a verified provider identity and open a session for it.
+async function signInIdentity(p, request, env, identity, user, stamp) {
   if (!user) {
     const id = crypto.randomUUID();
     try {
@@ -296,9 +355,23 @@ async function finishOAuth(p, request, env) {
     }
   }
   await saveProfile(p, env.DB, identity, stamp);
-  const sessionCookie = await issueSession(request, env, user.id, null, identity.subject, p);
-  return sessionCookie ? redirect(ACCOUNT_SITE + '/learn/', [cookie(OAUTH_COOKIE, '', 0), sessionCookie]) : oauthError();
+  return issueSession(request, env, user.id, null, identity.subject, p);
+}
+
+// Google Identity Services: the browser posts the credential it received (One Tap, automatic sign-in or the
+// Sign in with Google button) together with the nonce it asked Google to embed.
+async function googleCredentialLogin(request, env) {
+  let body;
+  try { body = await limitedJSON(request, 16384); } catch (_) { return response(400, { error: 'invalid_request' }); }
+  if (!body || typeof body !== 'object' || !TOKEN_PATTERN.test(body.nonce || '')) return response(400, { error: 'invalid_request' });
+  let identity;
+  try { identity = await verifyGoogleCredential(env, body.credential, body.nonce); } catch (_) { return response(503, { error: 'google_unavailable' }); }
+  if (!identity || !/^[A-Za-z0-9_-]{1,255}$/.test(identity.subject)) return response(401, { error: 'invalid_credential' });
+  const p = PROVIDERS.google, stamp = now();
+  const user = await providerIdentity(p, env.DB, identity.subject);
+  const sessionCookie = await signInIdentity(p, request, env, identity, user, stamp);
+  return sessionCookie ? response(200, { ok: true }, [sessionCookie]) : response(401, { error: 'invalid_credential' });
 }
 
 
-export { response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE };
+export { response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, verifyGoogleCredential, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE };

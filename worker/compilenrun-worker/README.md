@@ -210,3 +210,15 @@ request count on the free plan proportional to signed-in traffic, not page views
 
 Observability is sampled at 10% of requests (logs only, no traces) in `wrangler.jsonc`: the free plan allows
 200,000 events a day and an unsampled day produced about two events per request.
+
+## Google Identity Services (One Tap, automatic sign-in, the Google button)
+
+`POST /api/auth/google/credential` with `{credential, nonce}` signs a reader in from a Google Identity Services
+credential (an RS256 ID token). The Worker verifies the signature against Google's published keys
+(`https://www.googleapis.com/oauth2/v3/certs`, cached per isolate for the advertised max-age and refreshed once
+on an unknown key id), the issuer, the audience (`GOOGLE_CLIENT_ID`), the expiry and the nonce the page asked
+Google to embed (a 43-character token the page generates per load), then finds or creates the account by Google
+`sub` exactly like the redirect flow. Same-origin only (the `Origin` header must be the site). The page side lives in
+`hugo/assets/js/auth-ui.js`; the client id comes from `googleClientId` in `hugo/hugo.toml`. In the Google Cloud
+console the OAuth client must list `https://www.compilenrun.com` under "Authorized JavaScript origins" or the
+prompts will not appear.

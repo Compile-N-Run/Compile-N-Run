@@ -79,6 +79,28 @@ async function login(subject = 'google-user-1', existingCookie = '') {
   const current = await handleAccounts(request('/api/auth/session', { cookie }), env);
   return { cookie, response, ...(await current.json()) };
 }
+let jwks = [], googleKeyPair = null;
+const b64url = bytes => Buffer.from(bytes).toString('base64url');
+async function googleKey(kid = 'kid-1') {
+  if (!googleKeyPair) googleKeyPair = await crypto.subtle.generateKey({ name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['sign', 'verify']);
+  const jwk = await crypto.subtle.exportKey('jwk', googleKeyPair.publicKey);
+  return { kid, jwk: { kty: 'RSA', n: jwk.n, e: jwk.e, alg: 'RS256', use: 'sig', kid } };
+}
+// A Google Identity Services credential: an RS256 ID token signed with the test key.
+async function googleCredential(overrides = {}, { kid = 'kid-1', tamper = false } = {}) {
+  await googleKey(kid);
+  const time = Math.floor(Date.now() / 1000);
+  const payload = { iss: 'https://accounts.google.com', aud: 'test.apps.googleusercontent.com', sub: 'google-user-1', exp: time + 300, iat: time,
+    nonce: 'n'.repeat(43), email: 'reader@example.invalid', email_verified: true, name: 'One Tap Reader', ...overrides };
+  const header = b64url(Buffer.from(JSON.stringify({ alg: 'RS256', kid, typ: 'JWT' })));
+  const body = b64url(Buffer.from(JSON.stringify(payload)));
+  const signature = new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', googleKeyPair.privateKey, new TextEncoder().encode(header + '.' + body)));
+  if (tamper) signature[0] ^= 1;
+  return header + '.' + body + '.' + b64url(signature);
+}
+const postCredential = (credential, nonce = 'n'.repeat(43), headers = { origin: SITE }) =>
+  handleAccounts(request('/api/auth/google/credential', { method: 'POST', body: { credential, nonce }, headers }), env);
+
 beforeEach(() => {
   db = new D1();
   env = { DB: db, AUTH_LIMIT: { limit: async () => ({ success: true }) }, GOOGLE_CLIENT_ID: 'test.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'test-secret-not-real', GITHUB_CLIENT_ID: 'Iv1.test', GITHUB_CLIENT_SECRET: 'github-secret-not-real' };
@@ -117,6 +139,7 @@ beforeEach(() => {
     if (url === 'https://api.github.com/user/emails') {
       return Response.json([{ email: 'old@example.invalid', primary: false, verified: true }, { email: 'Mona@Example.invalid', primary: true, verified: true }, { email: 'unverified@example.invalid', primary: false, verified: false }]);
     }
+    if (url === 'https://www.googleapis.com/oauth2/v3/certs') return Response.json({ keys: jwks }, { headers: { 'cache-control': 'public, max-age=3600' } });
     assert.equal(url, 'https://openidconnect.googleapis.com/v1/userinfo');
     assert.equal(options.headers.authorization, 'Bearer mock-token-do-not-store');
     return Response.json({ sub: selectedSubject, name: selectedName, email: 'not-stored@example.invalid' });
@@ -625,4 +648,51 @@ test('a readable signed-in hint cookie accompanies the session cookie, is cleare
   assert.match(stale.headers.getSetCookie().find(value => value.startsWith('__Host-cnr_session=')), /Max-Age=0/);
   const guest = await handleAccounts(request('/api/auth/session'), env);
   assert.equal(guest.headers.getSetCookie().length, 0); // a plain guest check sets nothing
+});
+
+test('a Google Identity Services credential signs in after signature, issuer, audience, expiry and nonce checks', async () => {
+  jwks = [(await googleKey()).jwk];
+  const ok = await postCredential(await googleCredential());
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true });
+  const cookie = cookiePair(ok, '__Host-cnr_session');
+  assert.ok(cookie);
+  assert.match(ok.headers.getSetCookie().find(value => value.startsWith('cnr_signed_in=')), /cnr_signed_in=1/);
+  const current = await (await handleAccounts(request('/api/auth/session', { cookie }), env)).json();
+  assert.equal(current.user.name, 'One Tap Reader');
+  assert.equal(current.user.googleLinked, true);
+  assert.equal(current.user.googleEmail, 'reader@example.invalid');
+  // The same Google account through the redirect flow is the same user: identities are keyed by sub.
+  const viaOAuth = await login('google-user-1');
+  assert.equal(viaOAuth.user.id, current.user.id);
+  assert.equal(upstream.filter(call => call.url === 'https://www.googleapis.com/oauth2/v3/certs').length, 1, 'keys are cached between credentials');
+});
+
+test('forged, expired, foreign-audience, replayed-nonce and cross-origin credentials are rejected', async () => {
+  jwks = [(await googleKey()).jwk];
+  const cases = [
+    ['tampered signature', await googleCredential({}, { tamper: true })],
+    ['expired', await googleCredential({ exp: Math.floor(Date.now() / 1000) - 10 })],
+    ['other audience', await googleCredential({ aud: 'someone-else.apps.googleusercontent.com' })],
+    ['other issuer', await googleCredential({ iss: 'https://evil.example' })],
+    ['nonce mismatch', await googleCredential({ nonce: 'x'.repeat(43) })],
+    ['alg none', 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJnb29nbGUtdXNlci0xIn0.'],
+  ];
+  for (const [label, credential] of cases) {
+    const rejected = await postCredential(credential);
+    assert.equal(rejected.status, 401, label);
+    assert.equal(rejected.headers.getSetCookie().length, 0, label + ' sets no cookie');
+  }
+  const noOrigin = await postCredential(await googleCredential(), 'n'.repeat(43), {});
+  assert.equal(noOrigin.status, 403);
+  const badNonce = await postCredential(await googleCredential(), 'short');
+  assert.equal(badNonce.status, 400);
+  // An unknown key id makes the Worker refresh Google's keys once; a rotated key then verifies.
+  const before = upstream.filter(call => call.url === 'https://www.googleapis.com/oauth2/v3/certs').length;
+  const rotated = await googleKey('kid-2');
+  jwks = [rotated.jwk];
+  const afterRotation = await postCredential(await googleCredential({}, { kid: 'kid-2' }));
+  assert.equal(afterRotation.status, 200);
+  assert.equal(upstream.filter(call => call.url === 'https://www.googleapis.com/oauth2/v3/certs').length, before + 1);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_users').get().n, 1, 'rejected credentials create no accounts');
 });

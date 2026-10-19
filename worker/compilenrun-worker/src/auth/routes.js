@@ -1,8 +1,8 @@
 import { EMAIL_ROUTES, PUBLIC_EMAIL_ROUTES, handleEmailAccount } from '../email-accounts.js';
 import { limitedJSON } from '../lib/body.js';
 import { handleLearning } from '../learning/routes.js';
-import { ACCOUNT_SITE, PROVIDERS, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
-const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/account', '/api/learning', ...Object.keys(EMAIL_ROUTES),
+import { ACCOUNT_SITE, PROVIDERS, GOOGLE_CREDENTIAL_ROUTE, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
+const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/account', '/api/learning', GOOGLE_CREDENTIAL_ROUTE, ...Object.keys(EMAIL_ROUTES),
   ...Object.values(PROVIDERS).flatMap(p => [p.start, p.link, p.callback])]);
 
 export async function handleAccounts(request, env, ctx) {
@@ -11,7 +11,7 @@ export async function handleAccounts(request, env, ctx) {
   if (url.origin !== ACCOUNT_SITE) return response(403, { error: 'origin_not_allowed' });
   const origin = request.headers.get('origin');
   if (origin && origin !== ACCOUNT_SITE) return response(403, { error: 'origin_not_allowed' });
-  const methods = { ...EMAIL_ROUTES, '/api/auth/session': 'GET', '/api/auth/logout': 'POST', '/api/auth/account': 'DELETE', '/api/learning': 'GET,PUT,PATCH' };
+  const methods = { ...EMAIL_ROUTES, '/api/auth/session': 'GET', '/api/auth/logout': 'POST', '/api/auth/account': 'DELETE', '/api/learning': 'GET,PUT,PATCH', [GOOGLE_CREDENTIAL_ROUTE]: 'POST' };
   for (const p of Object.values(PROVIDERS)) Object.assign(methods, { [p.start]: 'GET', [p.link]: 'POST,DELETE', [p.callback]: 'GET' });
   if (!methods[url.pathname].split(',').includes(request.method)) return response(405, { error: 'method_not_allowed' });
   const starting = providerFor(url.pathname, 'start'), finishing = providerFor(url.pathname, 'callback'), linkingProvider = providerFor(url.pathname, 'link');
@@ -30,6 +30,10 @@ export async function handleAccounts(request, env, ctx) {
     if (PUBLIC_EMAIL_ROUTES.has(url.pathname)) {
       if (origin !== ACCOUNT_SITE) return response(403, { error: 'csrf_failed' });
       return await handleEmailAccount(request, env, ctx, null, kit);
+    }
+    if (url.pathname === GOOGLE_CREDENTIAL_ROUTE) {
+      if (origin !== ACCOUNT_SITE) return response(403, { error: 'csrf_failed' });
+      return googleConfigured(env) ? await googleCredentialLogin(request, env) : response(503, { error: 'google_not_configured' });
     }
     const login = await session(request, env.DB);
     if (url.pathname === '/api/auth/session') return response(200, { configured: true,
