@@ -55,6 +55,52 @@ For the learning-record update, apply `accounts-learning-records-schema.sql` bef
 Test the widget locally against production:
 `HUGO_PARAMS_ASKAI_ENDPOINT=https://www.compilenrun.com/api/ask hugo server`
 
+## Two deployments
+
+The same code runs as two independent Workers, each with its own D1 database, KV namespace, OAuth apps and
+secrets. Everything site-specific comes from `env`: `SITE_ORIGIN` (origin checks, CORS, OAuth redirect URIs,
+redirects after login, email links, the page fetch for Ask AI), `SITE_NAME` (email subjects and sender name, the
+Ask AI prompt, the title suffix stripped from pages) and `SITE_LANG` (`zh*` gives Chinese emails, Ask AI answers in
+Simplified Chinese and Chinese quizzes). Unset, they fall back to the compilenrun values.
+
+| | compilenrun-worker | echocool-worker |
+| --- | --- | --- |
+| Config | `wrangler.jsonc` | `wrangler.echocool.jsonc` |
+| Site | https://www.compilenrun.com, `en`, "Compile N Run" | https://www.echo.cool, `zh-CN`, "代码酷" |
+| D1 (`DB`) | `compilenrun-data` | `echocool-data` |
+| KV (`ASK_KV`) | `f5aeb7b0e57d46bf9e5f80d816231cb5` | its own namespace |
+| Rate-limit namespace ids | 1001-1003 | 2001-2003 |
+| Google client id | `718000240736-hnrumls0f481uteljtu6779dpdnv9qrp.apps.googleusercontent.com` | `1072237482521-hqchdphppq230u5agnavq59kvhjnr4iu.apps.googleusercontent.com` |
+| GitHub client id | `Ov23liduwQHgsDYpjinC` | `Ov23lio0cF8OkEi6J4gI` |
+| OAuth callbacks | `/auth/google_oauth2/callback`, `/auth/github_oauth2/callback` on the site host | the same paths on www.echo.cool |
+| Email accounts | on | off (no `BREVO_API_KEY`); session discovery reports `email: false`, email routes return `503 email_not_configured` |
+
+Deploy (from this folder, wrangler 4):
+
+```sh
+npx wrangler@4 deploy                                    # compilenrun-worker
+npx wrangler@4 deploy --config wrangler.echocool.jsonc   # echocool-worker
+```
+
+A fresh database (replace `echocool-data` with the database name) needs these files in order; `accounts-github-schema.sql`
+contains a non-repeatable `ALTER TABLE`, so apply it once:
+
+```sh
+npx wrangler@4 d1 execute echocool-data --remote --file schema.sql   # feedback votes
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-schema.sql
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-email-schema.sql
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-google-profile-schema.sql
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-github-schema.sql
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-learning-records-schema.sql
+```
+
+Secrets, set per Worker with `npx wrangler@4 secret put NAME` (add `--config wrangler.echocool.jsonc` for echo.cool):
+`GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_SECRET`, `PASSWORD_PEPPER`, `IP_SALT`, `TURNSTILE_SECRET` (the Turnstile widget
+must allow the site's hostname). Only when email accounts are on: the `BREVO_API_KEY` secret plus the vars
+`EMAIL_PASSWORD_ENABLED: "true"`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME` (defaults to `SITE_NAME`) and
+`ACCOUNT_EMAIL_DAILY_LIMIT`. Each OAuth app must list its own site's callback URL (and, for Google, the site origin
+under "Authorized JavaScript origins").
+
 ## Source modules
 
 `src/index.js` dispatches requests to `ai/ask.js`, `ai/quiz.js`, `feedback.js`, and `auth/routes.js`.

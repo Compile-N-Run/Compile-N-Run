@@ -1,4 +1,4 @@
-import { SITE } from '../lib/http.js';
+import { siteOrigin, siteName } from '../lib/http.js';
 const MAX_PAGE_CHARS = 14000;
 
 const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', '#39': "'", '#34': '"' };
@@ -13,13 +13,16 @@ function decode(s) {
 }
 
 // Turn the article HTML into Markdown-ish text the model can read: headings, paragraphs, lists and code blocks.
-export function pageText(html) {
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// siteTitle: the deployment's site name; a trailing " | <site>" or " - <site>" is dropped from the page title.
+export function pageText(html, siteTitle = 'Compile N Run') {
   const start = html.search(/data-pagefind-body[^>]*>/);
   if (start < 0) return null;
   let body = html.slice(start).replace(/^[^>]*>/, '');
   const end = body.search(/<footer|<\/article>|<\/main>/);
   if (end >= 0) body = body.slice(0, end);
-  const title = decode((html.match(/<title>([^<]*)<\/title>/) || [])[1] || '').replace(/\s*\|\s*Compile N Run\s*$/, '');
+  const title = decode((html.match(/<title>([^<]*)<\/title>/) || [])[1] || '').replace(new RegExp(`\\s*[|\\-–—]\\s*${escapeRegExp(siteTitle)}\\s*$`), '');
   const text = body
     .replace(/<(script|style|svg|button)\b[\s\S]*?<\/\1>/gi, '')
     .replace(/<a\b[^>]*hash-link[^>]*>[\s\S]*?<\/a>/gi, '')
@@ -40,14 +43,15 @@ export function pageText(html) {
   return { title, text: clean.length > MAX_PAGE_CHARS ? clean.slice(0, MAX_PAGE_CHARS) + '\n\n[…page truncated…]' : clean };
 }
 
-export async function getPage(path, ctx) {
+export async function getPage(path, ctx, env) {
+  const site = siteOrigin(env);
   const cache = caches.default;
-  const key = new Request(`${SITE}/__ask_ai_page${path}`);
+  const key = new Request(`${site}/__ask_ai_page${path}`);
   const hit = await cache.match(key);
   if (hit) return hit.json();
-  const res = await fetch(SITE + path, { headers: { 'user-agent': 'CompileNRun-AskAI' }, cf: { cacheTtl: 3600 } });
+  const res = await fetch(site + path, { headers: { 'user-agent': 'CompileNRun-AskAI' }, cf: { cacheTtl: 3600 } });
   if (!res.ok) return null;
-  const page = pageText(await res.text());
+  const page = pageText(await res.text(), siteName(env));
   if (!page || !page.text) return null;
   ctx.waitUntil(cache.put(key, new Response(JSON.stringify(page), { headers: { 'content-type': 'application/json', 'cache-control': 'max-age=86400' } })));
   return page;

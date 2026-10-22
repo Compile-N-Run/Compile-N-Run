@@ -1,4 +1,4 @@
-import { SITE, json, validPath } from '../lib/http.js';
+import { siteOrigin, siteName, siteIsChinese, json, validPath } from '../lib/http.js';
 import { humanCheck } from '../lib/turnstile.js';
 import { getPage } from './page-content.js';
 
@@ -9,14 +9,20 @@ const MAX_HISTORY_TURNS = 6;
 const MAX_HISTORY_CHARS = 2000; // per message
 const MAX_ANSWER_TOKENS = 700;
 
-const SYSTEM = `You are "Ask AI", the assistant on Compile N Run (compilenrun.com), a free programming tutorial site for beginners.
+// The system prompt names this deployment's site (env.SITE_NAME / SITE_ORIGIN) and its language (env.SITE_LANG).
+export function systemPrompt(env) {
+  const host = new URL(siteOrigin(env)).host.replace(/^www\./, '');
+  const chinese = siteIsChinese(env);
+  return `You are "Ask AI", the assistant on ${siteName(env)} (${host}), a free programming tutorial site for beginners${chinese ? ' written in Simplified Chinese' : ''}.
 The reader is on the tutorial page below and is asking about it. Answer their question:
 - Base the answer on the tutorial when it covers the question; you may add general programming knowledge when it helps.
 - Be concise and beginner-friendly. Use Markdown, and fenced code blocks with a language tag for code.
 - If the tutorial looks wrong or outdated on a point, say so and give the correct information.
 - Do not make up links. Refer to sections of this page by their heading instead.
 - Only help with programming, software and computer science topics; politely decline anything else.
-- Reply in the language the reader writes in.`;
+${chinese ? '- Answer in Simplified Chinese (简体中文), unless the reader clearly writes in another language. Keep code, identifiers and commands as they are.' : '- Reply in the language the reader writes in.'}`;
+}
+
 
 
 export async function ask(request, env, ctx, cors, ip) {
@@ -51,11 +57,11 @@ export async function ask(request, env, ctx, cors, ip) {
   }
   ctx.waitUntil(env.ASK_KV.put(`count:${day}`, String(used + 1), { expirationTtl: 3 * 86400 }));
 
-  const page = await getPage(path, ctx);
+  const page = await getPage(path, ctx, env);
   if (!page) return json(404, { error: 'Could not read this page.' }, cors);
 
   const messages = [
-    { role: 'system', content: `${SYSTEM}\n\nPage: ${page.title}\nURL: ${SITE}${path}\n\n<tutorial>\n${page.text}\n</tutorial>` },
+    { role: 'system', content: `${systemPrompt(env)}\n\nPage: ${page.title}\nURL: ${siteOrigin(env)}${path}\n\n<tutorial>\n${page.text}\n</tutorial>` },
     ...history,
     { role: 'user', content: question },
   ];

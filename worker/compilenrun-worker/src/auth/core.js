@@ -4,7 +4,10 @@
 // checked against Google's published keys, and its issuer, audience, expiry and nonce are all verified.
 import { emailConfigured } from '../email-accounts.js';
 import { limitedJSON } from '../lib/body.js';
-export const ACCOUNT_SITE = 'https://www.compilenrun.com';
+import { SITE, siteOrigin } from '../lib/http.js';
+// Fallback origin kept for importers; every request uses siteOrigin(env) (env.SITE_ORIGIN).
+export const ACCOUNT_SITE = SITE;
+export { siteOrigin };
 export const OAUTH_CALLBACK = '/auth/google_oauth2/callback';
 export const GITHUB_CALLBACK = '/auth/github_oauth2/callback';
 const SESSION_COOKIE = '__Host-cnr_session';
@@ -148,8 +151,8 @@ function redirect(target, cookies = []) {
   return new Response(null, { status: 303, headers });
 }
 
-function oauthError(linking = false) {
-  return redirect(ACCOUNT_SITE + (linking ? '/profile/?auth=error' : '/learn/?auth=error'), [cookie(OAUTH_COOKIE, '', 0)]);
+function oauthError(env, linking = false) {
+  return redirect(siteOrigin(env) + (linking ? '/profile/?auth=error' : '/learn/?auth=error'), [cookie(OAUTH_COOKIE, '', 0)]);
 }
 
 function readCookie(request, name) {
@@ -234,7 +237,7 @@ async function beginOAuth(p, request, env, linking = null) {
   if (linking && result[result.length - 1].meta.changes !== 1) return response(401, { error: 'authentication_required' });
   const url = new URL(p.authUrl);
   url.search = new URLSearchParams({
-    client_id: p.clientId(env), redirect_uri: ACCOUNT_SITE + p.callback,
+    client_id: p.clientId(env), redirect_uri: siteOrigin(env) + p.callback,
     response_type: 'code', scope: p.scope, state,
     code_challenge: await hash(verifier), code_challenge_method: 'S256', ...p.authParams,
   });
@@ -288,7 +291,7 @@ async function finishOAuth(p, request, env) {
   const state = url.searchParams.get('state'), code = url.searchParams.get('code');
   const binding = readCookie(request, OAUTH_COOKIE);
   if (!binding || !TOKEN_PATTERN.test(state || '') || typeof code !== 'string' || !code || code.length > 2048 ||
-      url.searchParams.has('error') || url.searchParams.getAll('state').length !== 1 || url.searchParams.getAll('code').length !== 1) return oauthError();
+      url.searchParams.has('error') || url.searchParams.getAll('state').length !== 1 || url.searchParams.getAll('code').length !== 1) return oauthError(env);
   const stateHash = await hash(state);
   // Read purpose before consuming the parent challenge (FK cascade removes it).
   const linking = await env.DB.prepare('SELECT user_id, session_hash FROM cnr_account_oauth_links WHERE state_hash = ?1').bind(stateHash).first();
@@ -296,45 +299,45 @@ async function finishOAuth(p, request, env) {
   const challenge = await env.DB.prepare(`DELETE FROM cnr_account_oauth_challenges
     WHERE state_hash = ?1 AND binding_hash = ?2 AND expires_at > ?3 AND provider = ?4 RETURNING verifier`)
     .bind(stateHash, await hash(binding), now(), p.key).first();
-  if (!challenge) return oauthError();
+  if (!challenge) return oauthError(env);
   if (linking) {
     const current = await session(request, env.DB);
-    if (!current || current.user.id !== linking.user_id || current.tokenHash !== linking.session_hash) return oauthError(true);
+    if (!current || current.user.id !== linking.user_id || current.tokenHash !== linking.session_hash) return oauthError(env, true);
   }
   const exchanged = await fetch(p.tokenUrl, {
     method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(10000),
     headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'compilenrun-worker' },
     body: new URLSearchParams({ client_id: p.clientId(env), client_secret: p.secret(env),
-      code, grant_type: 'authorization_code', redirect_uri: ACCOUNT_SITE + p.callback, code_verifier: challenge.verifier }),
+      code, grant_type: 'authorization_code', redirect_uri: siteOrigin(env) + p.callback, code_verifier: challenge.verifier }),
   });
-  if (!exchanged.ok) return oauthError(!!linking);
+  if (!exchanged.ok) return oauthError(env, !!linking);
   const credentials = await limitedJSON(exchanged, 32768);
   if (typeof credentials.access_token !== 'string' || !credentials.access_token || credentials.access_token.length > 8192 ||
-      String(credentials.token_type).toLowerCase() !== 'bearer') return oauthError(!!linking);
+      String(credentials.token_type).toLowerCase() !== 'bearer') return oauthError(env, !!linking);
   // Only a token obtained above from the provider's fixed token endpoint is accepted.
   // Do not authenticate from email, client-supplied tokens, or unverified JWTs.
   let identity;
-  try { identity = await p.identity(credentials.access_token); } catch (_) { return oauthError(!!linking); }
-  if (!/^[A-Za-z0-9_-]{1,255}$/.test(identity.subject)) return oauthError(!!linking);
+  try { identity = await p.identity(credentials.access_token); } catch (_) { return oauthError(env, !!linking); }
+  if (!/^[A-Za-z0-9_-]{1,255}$/.test(identity.subject)) return oauthError(env, !!linking);
   const stamp = now();
   let user = await providerIdentity(p, env.DB, identity.subject);
   if (linking) {
-    if (user && user.id !== linking.user_id) return oauthError(true);
+    if (user && user.id !== linking.user_id) return oauthError(env, true);
     const ownIdentity = await env.DB.prepare(`SELECT ${p.column} AS subject FROM ${p.identities} WHERE user_id = ?1`).bind(linking.user_id).first();
-    if (ownIdentity && ownIdentity.subject !== identity.subject) return oauthError(true);
+    if (ownIdentity && ownIdentity.subject !== identity.subject) return oauthError(env, true);
     const current = await session(request, env.DB);
-    if (!current || current.user.id !== linking.user_id || current.tokenHash !== linking.session_hash) return oauthError(true);
+    if (!current || current.user.id !== linking.user_id || current.tokenHash !== linking.session_hash) return oauthError(env, true);
     if (!ownIdentity) {
       const added = await env.DB.prepare(`INSERT INTO ${p.identities} (${p.column}, user_id, linked_at)
         SELECT ?1, user_id, ?2 FROM cnr_account_sessions WHERE token_hash = ?3 AND user_id = ?4 AND expires_at > ?2 RETURNING user_id`)
         .bind(identity.subject, stamp, linking.session_hash, linking.user_id).first();
-      if (!added) return oauthError(true);
+      if (!added) return oauthError(env, true);
     }
     await saveProfile(p, env.DB, identity, stamp);
-    return redirect(ACCOUNT_SITE + '/profile/?auth=linked', [cookie(OAUTH_COOKIE, '', 0)]);
+    return redirect(siteOrigin(env) + '/profile/?auth=linked', [cookie(OAUTH_COOKIE, '', 0)]);
   }
   const sessionCookie = await signInIdentity(p, request, env, identity, user, stamp);
-  return sessionCookie ? redirect(ACCOUNT_SITE + '/learn/', [cookie(OAUTH_COOKIE, '', 0), sessionCookie]) : oauthError();
+  return sessionCookie ? redirect(siteOrigin(env) + '/learn/', [cookie(OAUTH_COOKIE, '', 0), sessionCookie]) : oauthError(env);
 }
 
 // Find or create the account behind a verified provider identity and open a session for it.

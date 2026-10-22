@@ -1,38 +1,39 @@
 import { EMAIL_ROUTES, PUBLIC_EMAIL_ROUTES, handleEmailAccount } from '../email-accounts.js';
 import { limitedJSON } from '../lib/body.js';
 import { handleLearning } from '../learning/routes.js';
-import { ACCOUNT_SITE, PROVIDERS, GOOGLE_CREDENTIAL_ROUTE, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
+import { siteOrigin, PROVIDERS, GOOGLE_CREDENTIAL_ROUTE, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
 const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/account', '/api/learning', GOOGLE_CREDENTIAL_ROUTE, ...Object.keys(EMAIL_ROUTES),
   ...Object.values(PROVIDERS).flatMap(p => [p.start, p.link, p.callback])]);
 
 export async function handleAccounts(request, env, ctx) {
   const url = new URL(request.url);
+  const site = siteOrigin(env);
   if (!ROUTES.has(url.pathname)) return url.pathname.startsWith('/api/auth/') ? response(404, { error: 'not_found' }) : null;
-  if (url.origin !== ACCOUNT_SITE) return response(403, { error: 'origin_not_allowed' });
+  if (url.origin !== site) return response(403, { error: 'origin_not_allowed' });
   const origin = request.headers.get('origin');
-  if (origin && origin !== ACCOUNT_SITE) return response(403, { error: 'origin_not_allowed' });
+  if (origin && origin !== site) return response(403, { error: 'origin_not_allowed' });
   const methods = { ...EMAIL_ROUTES, '/api/auth/session': 'GET', '/api/auth/logout': 'POST', '/api/auth/account': 'DELETE', '/api/learning': 'GET,PUT,PATCH', [GOOGLE_CREDENTIAL_ROUTE]: 'POST' };
   for (const p of Object.values(PROVIDERS)) Object.assign(methods, { [p.start]: 'GET', [p.link]: 'POST,DELETE', [p.callback]: 'GET' });
   if (!methods[url.pathname].split(',').includes(request.method)) return response(405, { error: 'method_not_allowed' });
   const starting = providerFor(url.pathname, 'start'), finishing = providerFor(url.pathname, 'callback'), linkingProvider = providerFor(url.pathname, 'link');
   if (!configured(env)) {
     if (url.pathname === '/api/auth/session') return response(200, { configured: false, providers: { google: false, github: false, email: false }, googleConfigured: false, emailConfigured: false, user: null });
-    if (starting || finishing) return oauthError();
+    if (starting || finishing) return oauthError(env);
     return response(503, { error: 'accounts_not_configured' });
   }
   try {
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     const rate = await env.AUTH_LIMIT.limit({ key: await hash(ip) });
-    if (!rate.success) return finishing ? oauthError() : response(429, { error: 'rate_limited' });
-    if (starting) return providerConfigured(starting, env) ? await beginOAuth(starting, request, env) : oauthError();
-    if (finishing) return providerConfigured(finishing, env) ? await finishOAuth(finishing, request, env) : oauthError();
+    if (!rate.success) return finishing ? oauthError(env) : response(429, { error: 'rate_limited' });
+    if (starting) return providerConfigured(starting, env) ? await beginOAuth(starting, request, env) : oauthError(env);
+    if (finishing) return providerConfigured(finishing, env) ? await finishOAuth(finishing, request, env) : oauthError(env);
     const kit = { reply: response, readJSON: limitedJSON, hash, randomToken, issueSession, expiredSessionCookie: () => cookie(SESSION_COOKIE, '', 0) };
     if (PUBLIC_EMAIL_ROUTES.has(url.pathname)) {
-      if (origin !== ACCOUNT_SITE) return response(403, { error: 'csrf_failed' });
+      if (origin !== site) return response(403, { error: 'csrf_failed' });
       return await handleEmailAccount(request, env, ctx, null, kit);
     }
     if (url.pathname === GOOGLE_CREDENTIAL_ROUTE) {
-      if (origin !== ACCOUNT_SITE) return response(403, { error: 'csrf_failed' });
+      if (origin !== site) return response(403, { error: 'csrf_failed' });
       return googleConfigured(env) ? await googleCredentialLogin(request, env) : response(503, { error: 'google_not_configured' });
     }
     const login = await session(request, env.DB);
@@ -42,7 +43,7 @@ export async function handleAccounts(request, env, ctx) {
     !login && /(?:^|;\s*)(?:__Host-cnr_session|cnr_signed_in)=/.test(request.headers.get('cookie') || '') ? [cookie(SESSION_COOKIE, '', 0)] : []);
     if (!login) return response(401, { error: 'authentication_required' });
     if (request.headers.get('X-CNR-User') !== login.user.id) return response(409, { error: 'account_changed' });
-    if (request.method !== 'GET' && (origin !== ACCOUNT_SITE || !sameToken(request.headers.get('X-CSRF-Token'), login.csrfToken))) {
+    if (request.method !== 'GET' && (origin !== site || !sameToken(request.headers.get('X-CSRF-Token'), login.csrfToken))) {
       return response(403, { error: 'csrf_failed' });
     }
     if (EMAIL_ROUTES[url.pathname]) return await handleEmailAccount(request, env, ctx, login, kit);
@@ -85,6 +86,6 @@ export async function handleAccounts(request, env, ctx) {
     return await handleLearning(request, env, login, { reply: response, session });
   } catch (error) {
     // Never log OAuth codes, access tokens, cookie values, or private snapshots.
-    return providerFor(url.pathname, 'callback') || providerFor(url.pathname, 'start') ? oauthError() : response(503, { error: error?.message === 'password_service_busy' ? 'password_service_busy' : 'accounts_unavailable' });
+    return providerFor(url.pathname, 'callback') || providerFor(url.pathname, 'start') ? oauthError(env) : response(503, { error: error?.message === 'password_service_busy' ? 'password_service_busy' : 'accounts_unavailable' });
   }
 }

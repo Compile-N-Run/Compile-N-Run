@@ -63,7 +63,7 @@ const kit = {
 };
 beforeEach(() => {
   db = new D1(); mails = []; originalFetch = globalThis.fetch;
-  env = { DB: db, AUTH_LIMIT: { limit: async () => ({ success: true }) }, EMAIL_PASSWORD_ENABLED: 'true',
+  env = { SITE_ORIGIN: SITE, DB: db, AUTH_LIMIT: { limit: async () => ({ success: true }) }, EMAIL_PASSWORD_ENABLED: 'true',
     PASSWORD_PEPPER: 'test-only-pepper-with-at-least-thirty-two-characters', BREVO_API_KEY: 'mock-only', BREVO_SENDER_EMAIL: 'test@example.invalid', ACCOUNT_EMAIL_DAILY_LIMIT: '100' };
   globalThis.fetch = async (url, options) => {
     assert.equal(String(url), 'https://api.brevo.com/v3/smtp/email');

@@ -14,7 +14,7 @@ export default {
   async fetch(request, env, ctx) {
     const accountResponse = await handleAccounts(request, env, ctx);
     if (accountResponse) return accountResponse;
-    const cors = corsFor(request.headers.get('Origin') || '');
+    const cors = corsFor(request.headers.get('Origin') || '', env);
     if (request.method === 'OPTIONS') return new Response(null, { status: cors ? 204 : 403, headers: cors || {} });
     if (request.method !== 'POST') return json(405, { error: 'Use POST.' }, cors || {});
     if (!cors) return json(403, { error: 'Not allowed from this origin.' }, {});

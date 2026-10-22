@@ -103,7 +103,7 @@ const postCredential = (credential, nonce = 'n'.repeat(43), headers = { origin: 
 
 beforeEach(() => {
   db = new D1();
-  env = { DB: db, AUTH_LIMIT: { limit: async () => ({ success: true }) }, GOOGLE_CLIENT_ID: 'test.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'test-secret-not-real', GITHUB_CLIENT_ID: 'Iv1.test', GITHUB_CLIENT_SECRET: 'github-secret-not-real' };
+  env = { SITE_ORIGIN: 'https://www.compilenrun.com', DB: db, AUTH_LIMIT: { limit: async () => ({ success: true }) }, GOOGLE_CLIENT_ID: 'test.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'test-secret-not-real', GITHUB_CLIENT_ID: 'Iv1.test', GITHUB_CLIENT_SECRET: 'github-secret-not-real' };
   upstream = []; mail = []; pendingMail = []; selectedSubject = 'google-user-1'; selectedName = 'Practice Learner'; tokenFailure = false;
   originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
@@ -117,7 +117,7 @@ beforeEach(() => {
       assert.equal(options.method, 'POST');
       assert.equal(options.redirect, 'manual');
       const fields = new URLSearchParams(options.body);
-      assert.equal(fields.get('redirect_uri'), SITE + OAUTH_CALLBACK);
+      assert.equal(fields.get('redirect_uri'), env.SITE_ORIGIN + OAUTH_CALLBACK);
       assert.equal(fields.get('grant_type'), 'authorization_code');
       assert.match(fields.get('code_verifier'), /^[A-Za-z0-9_-]{43}$/);
       return Response.json(tokenFailure ? { error: 'invalid_grant' } : { access_token: 'mock-token-do-not-store', token_type: 'Bearer', id_token: 'unverified-and-ignored' }, { status: tokenFailure ? 400 : 200 });
@@ -126,7 +126,7 @@ beforeEach(() => {
       assert.equal(options.method, 'POST');
       assert.equal(options.headers.accept, 'application/json');
       const fields = new URLSearchParams(options.body);
-      assert.equal(fields.get('redirect_uri'), SITE + GITHUB_CALLBACK);
+      assert.equal(fields.get('redirect_uri'), env.SITE_ORIGIN + GITHUB_CALLBACK);
       assert.equal(fields.get('client_id'), 'Iv1.test');
       assert.match(fields.get('code_verifier'), /^[A-Za-z0-9_-]{43}$/);
       return Response.json(tokenFailure ? { error: 'bad_verification_code' } : { access_token: 'gho_mock-token', token_type: 'bearer', scope: 'read:user,user:email' }, { status: tokenFailure ? 400 : 200 });
@@ -695,4 +695,50 @@ test('forged, expired, foreign-audience, replayed-nonce and cross-origin credent
   assert.equal(afterRotation.status, 200);
   assert.equal(upstream.filter(call => call.url === 'https://www.googleapis.com/oauth2/v3/certs').length, before + 1);
   assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_users').get().n, 1, 'rejected credentials create no accounts');
+});
+
+test('the same router serves a second site (echo.cool) from SITE_ORIGIN', async () => {
+  const ECHO = 'https://www.echo.cool';
+  env.SITE_ORIGIN = ECHO;
+  const at = (path, options = {}) => new Request(ECHO + path, options);
+  const session = await handleAccounts(at('/api/auth/session'), env);
+  assert.equal(session.status, 200);
+  assert.equal((await session.json()).configured, true);
+  // The other deployment's host and origin are foreign here.
+  assert.equal((await handleAccounts(request('/api/auth/session'), env)).status, 403);
+  const crossOrigin = await handleAccounts(at('/api/auth/google/credential', { method: 'POST', headers: { Origin: SITE, 'content-type': 'application/json' },
+    body: JSON.stringify({ credential: 'x', nonce: 'n'.repeat(43) }) }), env);
+  assert.equal(crossOrigin.status, 403);
+  const started = await handleAccounts(at('/api/auth/google'), env);
+  assert.equal(started.status, 303);
+  const authorization = new URL(started.headers.get('location'));
+  assert.equal(authorization.searchParams.get('redirect_uri'), ECHO + OAUTH_CALLBACK);
+  const oauthCookie = cookiePair(started, '__Host-cnr_oauth');
+  const done = await handleAccounts(at(OAUTH_CALLBACK + '?state=' + authorization.searchParams.get('state') + '&code=test-code', { headers: { Cookie: oauthCookie } }), env);
+  assert.equal(done.headers.get('location'), ECHO + '/learn/');
+  assert.equal((await handleAccounts(at(OAUTH_CALLBACK + '?state=bad&code=x'), env)).headers.get('location'), ECHO + '/learn/?auth=error');
+  // Ask AI / quiz / feedback CORS follows the same origin.
+  const askCors = await worker.fetch(at('/api/ask', { method: 'OPTIONS', headers: { Origin: ECHO } }), env, {});
+  assert.equal(askCors.status, 204);
+  assert.equal(askCors.headers.get('access-control-allow-origin'), ECHO);
+  assert.equal((await worker.fetch(at('/api/ask', { method: 'OPTIONS', headers: { Origin: SITE } }), env, {})).status, 403);
+});
+
+test('emails and the Ask AI prompt follow SITE_NAME / SITE_LANG', async () => {
+  const { sendAccountEmail } = await import('../worker/compilenrun-worker/src/email.js');
+  const { systemPrompt } = await import('../worker/compilenrun-worker/src/ai/ask.js');
+  const { pageText } = await import('../worker/compilenrun-worker/src/ai/page-content.js');
+  const echo = { SITE_ORIGIN: 'https://www.echo.cool', SITE_NAME: '代码酷', SITE_LANG: 'zh-CN', BREVO_API_KEY: 'test-only', BREVO_SENDER_EMAIL: 'no-reply@echo.cool' };
+  await sendAccountEmail(echo, 'reader@example.invalid', 'reset', 'A'.repeat(43));
+  const sent = mail.at(-1);
+  assert.equal(sent.subject, '重置你的代码酷密码');
+  assert.equal(sent.sender.name, '代码酷');
+  assert.match(sent.textContent, /https:\/\/www\.echo\.cool\/profile\/#reset=A{43}/);
+  await sendAccountEmail({ BREVO_API_KEY: 'test-only', BREVO_SENDER_EMAIL: 'no-reply@compilenrun.com' }, 'reader@example.invalid', 'verify', 'B'.repeat(43));
+  assert.equal(mail.at(-1).subject, 'Verify your Compile N Run email');
+  assert.match(mail.at(-1).textContent, /https:\/\/www\.compilenrun\.com\/profile\/#verify=/);
+  assert.match(systemPrompt(echo), /代码酷 \(echo\.cool\)/);
+  assert.match(systemPrompt(echo), /Simplified Chinese/);
+  assert.match(systemPrompt({}), /Compile N Run \(compilenrun\.com\)/);
+  assert.equal(pageText('<title>列表 | 代码酷</title><article data-pagefind-body><p>x</p></article>', '代码酷').title, '列表');
 });

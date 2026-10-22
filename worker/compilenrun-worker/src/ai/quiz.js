@@ -1,4 +1,4 @@
-import { json, validPath } from '../lib/http.js';
+import { json, validPath, siteIsChinese } from '../lib/http.js';
 import { humanCheck } from '../lib/turnstile.js';
 import { getPage } from './page-content.js';
 
@@ -18,6 +18,9 @@ Rules:
 - Base everything strictly on the tutorial.
 - In "work", reason step by step: for code questions trace the code line by line and write the exact output; check every option.
 - Then write "explanation" (1-2 sentences for the reader) and finally "answer", the letter of the correct option.`;
+// On a Chinese site (env.SITE_LANG zh*) the reader-facing fields are written in Simplified Chinese.
+const QUIZ_CHINESE = `\n- Write "question", "options" and "explanation" in Simplified Chinese (简体中文); keep code, identifiers and program output unchanged. "work" may be in any language.`;
+const quizPrompt = (env) => QUIZ_PROMPT + (siteIsChinese(env) ? QUIZ_CHINESE : '');
 const QUIZ_SCHEMA = {
   type: 'object',
   properties: {
@@ -130,7 +133,7 @@ export async function quiz(request, env, ctx, cors, ip) {
     return json(429, { error: "Today's new quizzes have run out. They reset at 00:00 UTC — please try again tomorrow." }, cors);
   }
   ctx.waitUntil(env.ASK_KV.put(`quizcount:${day}`, String(used + 1), { expirationTtl: 3 * 86400 }));
-  const page = await getPage(path, ctx);
+  const page = await getPage(path, ctx, env);
   if (!page) return json(404, { error: 'Could not read this page.' }, cors);
 
   // New quiz: stream it. Each question is checked as soon as the model has written it, and sent on (in order)
@@ -163,7 +166,7 @@ export async function quiz(request, env, ctx, cors, ip) {
             const stream = await env.AI.run(env.QUIZ_MODEL || QUIZ_MODEL, {
               messages: [
                 { role: 'system', content: 'You write accurate programming quizzes. Reply with JSON only.' },
-                { role: 'user', content: `${QUIZ_PROMPT}${round ? `\n- This is quiz number ${round + 1} on this page: pick different parts of the tutorial than an obvious first quiz would.` : ''}\n\nTutorial: ${page.title}\n<tutorial>\n${page.text}\n</tutorial>` },
+                { role: 'user', content: `${quizPrompt(env)}${round ? `\n- This is quiz number ${round + 1} on this page: pick different parts of the tutorial than an obvious first quiz would.` : ''}\n\nTutorial: ${page.title}\n<tutorial>\n${page.text}\n</tutorial>` },
               ],
               response_format: { type: 'json_schema', json_schema: QUIZ_SCHEMA },
               max_tokens: 3000,
