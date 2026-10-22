@@ -4,6 +4,61 @@
 (function () {
   'use strict';
   if (window.CNRAuth) return;
+  // UI language follows <html lang>: English by default, Simplified Chinese on zh pages (the sister site copies this file).
+  const ZH = {
+    'A newer account action replaced this connection check.': '新的账户操作已取代本次连接检查。',
+    'Checking sign-in options…': '正在检查登录方式…',
+    'Could not connect to sign-in. Check your connection and try again.': '无法连接登录服务。请检查网络后重试。',
+    'Create a free account to keep your progress, bookmarks and solved problems on every device. You can keep learning without one.': '注册免费账户，即可在所有设备上保留学习进度、书签和已解决的题目。不注册也可以继续学习。',
+    'Create an account': '注册账户',
+    'Email or password was not accepted. If you just registered, verify your email first.': '邮箱或密码不正确。如果刚刚注册，请先验证邮箱。',
+    'Enter a valid email address.': '请输入有效的邮箱地址。',
+    'Google sign-in could not be verified. Please try again.': '无法验证 Google 登录。请重试。',
+    'Google sign-in did not load.': 'Google 登录未能加载。',
+    'If this address can be registered, a verification email will arrive shortly. Verify it before signing in.': '如果该邮箱可以注册，验证邮件将很快送达。请先完成验证再登录。',
+    'If this address has an eligible account, a password reset email will arrive shortly.': '如果该邮箱有对应的账户，密码重置邮件将很快送达。',
+    'If this address needs verification, a verification email will arrive shortly.': '如果该邮箱需要验证，验证邮件将很快送达。',
+    'Learner': '学习者',
+    'Learning needs attention': '学习记录需要处理',
+    'Open account menu for {name}': '打开 {name} 的账户菜单',
+    'Opening GitHub sign-in…': '正在打开 GitHub 登录…',
+    'Opening Google sign-in…': '正在打开 Google 登录…',
+    'Please wait a little before trying again.': '请稍候再试。',
+    'Please wait for the current account request.': '请等待当前账户请求完成。',
+    'Reconnect': '重新连接',
+    'Reconnect to confirm the current account before signing out.': '请先重新连接以确认当前账户，再退出登录。',
+    'Reconnecting…': '正在重新连接…',
+    'Reset your password': '重置密码',
+    'Saved on this device. Sign in to keep your progress on every device, or close this to keep going as a guest.': '已保存在本设备。登录后可在所有设备上保留学习进度；也可以关闭此窗口，继续以访客身份学习。',
+    'Sending your request…': '正在发送请求…',
+    'Sign in': '登录',
+    'Sign-in could not be confirmed. Please try again.': '无法确认登录状态。请重试。',
+    'Sign-in details could not be verified. Please try again.': '无法验证登录信息。请重试。',
+    'Sign-in is busy right now. Please try again in a moment.': '登录服务繁忙，请稍后重试。',
+    'Sign-in is unavailable right now. Please try again later.': '登录服务暂不可用，请稍后重试。',
+    'Sign-in is unavailable right now. You can keep learning on this device.': '登录服务暂不可用。你可以继续在本设备上学习。',
+    'Sign-out could not be confirmed. Please try again.': '无法确认退出登录。请重试。',
+    'Signing in with Google…': '正在使用 Google 登录…',
+    'Signing in…': '正在登录…',
+    'Signing out…': '正在退出登录…',
+    'The account response was too large. Please try again.': '账户服务的响应过大。请重试。',
+    'The account service returned an empty response.': '账户服务返回了空响应。',
+    'The account service returned an unreadable response. Please try again.': '账户服务返回了无法读取的响应。请重试。',
+    'The sign-in response could not be verified. Please try again.': '无法验证登录响应。请重试。',
+    'The signed-in account changed before progress could be saved. Review the current account before trying again.': '在保存进度之前，已登录的账户发生了变化。请先确认当前账户再重试。',
+    'The signed-in account changed. Review the current account before trying again.': '已登录的账户发生了变化。请先确认当前账户再重试。',
+    'Use a display name of 1–100 characters.': '显示名称需为 1–100 个字符。',
+    'Use a password with 15–128 characters. Spaces are kept.': '密码需为 15–128 个字符，空格会被保留。',
+    'Verify your email': '验证邮箱',
+    'Your latest progress could not be synced. You are still signed in; retry before signing out.': '最新进度未能同步。你仍处于登录状态，请重试同步后再退出登录。',
+    'Your learning could not be kept safely before this account change. Try connecting again, then retry.': '切换账户前未能安全保留你的学习记录。请重新连接后再试。',
+    'Your learning could not finish switching. Try connecting again before continuing.': '学习记录未能完成切换。请重新连接后再继续。',
+    'Your learning needs attention. Retry the connection before editing.': '你的学习记录需要处理。请重试连接后再编辑。',
+    'Your sign-in changed. Refresh the connection and try again.': '登录状态已变化。请刷新连接后重试。',
+    'Your sign-in has ended. Please sign in again.': '登录已过期，请重新登录。',
+  };
+  const isZh = /^zh/i.test(document.documentElement.lang);
+  function t(text, vars) { let out = isZh && ZH[text] !== undefined ? ZH[text] : text; if (vars) Object.keys(vars).forEach(k => { out = out.split('{' + k + '}').join(String(vars[k])); }); return out; }
   const widget = document.querySelector('[data-auth-widget]');
   const dialog = document.querySelector('[data-auth-dialog]');
   const menu = widget?.querySelector('[data-auth-menu]');
@@ -12,7 +67,7 @@
   const menuStatus = widget?.querySelector('[data-auth-menu-status]');
   const message = dialog?.querySelector('[data-auth-message]');
   const forms = dialog ? Array.from(dialog.querySelectorAll('[data-auth-form]')) : [];
-  const titles = { login: 'Sign in', register: 'Create an account', forgot: 'Reset your password', resend: 'Verify your email' };
+  const titles = { login: t('Sign in'), register: t('Create an account'), forgot: t('Reset your password'), resend: t('Verify your email') };
   let current = null, known = false, published = false, transitionFailed = false, actionPending = false, capabilities = { google: false, github: false, email: false };
   let inFlight = null, refreshController = null, initial = null, mutation = null, answered = false; // answered: a real server answer was validated
   let lastAttempt = 0, requestEpoch = 0, stateEpoch = 0, transition = Promise.resolve(), transitioning = false;
@@ -39,7 +94,7 @@
   const plain = (value, max, empty = false) => typeof value === 'string' && (empty || value.length > 0) && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
   function fault(code, text) { const error = new Error(text); error.code = code; return error; }
   function validate(value) {
-    if (!object(value) || typeof value.configured !== 'boolean' || (value.user !== null && !object(value.user))) throw fault('invalid_response','Sign-in details could not be verified. Please try again.');
+    if (!object(value) || typeof value.configured !== 'boolean' || (value.user !== null && !object(value.user))) throw fault('invalid_response',t('Sign-in details could not be verified. Please try again.'));
     const providers = object(value.providers) ? { google: value.providers.google === true, github: value.providers.github === true, email: value.providers.email === true } : { google: value.googleConfigured === true, github: false, email: value.emailConfigured === true };
     if (value.user === null) return { configured: value.configured, providers: value.configured ? providers : { google: false, github: false, email: false }, user: null };
     const user = value.user;
@@ -47,7 +102,7 @@
         !(user.email === undefined || user.email === null || plain(user.email,254)) ||
         typeof user.emailVerified !== 'boolean' || typeof user.hasPassword !== 'boolean' || typeof user.googleLinked !== 'boolean' || !(user.googleEmail === undefined || user.googleEmail === null || plain(user.googleEmail,254)) ||
         !(user.githubLinked === undefined || typeof user.githubLinked === 'boolean') || !(user.githubLogin === undefined || user.githubLogin === null || plain(user.githubLogin,39)) || !plain(value.csrfToken,500)) {
-      throw fault('invalid_response','Sign-in details could not be verified. Please try again.');
+      throw fault('invalid_response',t('Sign-in details could not be verified. Please try again.'));
     }
     return { configured: value.configured, providers, user: { id: user.id, name: user.name, email: user.email || null,
       emailVerified: user.emailVerified, hasPassword: user.hasPassword, googleLinked: user.googleLinked, googleEmail: user.googleLinked && user.googleEmail || null,
@@ -72,15 +127,15 @@
   function openMenu(focusFirst = false) {
     if(!current?.user||!menu||busy||transitioning)return;
     menu.hidden=false;avatar.setAttribute('aria-expanded','true');positionMenu();
-    if(menuStatus)menuStatus.textContent=transitionFailed?'Your learning needs attention. Retry the connection before editing.':syncNotice;
+    if(menuStatus)menuStatus.textContent=transitionFailed?t('Your learning needs attention. Retry the connection before editing.'):syncNotice;
     if(focusFirst)menu.querySelector('a')?.focus();
   }
   function render() {
     const user=current?.user;
     if(widget){
       widget.setAttribute('aria-busy',String(busy||transitioning));
-      openButton.hidden=Boolean(user);openButton.textContent=published&&current===null?'Reconnect':'Sign in';avatar.hidden=!user;avatar.disabled=busy||transitioning;
-      if(user){widget.querySelector('[data-auth-initials]').textContent=initials(user.name);widget.querySelector('[data-auth-name]').textContent=user.name||'Learner';avatar.setAttribute('aria-label','Open account menu for '+(user.name||'Learner'));}
+      openButton.hidden=Boolean(user);openButton.textContent=published&&current===null?t('Reconnect'):t('Sign in');avatar.hidden=!user;avatar.disabled=busy||transitioning;
+      if(user){widget.querySelector('[data-auth-initials]').textContent=initials(user.name);widget.querySelector('[data-auth-name]').textContent=user.name||t('Learner');avatar.setAttribute('aria-label',t('Open account menu for {name}',{name:user.name||t('Learner')}));}
       else closeMenu();
       widget.querySelector('[data-auth-signout]').disabled=!user||busy||transitioning;
       widget.querySelector('[data-auth-refresh]').hidden=!transitionFailed;widget.querySelector('[data-auth-refresh]').disabled=busy||transitioning;
@@ -95,7 +150,7 @@
     dialog.querySelector('[data-auth-divider]').hidden=!(capabilities.email&&(capabilities.google||capabilities.github));
     dialog.querySelector('[data-auth-retry]').hidden=!transitionFailed&&Boolean(current?.configured && (capabilities.email||capabilities.google||capabilities.github));
     dialog.querySelector('[data-auth-retry]').disabled=busy||Boolean(inFlight);
-    dialog.querySelector('#cnr-auth-title').textContent=transitionFailed&&user?'Learning needs attention':titles[mode];
+    dialog.querySelector('#cnr-auth-title').textContent=transitionFailed&&user?t('Learning needs attention'):titles[mode];
     forms.forEach(form=>{
       form.hidden=form.dataset.authForm!==mode;
       form.querySelectorAll('input,button').forEach(control=>{control.disabled=busy||transitioning||transitionFailed||!capabilities.email;});
@@ -108,7 +163,7 @@
     // server's answer). Ownership is unchanged, so update the popup without a learning transition.
     if(published&&!actionPending&&!transitionFailed&&next&&current&&current.user===null&&next.user===null&&current.configured===next.configured){
       await transition;current=next;known=true;capabilities={...next.providers};if(next.configured)rememberProviders(next.providers);setHint(false);render();
-      if(dialog?.open&&!busy&&message?.textContent==='Checking sign-in options…')say('');
+      if(dialog?.open&&!busy&&message?.textContent===t('Checking sign-in options…'))say('');
       return clone(current);
     }
     const previousUserId=current?.user?.id||null;
@@ -125,15 +180,15 @@
     if(epoch===stateEpoch){
       transitioning=false;transitionFailed=results.some(result=>result.status==='rejected');render();
       if(transitionFailed){
-        const problem=fault('learning_transition_failed','Your learning could not finish switching. Try connecting again before continuing.');
+        const problem=fault('learning_transition_failed',t('Your learning could not finish switching. Try connecting again before continuing.'));
         say(problem.message,true);if(menuStatus)menuStatus.textContent=problem.message;
         if(dialog)dialog.querySelector('[data-auth-retry]').hidden=false;
         throw problem;
       }
       if(dialog?.open&&!busy){
         if(next?.user)closeDialog(true);
-        else if(!next?.configured)say(next?'Sign-in is unavailable right now. You can keep learning on this device.':'Could not connect to sign-in. Check your connection and try again.',true);
-        else if(message?.textContent==='Checking sign-in options…')say('');
+        else if(!next?.configured)say(next?t('Sign-in is unavailable right now. You can keep learning on this device.'):t('Could not connect to sign-in. Check your connection and try again.'),true);
+        else if(message?.textContent===t('Checking sign-in options…'))say('');
       }
     }
     return clone(current);
@@ -144,33 +199,33 @@
     const results=await Promise.allSettled(waits);
     const failure=results.find(result=>result.status==='rejected');
     if(failure){
-      if(failure.reason?.code==='account_changed')throw fault('account_changed','The signed-in account changed before progress could be saved. Review the current account before trying again.');
-      throw fault('learning_transition_failed',action==='logout'||action==='/api/auth/logout'?'Your latest progress could not be synced. You are still signed in; retry before signing out.':'Your learning could not be kept safely before this account change. Try connecting again, then retry.');
+      if(failure.reason?.code==='account_changed')throw fault('account_changed',t('The signed-in account changed before progress could be saved. Review the current account before trying again.'));
+      throw fault('learning_transition_failed',action==='logout'||action==='/api/auth/logout'?t('Your latest progress could not be synced. You are still signed in; retry before signing out.'):t('Your learning could not be kept safely before this account change. Try connecting again, then retry.'));
     }
   }
   async function readJSON(response) {
-    if(Number(response.headers.get('content-length'))>65536)throw fault('invalid_response','The account response was too large. Please try again.');
+    if(Number(response.headers.get('content-length'))>65536)throw fault('invalid_response',t('The account response was too large. Please try again.'));
     const reader=response.body?.getReader();
-    if(!reader)throw fault('invalid_response','The account service returned an empty response.');
+    if(!reader)throw fault('invalid_response',t('The account service returned an empty response.'));
     const chunks=[];let size=0;
-    try{while(true){const part=await reader.read();if(part.done)break;size+=part.value.byteLength;if(size>65536){await reader.cancel();throw fault('invalid_response','The account response was too large. Please try again.');}chunks.push(part.value);}}
+    try{while(true){const part=await reader.read();if(part.done)break;size+=part.value.byteLength;if(size>65536){await reader.cancel();throw fault('invalid_response',t('The account response was too large. Please try again.'));}chunks.push(part.value);}}
     finally{reader.releaseLock();}
     const bytes=new Uint8Array(size);let offset=0;chunks.forEach(chunk=>{bytes.set(chunk,offset);offset+=chunk.byteLength;});
-    try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch(_){throw fault('invalid_response','The account service returned an unreadable response. Please try again.');}
+    try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch(_){throw fault('invalid_response',t('The account service returned an unreadable response. Please try again.'));}
   }
   function responseError(response, value) {
     const code=object(value)&&typeof value.error==='string'?value.error:'';
     const texts={
-      invalid_credentials:'Email or password was not accepted. If you just registered, verify your email first.',
-      invalid_email:'Enter a valid email address.', invalid_name:'Use a display name of 1–100 characters.',
-      password_policy:'Use a password with 15–128 characters. Spaces are kept.',
-      account_changed:'The signed-in account changed. Review the current account before trying again.',
-      authentication_required:'Your sign-in has ended. Please sign in again.',
-      csrf_failed:'Your sign-in changed. Refresh the connection and try again.',
-      password_service_busy:'Sign-in is busy right now. Please try again in a moment.',
-      rate_limited:'Please wait a little before trying again.',
+      invalid_credentials:t('Email or password was not accepted. If you just registered, verify your email first.'),
+      invalid_email:t('Enter a valid email address.'), invalid_name:t('Use a display name of 1–100 characters.'),
+      password_policy:t('Use a password with 15–128 characters. Spaces are kept.'),
+      account_changed:t('The signed-in account changed. Review the current account before trying again.'),
+      authentication_required:t('Your sign-in has ended. Please sign in again.'),
+      csrf_failed:t('Your sign-in changed. Refresh the connection and try again.'),
+      password_service_busy:t('Sign-in is busy right now. Please try again in a moment.'),
+      rate_limited:t('Please wait a little before trying again.'),
     };
-    return fault(code||'unavailable',texts[code]||(response.status===429?texts.rate_limited:'Sign-in is unavailable right now. Please try again later.'));
+    return fault(code||'unavailable',texts[code]||(response.status===429?texts.rate_limited:t('Sign-in is unavailable right now. Please try again later.')));
   }
   async function request(url,method='GET',body,identity,signal) {
     const controller=new AbortController();
@@ -181,7 +236,7 @@
     try{
       const response=await fetch(url,{method,headers,credentials:'same-origin',cache:'no-store',redirect:'error',signal:controller.signal,...(body===undefined?{}:{body:JSON.stringify(body)})});
       const value=await readJSON(response);if(!response.ok)throw responseError(response,value);return value;
-    }catch(error){if(error.code)throw error;throw fault('offline','Could not connect to sign-in. Check your connection and try again.');}
+    }catch(error){if(error.code)throw error;throw fault('offline',t('Could not connect to sign-in. Check your connection and try again.'));}
     finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);}
   }
   function invalidateRefresh() {requestEpoch++;refreshController?.abort();inFlight=null;refreshController=null;}
@@ -193,11 +248,11 @@
     const promise=(async()=>{
       try{
         const value=validate(await request('/api/auth/session','GET',undefined,undefined,controller.signal));
-        if(epoch!==requestEpoch)throw fault('superseded','A newer account action replaced this connection check.');
+        if(epoch!==requestEpoch)throw fault('superseded',t('A newer account action replaced this connection check.'));
         answered=true;
         return await accept(value,reason);
       }catch(error){
-        if(epoch!==requestEpoch)throw fault('superseded','A newer account action replaced this connection check.');
+        if(epoch!==requestEpoch)throw fault('superseded',t('A newer account action replaced this connection check.'));
         if(error.code==='learning_transition_failed')throw error;
         await accept(null,'unavailable');
         if(dialog?.open){say(error.message,true);dialog.querySelector('[data-auth-retry]').hidden=false;}
@@ -218,7 +273,7 @@
     if(!dialog)return;
     if(current?.user){openMenu(true);return;}
     closeMenu();returnFocus=trigger;mode=titles[next]?next:'login';clearPasswords();render();
-    say(transitionFailed?'Your learning could not finish switching. Try connecting again before continuing.':current?.configured?'':known?'Sign-in is unavailable right now. You can keep learning on this device.':'Checking sign-in options…',transitionFailed);
+    say(transitionFailed?t('Your learning could not finish switching. Try connecting again before continuing.'):current?.configured?'':known?t('Sign-in is unavailable right now. You can keep learning on this device.'):t('Checking sign-in options…'),transitionFailed);
     if(!dialog.open)dialog.showModal();
     const field=capabilities.email?forms.find(form=>form.dataset.authForm===mode)?.querySelector('input'):dialog.querySelector('[data-auth-close]');field?.focus();
     // Opening a dialog reuses the initial/ongoing check and only refreshes stale discovery.
@@ -227,23 +282,23 @@
   async function perform(form) {
     if(busy||transitioning||transitionFailed||!capabilities.email||!form.reportValidity())return;
     const kind=form.dataset.authForm,fields=Object.fromEntries(new FormData(form));
-    if(kind==='register' && (Array.from(fields.password).length<15 || Array.from(fields.password).length>128 || fields.password.includes('\0'))){say('Use a password with 15–128 characters. Spaces are kept.',true);form.elements.password.focus();return;}
-    if(kind==='register' && (!fields.name.trim() || /[\u0000-\u001f\u007f]/.test(fields.name))){say('Use a display name of 1–100 characters.',true);form.elements.name.focus();return;}
+    if(kind==='register' && (Array.from(fields.password).length<15 || Array.from(fields.password).length>128 || fields.password.includes('\0'))){say(t('Use a password with 15–128 characters. Spaces are kept.'),true);form.elements.password.focus();return;}
+    if(kind==='register' && (!fields.name.trim() || /[\u0000-\u001f\u007f]/.test(fields.name))){say(t('Use a display name of 1–100 characters.'),true);form.elements.name.focus();return;}
     const routes={login:'/api/auth/login',register:'/api/auth/register',forgot:'/api/auth/forgot-password',resend:'/api/auth/resend-verification'};
     const body=kind==='register'?{name:fields.name.trim(),email:fields.email.trim(),password:fields.password}:kind==='login'?{email:fields.email.trim(),password:fields.password}:{email:fields.email.trim()};
-    busy=true;clearPasswords();say(kind==='login'?'Signing in…':'Sending your request…');render();
+    busy=true;clearPasswords();say(kind==='login'?t('Signing in…'):t('Sending your request…'));render();
     if(kind==='login')invalidateRefresh();
     const operation=(async()=>{
       try{
         if(kind==='login')await beforeAction('login');
         const result=await request(routes[kind],'POST',body);
-        if(!object(result)||result.ok!==true)throw fault('invalid_response','The sign-in response could not be verified. Please try again.');
+        if(!object(result)||result.ok!==true)throw fault('invalid_response',t('The sign-in response could not be verified. Please try again.'));
         if(kind==='login'){
           const next=await fetchSession({force:true,reason:'login'});
-          if(!next?.user)throw fault('authentication_required','Sign-in could not be confirmed. Please try again.');
+          if(!next?.user)throw fault('authentication_required',t('Sign-in could not be confirmed. Please try again.'));
           if(dialog?.open)closeDialog(true);
-        }else if(kind==='register')say('If this address can be registered, a verification email will arrive shortly. Verify it before signing in.');
-        else say(kind==='forgot'?'If this address has an eligible account, a password reset email will arrive shortly.':'If this address needs verification, a verification email will arrive shortly.');
+        }else if(kind==='register')say(t('If this address can be registered, a verification email will arrive shortly. Verify it before signing in.'));
+        else say(kind==='forgot'?t('If this address has an eligible account, a password reset email will arrive shortly.'):t('If this address needs verification, a verification email will arrive shortly.'));
       }catch(error){
         say(error.message,true);
         if(kind==='login'&&error.code!=='learning_transition_failed'){try{await fetchSession({force:true,reason:'login-failed'});}catch(_){} }
@@ -255,19 +310,19 @@
     try{await operation;}catch(_){}finally{if(mutation===operation)mutation=null;}
   }
   async function signOut() {
-    if(mutation||busy)throw fault('busy','Please wait for the current account request.');
+    if(mutation||busy)throw fault('busy',t('Please wait for the current account request.'));
     const expected=current?.user?.id;
-    if(!current)throw fault('offline','Reconnect to confirm the current account before signing out.');
+    if(!current)throw fault('offline',t('Reconnect to confirm the current account before signing out.'));
     if(!expected)return clone(current);
-    busy=true;render();if(menuStatus)menuStatus.textContent='Signing out…';
+    busy=true;render();if(menuStatus)menuStatus.textContent=t('Signing out…');
     const operation=(async()=>{
       try{
         const verified=await fetchSession({force:true});
-        if(!verified?.user || verified.user.id!==expected)throw fault('account_changed','The signed-in account changed. Review the current account before trying again.');
+        if(!verified?.user || verified.user.id!==expected)throw fault('account_changed',t('The signed-in account changed. Review the current account before trying again.'));
         await beforeAction('logout');
         invalidateRefresh();
         const result=await request('/api/auth/logout','POST',{},verified);
-        if(!object(result)||result.ok!==true)throw fault('invalid_response','Sign-out could not be confirmed. Please try again.');
+        if(!object(result)||result.ok!==true)throw fault('invalid_response',t('Sign-out could not be confirmed. Please try again.'));
         const next=await fetchSession({force:true,reason:'logout'});
         closeMenu();return next;
       }catch(error){if(menuStatus)menuStatus.textContent=error.message;if(error.code==='offline'){await accept(null,'unavailable');}if(error.code==='learning_transition_failed'){transitionFailed=true;render();}if(['account_changed','authentication_required','csrf_failed'].includes(error.code)){try{await fetchSession({force:true});}catch(_){} }throw error;}
@@ -289,7 +344,7 @@
     avatar.addEventListener('click',()=>menu.hidden?openMenu():closeMenu());
     avatar.addEventListener('keydown',event=>{if(event.key==='ArrowDown'){event.preventDefault();openMenu(true);}});
     widget.querySelector('[data-auth-signout]').addEventListener('click',()=>{signOut().catch(()=>{});});
-    widget.querySelector('[data-auth-refresh]').addEventListener('click',()=>{if(menuStatus)menuStatus.textContent='Reconnecting…';refresh({force:true}).catch(error=>{if(menuStatus)menuStatus.textContent=error.message;});});
+    widget.querySelector('[data-auth-refresh]').addEventListener('click',()=>{if(menuStatus)menuStatus.textContent=t('Reconnecting…');refresh({force:true}).catch(error=>{if(menuStatus)menuStatus.textContent=error.message;});});
     menu.querySelectorAll('a').forEach(link=>link.addEventListener('click',()=>closeMenu()));
     document.addEventListener('focusin',event=>{if(!menu.hidden&&!menu.contains(event.target)&&event.target!==avatar)closeMenu();});
     document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!menu.hidden&&!dialog.open){event.preventDefault();closeMenu(true);}});
@@ -303,15 +358,15 @@
     dialog.querySelectorAll('[data-auth-mode]').forEach(button=>button.addEventListener('click',()=>modeChanged(button.dataset.authMode)));
     dialog.querySelector('[data-auth-github]').addEventListener('click',event=>{
       event.preventDefault();if(busy||transitioning||transitionFailed||!capabilities.github)return;
-      busy=true;clearPasswords();render();say('Opening GitHub sign-in…');
+      busy=true;clearPasswords();render();say(t('Opening GitHub sign-in…'));
       beforeAction('github').then(()=>location.assign('/api/auth/github')).catch(error=>{busy=false;transitionFailed=true;say(error.message,true);render();});
     });
     dialog.querySelector('[data-auth-google]').addEventListener('click',event=>{
       event.preventDefault();if(busy||transitioning||transitionFailed||!capabilities.google)return;
-      busy=true;clearPasswords();render();say('Opening Google sign-in…');
+      busy=true;clearPasswords();render();say(t('Opening Google sign-in…'));
       beforeAction('google').then(()=>location.assign('/api/auth/google')).catch(error=>{busy=false;transitionFailed=true;say(error.message,true);render();});
     });
-    dialog.querySelector('[data-auth-retry]').addEventListener('click',()=>{say('Checking sign-in options…');refresh({force:true}).then(next=>{say(next?.configured?'':'Sign-in is unavailable right now. You can keep learning on this device.');}).catch(()=>{});});
+    dialog.querySelector('[data-auth-retry]').addEventListener('click',()=>{say(t('Checking sign-in options…'));refresh({force:true}).then(next=>{say(next?.configured?'':t('Sign-in is unavailable right now. You can keep learning on this device.'));}).catch(()=>{});});
     forms.forEach(form=>form.addEventListener('submit',event=>{event.preventDefault();perform(form);}));
     window.addEventListener('resize',positionMenu,{passive:true});window.addEventListener('scroll',()=>closeMenu(),{passive:true});
     render();
@@ -334,8 +389,8 @@
     }
     function later(ms,text){clearTimeout(timer);timer=setTimeout(()=>{if(document.visibilityState!=='visible'){document.addEventListener('visibilitychange',()=>later(1500,text),{once:true});return;}
       initial.then(()=>eligible()&&!answered?fetchSession({force:true,reason:'invite'}):null).then(()=>show(text)).catch(()=>{});},ms);}
-    if(pages>=2)later(delay,'Create a free account to keep your progress, bookmarks and solved problems on every device. You can keep learning without one.');
-    window.addEventListener('cnr:learning-updated',event=>{if(event.detail?.persistent&&!current?.user)later(1500,'Saved on this device. Sign in to keep your progress on every device, or close this to keep going as a guest.');});
+    if(pages>=2)later(delay,t('Create a free account to keep your progress, bookmarks and solved problems on every device. You can keep learning without one.'));
+    window.addEventListener('cnr:learning-updated',event=>{if(event.detail?.persistent&&!current?.user)later(1500,t('Saved on this device. Sign in to keep your progress on every device, or close this to keep going as a guest.'));});
     dialog.addEventListener('close',()=>{
       if(!invited)return;invited=false;
       if(current?.user)return;
@@ -353,8 +408,8 @@
     gsiPromise=new Promise((resolve,reject)=>{
       if(window.google?.accounts?.id)return resolve(window.google.accounts.id);
       const script=document.createElement('script');script.src='https://accounts.google.com/gsi/client';script.async=true;script.defer=true;
-      script.onload=()=>window.google?.accounts?.id?resolve(window.google.accounts.id):reject(fault('gsi_unavailable','Google sign-in did not load.'));
-      script.onerror=()=>reject(fault('gsi_unavailable','Google sign-in did not load.'));
+      script.onload=()=>window.google?.accounts?.id?resolve(window.google.accounts.id):reject(fault('gsi_unavailable',t('Google sign-in did not load.')));
+      script.onerror=()=>reject(fault('gsi_unavailable',t('Google sign-in did not load.')));
       document.head.appendChild(script);
     }).catch(error=>{gsiPromise=null;throw error;});
     return gsiPromise;
@@ -370,14 +425,14 @@
   }
   async function gsiCredential(credentialResponse){
     if(gsiBusy||busy||transitioning||transitionFailed||!object(credentialResponse)||typeof credentialResponse.credential!=='string')return;
-    gsiBusy=true;busy=true;clearPasswords();render();if(dialog?.open)say('Signing in with Google…');
+    gsiBusy=true;busy=true;clearPasswords();render();if(dialog?.open)say(t('Signing in with Google…'));
     try{
       invalidateRefresh();
       await beforeAction('google');
       const result=await request('/api/auth/google/credential','POST',{credential:credentialResponse.credential,nonce:gsiNonceValue()});
-      if(!object(result)||result.ok!==true)throw fault('invalid_response','Google sign-in could not be verified. Please try again.');
+      if(!object(result)||result.ok!==true)throw fault('invalid_response',t('Google sign-in could not be verified. Please try again.'));
       const next=await fetchSession({force:true,reason:'login'});
-      if(!next?.user)throw fault('authentication_required','Sign-in could not be confirmed. Please try again.');
+      if(!next?.user)throw fault('authentication_required',t('Sign-in could not be confirmed. Please try again.'));
       if(dialog?.open)closeDialog(true);
     }catch(error){
       if(dialog?.open)say(error.message,true);
@@ -403,7 +458,7 @@
     gsiInit().then(id=>{
       if(gsiButton||!dialog.open)return;
       box.hidden=false;
-      id.renderButton(box,{type:'standard',theme:'outline',size:'large',text:'continue_with',shape:'pill',logo_alignment:'left',width:Math.min(400,Math.max(200,Math.round(box.clientWidth||320)))});
+      id.renderButton(box,{type:'standard',theme:'outline',size:'large',text:'continue_with',shape:'pill',logo_alignment:'left',...(isZh?{locale:'zh_CN'}:{}),width:Math.min(400,Math.max(200,Math.round(box.clientWidth||320)))});
       gsiButton=!!box.childElementCount;
       if(!gsiButton)box.hidden=true;
       render();
@@ -421,7 +476,7 @@
   window.addEventListener('focus',checkCurrentSession);
   window.addEventListener('online',()=>{if(document.visibilityState==='visible'&&!mutation&&!actionPending&&(hinted()||current?.user||current===null))refresh({force:current===null}).catch(()=>{});});
   document.addEventListener('visibilitychange',checkCurrentSession);
-  window.addEventListener('pageshow',event=>{if(event.persisted){busy=false;actionPending=true;invalidateRefresh();closeMenu();if(dialog?.open)say('Checking sign-in options…');render();refresh({force:true,reason:'return'}).catch(()=>{});}});
+  window.addEventListener('pageshow',event=>{if(event.persisted){busy=false;actionPending=true;invalidateRefresh();closeMenu();if(dialog?.open)say(t('Checking sign-in options…'));render();refresh({force:true,reason:'return'}).catch(()=>{});}});
   // No interval, localStorage token, or per-keystroke request. One deduplicated
   // initial discovery; focus/visibility checks are throttled for 30 seconds.
   // A recovered network immediately retries an unknown/failed session check.

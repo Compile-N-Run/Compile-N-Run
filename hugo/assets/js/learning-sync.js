@@ -2,6 +2,47 @@
  * IndexedDB partitions isolate guest and account data. No credential is stored. */
 (function () {
   'use strict';
+  // UI strings keyed by their English source text; English pages use the key itself (shared with 代码酷, lang="zh-Hans").
+  var ZH = {
+    'Account connection unavailable. Your existing browser workspace is preserved.': '账户连接不可用，浏览器中的现有学习空间已保留。',
+    'Account learning could not be saved on this device.': '无法在此设备上保存账户学习记录。',
+    'Close older site tabs and retry opening account learning.': '请关闭本站较早打开的标签页，然后重新打开账户学习记录。',
+    'Combining changes from another device…': '正在合并来自其他设备的更改…',
+    'Device storage is full or unavailable.': '设备存储已满或不可用。',
+    'Device storage is unavailable.': '设备存储不可用。',
+    'Device storage is unavailable. Account learning is paused to protect existing data.': '设备存储不可用。为保护现有数据，账户学习同步已暂停。',
+    'Guest progress stays in this browser; signed-in progress syncs across devices.': '访客进度只保存在此浏览器中；登录后进度会在多台设备间同步。',
+    'Latest progress could not be synced. You are still signed in, and your changes remain on this device. Reconnect or reduce large drafts, then retry.': '最新进度无法同步。你仍处于登录状态，更改保留在此设备上。请重新连接或精简较大的草稿后重试。',
+    'Learning could not be saved safely. Your account has not been left.': '学习记录无法安全保存，尚未退出账户。',
+    'Learning could not switch safely. Your previous data is preserved. Download a backup or free device storage, then retry.': '学习记录无法安全切换，之前的数据已保留。请下载备份或释放设备存储空间后重试。',
+    'Learning is kept on this device, but the sync queue could not be updated. Keep this tab open and download a backup.': '学习记录已保存在此设备上，但同步队列无法更新。请保持此标签页打开并下载备份。',
+    'Learning ownership could not be established.': '无法确定学习记录的归属。',
+    'Loading your learning…': '正在加载学习记录…',
+    'Offline or storage unavailable. Your changes are kept here and sync will retry.': '当前离线或存储不可用。更改已保存在这里，稍后会重试同步。',
+    'Offline. Learning stays in its existing browser workspace until your account connection returns.': '当前离线。账户连接恢复前，学习记录会保留在浏览器现有的学习空间中。',
+    'Offline. Your existing workspace and changes are kept on this device.': '当前离线。现有学习空间和更改已保存在此设备上。',
+    'Progress is up to date.': '进度已是最新。',
+    'Progress saved to your account.': '进度已保存到你的账户。',
+    'Reconnect your account to continue syncing. Your changes are kept on this device.': '请重新连接账户以继续同步。更改已保存在此设备上。',
+    'Saved account learning could not be read safely. Nothing was overwritten; your browser copy is preserved.': '无法安全读取账户中保存的学习记录。没有任何数据被覆盖，浏览器中的副本已保留。',
+    'Saved learning needs recovery before an account can open.': '已保存的学习记录需要先恢复，才能打开账户。',
+    'Saving your latest changes…': '正在保存最新更改…',
+    'Saving your latest progress before leaving this account…': '退出此账户前，正在保存最新进度…',
+    'Saving your progress…': '正在保存进度…',
+    'Sync will retry shortly. Your changes are kept on this device.': '稍后将重试同步。更改已保存在此设备上。',
+    'Syncing your progress…': '正在同步进度…',
+    'The account changed before progress could be saved.': '进度保存前账户已发生变化。',
+    'The account identity is invalid.': '账户身份无效。',
+    'The account’s saved device copy needs recovery.': '该账户在此设备上保存的副本需要恢复。',
+    'The saved learning owner is unreadable.': '无法读取已保存的学习记录归属。',
+    'This browser cannot safely coordinate account learning. Your local data has not been replaced.': '此浏览器无法安全协调账户学习记录，本地数据未被替换。',
+    'This data needs recovery before it can be exported. Existing device copies have not been replaced.': '这些数据需要先恢复才能导出，设备上的现有副本未被替换。',
+    'This learning collection is too large to sync. Your changes are kept here; download a backup and reduce large playground drafts.': '学习数据太大，无法同步。更改已保存在这里；请下载备份并精简较大的练习场草稿。',
+    'Your edit is kept for this workspace, but device storage could not finish updating. Keep this page open and download a recovery copy.': '你的修改已保留在此学习空间中，但设备存储未能完成更新。请保持此页面打开并下载恢复副本。',
+    'Your learning needs recovery before it can be queued safely. Download a copy before leaving.': '学习记录需要先恢复，才能安全加入同步队列。离开前请下载一份副本。'
+  };
+  var isZh = /^zh/i.test(document.documentElement.lang);
+  function t(text, vars) { var out = isZh && ZH[text] !== undefined ? ZH[text] : text; return vars ? out.replace(/\{(\w+)\}/g, function (m, k) { return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m; }) : out; }
   if (!window.CNR_SYNC_ENABLED || !window.CNRLearning) return;
   var api = window.CNRLearning, OWNER = 'cnr_learning_owner_v1', TRANSITION = 'cnr_learning_transition_v1';
   var CLOUD_LIMIT = 1800000, LOCK = 'cnr-learning-state', dbPromise;
@@ -9,7 +50,7 @@
   var timer = null, controller = null, lastAttempt = 0, backoff = 0, nextAllowedAttempt = 0, localQueue = Promise.resolve(), running = null;
   var authObserved = false, efficientSync = false, refreshRequired = false;
   var REFRESH_INTERVAL = 300000;
-  var status = { state: 'loading', message: 'Loading your learning…' }, lastView = null;
+  var status = { state: 'loading', message: t('Loading your learning…') }, lastView = null;
   function empty() { return { format: 'cnr-learning-backup', version: 1, exportedAt: new Date().toISOString(), progress: { v: 1, done: {}, tuts: {} }, learning: { v: 1, lessons: {} }, playground: { version: 1, drafts: {} } }; }
   function copy(value) { return JSON.parse(JSON.stringify(value)); }
   function stable(value) { if (Array.isArray(value)) return '[' + value.map(stable).join(',') + ']'; if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(function (k) { return JSON.stringify(k) + ':' + stable(value[k]); }).join(',') + '}'; return JSON.stringify(value); }
@@ -17,8 +58,8 @@
   function equal(a, b) { return stable(a) === stable(b); }
   function union() { var out = new Set(); Array.from(arguments).forEach(function (o) { Object.keys(o || {}).forEach(function (k) { out.add(k); }); }); return Array.from(out); }
   function normal(value) { var clean = api.validateBackup(JSON.stringify(value)); return { format: 'cnr-learning-backup', version: 1, exportedAt: value.exportedAt || new Date().toISOString(), progress: clean.progress, learning: clean.learning, playground: clean.playground }; }
-  function marker() { var raw = localStorage.getItem(OWNER); if (!raw) return null; var value = JSON.parse(raw); if (!value || value.v !== 1 || typeof value.owner !== 'string' || !/^(guest|user:[A-Za-z0-9_-]{1,200})$/.test(value.owner)) throw new Error('The saved learning owner is unreadable.'); return value.owner; }
-  function sessionOwner(value) { if (!value) return null; if (!value.user) return 'guest'; if (!/^[A-Za-z0-9_-]{1,200}$/.test(value.user.id || '')) throw new Error('The account identity is invalid.'); return 'user:' + value.user.id; }
+  function marker() { var raw = localStorage.getItem(OWNER); if (!raw) return null; var value = JSON.parse(raw); if (!value || value.v !== 1 || typeof value.owner !== 'string' || !/^(guest|user:[A-Za-z0-9_-]{1,200})$/.test(value.owner)) throw new Error(t('The saved learning owner is unreadable.')); return value.owner; }
+  function sessionOwner(value) { if (!value) return null; if (!value.user) return 'guest'; if (!/^[A-Za-z0-9_-]{1,200}$/.test(value.user.id || '')) throw new Error(t('The account identity is invalid.')); return 'user:' + value.user.id; }
   function mayWrite() {
     try { return ready && !phase && !draining && owner === marker() && !localStorage.getItem(TRANSITION) && (!auth || sessionOwner(auth) === owner); } catch (_) { return false; }
   }
@@ -37,18 +78,18 @@
       var request = indexedDB.open('cnr-learning-sync-v1', 1);
       request.onupgradeneeded = function () { request.result.createObjectStore('state'); };
       request.onsuccess = function () { resolve(request.result); };
-      request.onerror = function () { reject(new Error('Account learning could not be saved on this device.')); };
-      request.onblocked = function () { reject(new Error('Close older site tabs and retry opening account learning.')); };
+      request.onerror = function () { reject(new Error(t('Account learning could not be saved on this device.'))); };
+      request.onblocked = function () { reject(new Error(t('Close older site tabs and retry opening account learning.'))); };
     });
     return dbPromise;
   }
   async function dbGet(key) { var db = await database(); return new Promise(function (resolve, reject) { var tx = db.transaction('state', 'readonly'), request = tx.objectStore('state').get(key); request.onsuccess = function () { resolve(request.result); }; request.onerror = function () { reject(request.error); }; }); }
-  async function dbPut(key, value) { var db = await database(); return new Promise(function (resolve, reject) { var tx = db.transaction('state', 'readwrite'); tx.objectStore('state').put(value, key); tx.oncomplete = resolve; tx.onerror = tx.onabort = function () { reject(tx.error || new Error('Device storage is full or unavailable.')); }; }); }
-  async function dbRemove(key) { var db = await database(); return new Promise(function (resolve, reject) { var tx = db.transaction('state', 'readwrite'); tx.objectStore('state').delete(key); tx.oncomplete = resolve; tx.onerror = tx.onabort = function () { reject(tx.error || new Error('Device storage is unavailable.')); }; }); }
-  function locked(fn) { if (!navigator.locks) return Promise.reject(new Error('This browser cannot safely coordinate account learning. Your local data has not been replaced.')); return navigator.locks.request(LOCK, fn); }
+  async function dbPut(key, value) { var db = await database(); return new Promise(function (resolve, reject) { var tx = db.transaction('state', 'readwrite'); tx.objectStore('state').put(value, key); tx.oncomplete = resolve; tx.onerror = tx.onabort = function () { reject(tx.error || new Error(t('Device storage is full or unavailable.'))); }; }); }
+  async function dbRemove(key) { var db = await database(); return new Promise(function (resolve, reject) { var tx = db.transaction('state', 'readwrite'); tx.objectStore('state').delete(key); tx.oncomplete = resolve; tx.onerror = tx.onabort = function () { reject(tx.error || new Error(t('Device storage is unavailable.'))); }; }); }
+  function locked(fn) { if (!navigator.locks) return Promise.reject(new Error(t('This browser cannot safely coordinate account learning. Your local data has not been replaced.'))); return navigator.locks.request(LOCK, fn); }
   async function partition(id) {
     var value = await dbGet(id); if (!value) return { v: 1, owner: id, revision: 0, base: empty(), local: empty(), pending: false, detachedBase: null };
-    if (value.v !== 1 || value.owner !== id || !Number.isSafeInteger(value.revision) || value.revision < 0) throw new Error('The account’s saved device copy needs recovery.');
+    if (value.v !== 1 || value.owner !== id || !Number.isSafeInteger(value.revision) || value.revision < 0) throw new Error(t('The account’s saved device copy needs recovery.'));
     value.base = normal(value.base); value.local = normal(value.local); if (value.detachedBase) value.detachedBase = normal(value.detachedBase); return value;
   }
   function select(b, l, r, timestamp) {
@@ -100,7 +141,7 @@
       while (out.playground.drafts[key]) key = stem + '-' + index++;
       out.playground.drafts[key] = copy(d);
     });
-    Object.keys(out.progress.tuts).forEach(function (id) { var t = out.progress.tuts[id]; t.done = Math.min(t.total, Object.keys(out.progress.done).filter(function (p) { return p.indexOf('/docs/' + id + '/') === 0; }).length); });
+    Object.keys(out.progress.tuts).forEach(function (id) { var tut = out.progress.tuts[id]; tut.done = Math.min(tut.total, Object.keys(out.progress.done).filter(function (p) { return p.indexOf('/docs/' + id + '/') === 0; }).length); });
     return normal(out);
   }
   function changes(before, after) {
@@ -140,7 +181,7 @@
   async function recoverWorking() {
     var recover = await dbGet('recovery');
     if (recover) {
-      if (recover.v !== 1 || !/^(guest|user:[A-Za-z0-9_-]{1,200})$/.test(recover.owner)) throw new Error('Saved learning needs recovery before an account can open.');
+      if (recover.v !== 1 || !/^(guest|user:[A-Za-z0-9_-]{1,200})$/.test(recover.owner)) throw new Error(t('Saved learning needs recovery before an account can open.'));
       applying = true;
       try { api.replaceSnapshot(normal(recover.data), { ownerChange: true }); localStorage.setItem(OWNER, JSON.stringify({ v: 1, owner: recover.owner })); }
       finally { applying = false; }
@@ -164,7 +205,7 @@
   async function transition(value) {
     if (ready && !phase && marker() === owner && (!value || sessionOwner(value) === owner)) {
       auth = value; cancel(); if (value && value.user && lastSyncError && lastSyncError.status !== 429) { nextAllowedAttempt = 0; backoff = 0; } renderGuard();
-      if (value && value.user) schedule(true); else tell(value ? 'guest' : 'offline', value ? 'Guest progress stays in this browser; signed-in progress syncs across devices.' : 'Offline. Your existing workspace and changes are kept on this device.');
+      if (value && value.user) schedule(true); else tell(value ? 'guest' : 'offline', value ? t('Guest progress stays in this browser; signed-in progress syncs across devices.') : t('Offline. Your existing workspace and changes are kept on this device.'));
       return;
     }
     var previousOwner = owner;
@@ -177,7 +218,7 @@
         var existing = marker(), target = sessionOwner(value) || existing;
         localStorage.setItem(TRANSITION, '1');
         if (owner && owner !== existing) await flushOwner(owner, true);
-        if (!existing) throw new Error('Learning ownership could not be established.');
+        if (!existing) throw new Error(t('Learning ownership could not be established.'));
         var outgoing = await flushOwner(existing, existing === owner), incoming = target === existing ? outgoing : await partition(target);
         await dbPut(target, incoming);
         await install(target, incoming.local, existing, outgoing.local, target !== owner);
@@ -189,11 +230,11 @@
       else window.dispatchEvent(new CustomEvent('cnr:learning-imported'));
       hasActivated = true;
       api.recordVisit();
-      if (!value) tell('offline', 'Offline. Learning stays in its existing browser workspace until your account connection returns.');
-      else if (!value.user) tell('guest', 'Guest progress stays in this browser; signed-in progress syncs across devices.');
-      else { tell('syncing', 'Syncing your progress…'); schedule(true); }
+      if (!value) tell('offline', t('Offline. Learning stays in its existing browser workspace until your account connection returns.'));
+      else if (!value.user) tell('guest', t('Guest progress stays in this browser; signed-in progress syncs across devices.'));
+      else { tell('syncing', t('Syncing your progress…')); schedule(true); }
     } catch (e) {
-      phase = true; ready = false; renderGuard(); tell('error', 'Learning could not switch safely. Your previous data is preserved. Download a backup or free device storage, then retry.'); throw e;
+      phase = true; ready = false; renderGuard(); tell('error', t('Learning could not switch safely. Your previous data is preserved. Download a backup or free device storage, then retry.')); throw e;
     }
   }
   function captureChange(event) {
@@ -201,7 +242,7 @@
     if (applying || !mayWrite()) return;
     var id = owner, ownSnapshot, ancestor;
     try { ownSnapshot = normal(event && event.detail && event.detail.snapshot ? event.detail.snapshot : api.captureSnapshot(false)); ancestor = event && event.detail && event.detail.before ? normal({ ...empty(), ...event.detail.before }) : copy(lastView || ownSnapshot); lastView = copy(ownSnapshot); }
-    catch (_) { tell('error', 'Your learning needs recovery before it can be queued safely. Download a copy before leaving.'); return; }
+    catch (_) { tell('error', t('Your learning needs recovery before it can be queued safely. Download a copy before leaving.')); return; }
     // Capture this tab's delta synchronously. Reading only disk in the later task
     // loses an already-applied edit when another tab wins a localStorage RMW race.
     localQueue = localQueue.catch(function () {}).then(function () { return locked(async function () {
@@ -216,8 +257,8 @@
       }
       cached.local = merged; cached.detachedBase = null; cached.pending = signature(merged) !== signature(cached.base); await dbPut(id, cached);
       if (owner === id && marker() === id) lastView = normal(api.captureSnapshot(false));
-    }); }).catch(function () { tell('error', 'Learning is kept on this device, but the sync queue could not be updated. Keep this tab open and download a backup.'); });
-    if (auth && auth.user) { tell('syncing', 'Saving your progress…'); schedule(false); }
+    }); }).catch(function () { tell('error', t('Learning is kept on this device, but the sync queue could not be updated. Keep this tab open and download a backup.')); });
+    if (auth && auth.user) { tell('syncing', t('Saving your progress…')); schedule(false); }
   }
   function commitMutation(before, after) {
     if (!mayWrite()) return Promise.resolve(false);
@@ -235,9 +276,9 @@
         cached.detachedBase = null; await dbPut(id, cached);
         if (owner === id) lastView = normal(api.captureSnapshot(false));
       }
-      if (auth && auth.user && sessionOwner(auth) === id) { tell('syncing', 'Saving your progress…'); schedule(false); }
+      if (auth && auth.user && sessionOwner(auth) === id) { tell('syncing', t('Saving your progress…')); schedule(false); }
       return true;
-    }); }).catch(function () { tell('error', 'Your edit is kept for this workspace, but device storage could not finish updating. Keep this page open and download a recovery copy.'); return false; });
+    }); }).catch(function () { tell('error', t('Your edit is kept for this workspace, but device storage could not finish updating. Keep this page open and download a recovery copy.')); return false; });
     localQueue = operation.then(function () {}); return operation;
   }
   function commitPlayground(beforeDrafts, afterDrafts) {
@@ -276,7 +317,7 @@
         var optimistic = cached.incremental === true && hasChanges && !refreshRequired;
         if (!hasChanges && cached.protocol2 === true && !forceRead && !refreshRequired &&
             Date.now() - (cached.lastReadAt || 0) < REFRESH_INTERVAL) {
-          tell('saved', 'Progress saved to your account.');
+          tell('saved', t('Progress saved to your account.'));
           schedule(true, REFRESH_INTERVAL - (Date.now() - cached.lastReadAt)); return;
         }
         var remote = optimistic ? { revision: cached.revision, data: cached.base, syncProtocol: 2, incremental: true } :
@@ -306,7 +347,7 @@
         }
         var afterInstall = normal(disk());
         if (signature(afterInstall) !== signature(merged)) { merged = afterInstall; cached.local = afterInstall; cached.pending = signature(afterInstall) !== signature(cached.base); await dbPut(id, cached); }
-        if (!cached.pending) { backoff = 0; nextAllowedAttempt = 0; tell('saved', 'Progress is up to date.'); return; }
+        if (!cached.pending) { backoff = 0; nextAllowedAttempt = 0; tell('saved', t('Progress is up to date.')); return; }
         var raw = JSON.stringify(merged);
         if (new Blob([raw]).size > CLOUD_LIMIT) { var tooLarge = new Error('snapshot_too_large'); tooLarge.status = 413; throw tooLarge; }
         var sent = copy(merged), incremental = remote.syncProtocol === 2 && remote.incremental === true;
@@ -318,18 +359,18 @@
         var latest = normal(disk()); cached = await partition(id); cached.base = sent; cached.revision = result.revision; cached.local = latest; cached.pending = signature(latest) !== signature(sent); cached.detachedBase = null;
         cached.incremental = result.syncProtocol === 2 && result.incremental === true; cached.lastReadAt = Date.now();
         await dbPut(id, cached); backoff = 0; nextAllowedAttempt = 0;
-        tell(cached.pending ? 'syncing' : 'saved', cached.pending ? 'Saving your latest changes…' : 'Progress saved to your account.');
+        tell(cached.pending ? 'syncing' : 'saved', cached.pending ? t('Saving your latest changes…') : t('Progress saved to your account.'));
         if (cached.pending) schedule(false);
       });
     })().catch(function (e) {
       lastSyncError = e;
       if (token !== generation || e.message === 'scope_changed' || e.name === 'AbortError') return;
-      if (e.status === 409 && e.message !== 'account_changed') { refreshRequired = true; tell('syncing', 'Combining changes from another device…'); schedule(false); }
-      else if (e.status === 401 || e.message === 'account_changed' || e.status === 403) { tell('offline', 'Reconnect your account to continue syncing. Your changes are kept on this device.'); setTimeout(function () { if (window.CNRAuth) window.CNRAuth.refresh().catch(function () {}); }, 0); }
-      else if (e.status === 413) tell('error', 'This learning collection is too large to sync. Your changes are kept here; download a backup and reduce large playground drafts.');
-      else if (e.status === 429) { backoff = Math.min(backoff ? backoff * 2 : 30000, 300000); nextAllowedAttempt = Date.now() + backoff; tell('offline', 'Sync will retry shortly. Your changes are kept on this device.'); schedule(false, backoff); }
-      else if (e.message === 'invalid_cloud' || /unsupported|invalid|unsafe|too many|too long/i.test(e.message)) tell('error', 'Saved account learning could not be read safely. Nothing was overwritten; your browser copy is preserved.');
-      else { backoff = Math.min(backoff ? backoff * 2 : 10000, 300000); nextAllowedAttempt = Date.now() + backoff; tell('offline', 'Offline or storage unavailable. Your changes are kept here and sync will retry.'); schedule(false, backoff); }
+      if (e.status === 409 && e.message !== 'account_changed') { refreshRequired = true; tell('syncing', t('Combining changes from another device…')); schedule(false); }
+      else if (e.status === 401 || e.message === 'account_changed' || e.status === 403) { tell('offline', t('Reconnect your account to continue syncing. Your changes are kept on this device.')); setTimeout(function () { if (window.CNRAuth) window.CNRAuth.refresh().catch(function () {}); }, 0); }
+      else if (e.status === 413) tell('error', t('This learning collection is too large to sync. Your changes are kept here; download a backup and reduce large playground drafts.'));
+      else if (e.status === 429) { backoff = Math.min(backoff ? backoff * 2 : 30000, 300000); nextAllowedAttempt = Date.now() + backoff; tell('offline', t('Sync will retry shortly. Your changes are kept on this device.')); schedule(false, backoff); }
+      else if (e.message === 'invalid_cloud' || /unsupported|invalid|unsafe|too many|too long|不支持|无效|不安全|过多|过长/i.test(e.message)) tell('error', t('Saved account learning could not be read safely. Nothing was overwritten; your browser copy is preserved.'));
+      else { backoff = Math.min(backoff ? backoff * 2 : 10000, 300000); nextAllowedAttempt = Date.now() + backoff; tell('offline', t('Offline or storage unavailable. Your changes are kept here and sync will retry.')); schedule(false, backoff); }
     }).finally(function () { running = null; if (token !== generation && mayWrite() && auth && auth.user) schedule(true); });
     return running;
   }
@@ -354,13 +395,13 @@
       await bootPromise; await localQueue; if (running) await running;
       await locked(async function () { if (owner) await flushOwner(owner, true); });
       if (login && login.user) {
-        if (sessionOwner(login) !== owner) { var mismatch = new Error('The account changed before progress could be saved.'); mismatch.code = 'account_changed'; throw mismatch; }
+        if (sessionOwner(login) !== owner) { var mismatch = new Error(t('The account changed before progress could be saved.')); mismatch.code = 'account_changed'; throw mismatch; }
         auth = login;
-        tell('syncing', 'Saving your latest progress before leaving this account…');
+        tell('syncing', t('Saving your latest progress before leaving this account…'));
         await synchronize(); await localQueue;
         var saved = await partition(owner);
         if (saved.pending || signature(currentSnapshot()) !== signature(saved.base)) {
-          var failed = new Error('Latest progress could not be synced. You are still signed in, and your changes remain on this device. Reconnect or reduce large drafts, then retry.');
+          var failed = new Error(t('Latest progress could not be synced. You are still signed in, and your changes remain on this device. Reconnect or reduce large drafts, then retry.'));
           failed.code = lastSyncError && (lastSyncError.status === 401 || lastSyncError.status === 403 || lastSyncError.message === 'account_changed') ? 'account_changed' : 'learning_transition_failed';
           throw failed;
         }
@@ -368,7 +409,7 @@
       phase = true; ready = false; draining = false; renderGuard();
     })().catch(function (e) {
       draining = false; phase = e.code === 'account_changed' ? true : previous.phase; ready = e.code === 'account_changed' ? false : previous.ready; renderGuard();
-      tell('offline', e.message || 'Learning could not be saved safely. Your account has not been left.'); throw e;
+      tell('offline', e.message || t('Learning could not be saved safely. Your account has not been left.')); throw e;
     });
     if (event.detail && event.detail.waitUntil) event.detail.waitUntil(flushing); else flushing.catch(function () {});
   });
@@ -390,9 +431,9 @@
   window.addEventListener('focus', function () { if (auth && auth.user) schedule(true); });
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible' && auth && auth.user) schedule(true); });
   setInterval(function () { if (document.visibilityState === 'visible' && auth && auth.user && mayWrite()) schedule(true); }, REFRESH_INTERVAL);
-  document.querySelectorAll('[data-learning-sync-retry]').forEach(function (b) { b.addEventListener('click', function () { if (window.CNRAuth) window.CNRAuth.refresh({ force: true }).then(function (s) { return transition(s); }).catch(function () { tell('offline', 'Account connection unavailable. Your existing browser workspace is preserved.'); }); }); });
-  document.querySelectorAll('[data-learning-sync-export]').forEach(function (b) { b.addEventListener('click', function () { try { var data = api.captureSnapshot(true), url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' })), a = document.createElement('a'); a.href = url; a.download = 'learning-recovery.json'; a.click(); setTimeout(function () { URL.revokeObjectURL(url); }, 1000); } catch (_) { tell('error', 'This data needs recovery before it can be exported. Existing device copies have not been replaced.'); } }); });
+  document.querySelectorAll('[data-learning-sync-retry]').forEach(function (b) { b.addEventListener('click', function () { if (window.CNRAuth) window.CNRAuth.refresh({ force: true }).then(function (s) { return transition(s); }).catch(function () { tell('offline', t('Account connection unavailable. Your existing browser workspace is preserved.')); }); }); });
+  document.querySelectorAll('[data-learning-sync-export]').forEach(function (b) { b.addEventListener('click', function () { try { var data = api.captureSnapshot(true), url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' })), a = document.createElement('a'); a.href = url; a.download = 'learning-recovery.json'; a.click(); setTimeout(function () { URL.revokeObjectURL(url); }, 1000); } catch (_) { tell('error', t('This data needs recovery before it can be exported. Existing device copies have not been replaced.')); } }); });
   window.CNRLearningSync = Object.freeze({ getStatus: function () { return copy(status); }, commitMutation: commitMutation, commitPlayground: commitPlayground, flush: async function () { await localQueue; if (running) await running; return synchronize(true); }, threeWay: threeWay, getOwner: function () { return owner; } });
   bootPromise.then(function () { if (!authObserved && window.CNRAuth) return window.CNRAuth.ready().then(function (value) { if (!authObserved) return transition(value); }); }).catch(function () {});
-  bootPromise.catch(function () { tell('error', 'Device storage is unavailable. Account learning is paused to protect existing data.'); });
+  bootPromise.catch(function () { tell('error', t('Device storage is unavailable. Account learning is paused to protect existing data.')); });
 })();
