@@ -226,7 +226,9 @@
   function isProblem(p) { return typeof p === 'string' && p.indexOf('/interview/problems/') === 0; }
   function docURL(value, allowCategory) {
     if (typeof value !== 'string' || value.length > 600 || value.indexOf('//') >= 0) return null;
-    if (!/^\/docs\/[A-Za-z0-9_+./-]+\/?$/.test(value) && !/^\/interview\/problems\/[a-z0-9]+(-[a-z0-9]+)*\/?$/.test(value)) return null;
+    // 代码酷 URLs contain Chinese (raw or percent-encoded, in either hex case): compare them in decoded form.
+    if (value.indexOf('%') >= 0) { try { value = decodeURI(value); } catch (_) { return null; } if (value.length > 600 || value.indexOf('//') >= 0) return null; }
+    if (!/^\/docs\/[\p{L}\p{N}\p{M}_+./-]+\/?$/u.test(value) && !/^\/interview\/problems\/[a-z0-9]+(-[a-z0-9]+)*\/?$/.test(value)) return null;
     if (value.split('/').some(function (part) { return part === '.' || part === '..'; }) || (!allowCategory && value.indexOf('/docs/category/') === 0)) return null;
     var normal = value.replace(/\/+$/, '') + '/';
     return normal.length <= 600 ? normal : null;
@@ -802,7 +804,9 @@
     var records = Object.keys(state.learning.lessons).filter(function (p) { return !isProblem(p); }), stats = root.querySelector('[data-learning-summary]'), solved = solvedProblems();
     if (stats) {
       stats.replaceChildren();
-      [[t('Pages read'), Object.keys(state.progress.done).length], [t('Lessons practiced'), records.filter(function (p) { return lessonStatus(p).practiced; }).length], [t('Lessons with a passed check'), records.filter(function (p) { return lessonStatus(p).passed; }).length], [t('Interview problems solved'), solved.length]].forEach(function (pair) {
+      // The interview tile only on dashboards that have an interview section (代码酷 has none).
+      [[t('Pages read'), Object.keys(state.progress.done).length], [t('Lessons practiced'), records.filter(function (p) { return lessonStatus(p).practiced; }).length], [t('Lessons with a passed check'), records.filter(function (p) { return lessonStatus(p).passed; }).length]]
+        .concat(root.querySelector('[data-learning-solved]') ? [[t('Interview problems solved'), solved.length]] : []).forEach(function (pair) {
         var card = el('div', null, 'cnr-learning__stat'); card.appendChild(el('strong', String(pair[1]))); card.appendChild(el('span', pair[0])); stats.appendChild(card);
       });
     }
