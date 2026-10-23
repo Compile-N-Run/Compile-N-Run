@@ -16,6 +16,7 @@ class D1 {
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-github-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-learning-records-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-qr-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -903,7 +904,8 @@ test('WeChat link mode attaches the openid to the signed-in account, refuses one
 test('subscribe gets a welcome, unsubscribe and non-text messages get "success"', async () => {
   enableWechat();
   const welcome = field(await (await wxPush(wxEvent(OPENID_A, 'subscribe'))).text(), 'Content');
-  assert.match(welcome, /代码酷/); assert.match(welcome, /https:\/\/www\.compilenrun\.com/); assert.match(welcome, /6 位验证码/);
+  assert.match(welcome, /代码酷/); assert.match(welcome, /https:\/\/www\.compilenrun\.com/); assert.match(welcome, /微信登录/);
+  assert.doesNotMatch(welcome, /验证码|已登录|过期/, 'a plain follow gets the neutral welcome');
   assert.equal(await (await wxPush(wxEvent(OPENID_A, 'unsubscribe'))).text(), 'success');
   const image = `<xml><ToUserName><![CDATA[${WX_ACCOUNT}]]></ToUserName><FromUserName><![CDATA[${OPENID_A}]]></FromUserName><MsgType><![CDATA[image]]></MsgType></xml>`;
   assert.equal(await (await wxPush(image)).text(), 'success');
@@ -955,4 +957,152 @@ test('encrypted (safe mode) pushes are verified, decrypted, and answered encrypt
     const res = await pushEncrypted(wxText(OPENID_A, 'x'.repeat(extra)));
     assert.equal(res.status, 200, 'padding case ' + extra);
   }
+});
+
+// ---- WeChat scan-to-sign-in (pooled parametric QR tickets) ----
+const POOL_SECRET = 'pool-secret-for-tests-only-0123456789';
+const wxPool = (method, body, secret = POOL_SECRET) => handleAccounts(new Request(SITE + '/api/auth/wechat/pool', {
+  method, headers: { ...(secret === null ? {} : { Authorization: 'Bearer ' + secret }), 'content-type': 'application/json' },
+  ...(body !== undefined ? { body: JSON.stringify(body) } : {}) }), env);
+const scene = n => ('scene' + String(n).padStart(4, '0')).padEnd(32, 'x');
+const poolTicket = (n, seconds = 2592000) => ({ scene: scene(n), ticket: 'gQH47joAAAAAAAAAASxodHRwOi8v+/T' + n + '==', expiresAt: Math.floor(Date.now() / 1000) + seconds });
+const wxScan = (openid, key, event = 'SCAN') => `<xml><ToUserName><![CDATA[${WX_ACCOUNT}]]></ToUserName><FromUserName><![CDATA[${openid}]]></FromUserName><CreateTime>${Math.floor(Date.now() / 1000)}</CreateTime><MsgType><![CDATA[event]]></MsgType><Event><![CDATA[${event}]]></Event><EventKey><![CDATA[${key}]]></EventKey><Ticket><![CDATA[ignored]]></Ticket></xml>`;
+const sceneOf = code => db.sqlite.prepare('SELECT scene FROM cnr_account_wechat_qr WHERE login_code = ?').get(code)?.scene;
+
+test('the QR pool is 404 without WECHAT_POOL_SECRET and needs the bearer secret; uploads are validated and counted', async () => {
+  enableWechat();
+  assert.equal((await wxPool('GET')).status, 404, 'off without the secret');
+  env.WECHAT_POOL_SECRET = POOL_SECRET;
+  assert.equal((await wxPool('GET', undefined, null)).status, 401);
+  assert.equal((await wxPool('GET', undefined, 'wrong')).status, 401);
+  assert.equal((await wxPool('POST', { tickets: [poolTicket(1)] }, POOL_SECRET + 'x')).status, 401);
+  assert.equal((await wxPool('DELETE')).status, 405);
+  assert.deepEqual(await (await wxPool('GET')).json(), { available: 0, expiringSoon: 0 });
+  // No Origin header and no rate limit: AUTH_LIMIT would refuse everything here.
+  env.AUTH_LIMIT = { limit: async () => ({ success: false }) };
+  const uploaded = await wxPool('POST', { tickets: [poolTicket(1), poolTicket(2), poolTicket(3, 3600)] });
+  assert.equal(uploaded.status, 200);
+  assert.deepEqual(await uploaded.json(), { ok: true, inserted: 3, available: 3 });
+  assert.deepEqual(await (await wxPool('POST', { tickets: [poolTicket(1), poolTicket(4, 300)] })).json(), { ok: true, inserted: 1, available: 3 },
+    'duplicates are ignored; a ticket with under 10 minutes left is not available');
+  assert.deepEqual(await (await wxPool('GET')).json(), { available: 3, expiringSoon: 1 });
+  for (const bad of [{ tickets: [{ ...poolTicket(5), scene: 'short' }] }, { tickets: [{ ...poolTicket(5), scene: 'x'.repeat(31) + '!' }] },
+    { tickets: [{ ...poolTicket(5), ticket: 'a'.repeat(513) }] }, { tickets: [{ ...poolTicket(5), ticket: 'has space' }] },
+    { tickets: [{ ...poolTicket(5), expiresAt: 1 }] }, { tickets: [{ ...poolTicket(5), expiresAt: Math.floor(Date.now() / 1000) + 9999999 }] },
+    { tickets: Array.from({ length: 501 }, (_, i) => poolTicket(100 + i)) }, { tickets: 'no' }, {}]) {
+    assert.equal((await wxPool('POST', bad)).status, 400, JSON.stringify(bad).slice(0, 80));
+  }
+  const bulk = await wxPool('POST', { tickets: Array.from({ length: 500 }, (_, i) => poolTicket(1000 + i)) });
+  assert.deepEqual(await bulk.json(), { ok: true, inserted: 500, available: 503 });
+  // Expired rows are removed on upload.
+  db.sqlite.prepare('UPDATE cnr_account_wechat_qr SET expires_at = 5 WHERE scene = ?').run(scene(4));
+  await wxPool('POST', { tickets: [] });
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scene(4)).n, 0);
+});
+
+test('start assigns a pooled ticket (mode scan); SCAN by a follower confirms that login and the ticket is single-use', async () => {
+  enableWechat({ WECHAT_POOL_SECRET: POOL_SECRET });
+  await wxPool('POST', { tickets: [poolTicket(1), poolTicket(2, 1800), poolTicket(3, 600)] });
+  const started = await wxStart();
+  const body = await started.json();
+  assert.equal(body.mode, 'scan');
+  assert.match(body.code, /^\d{6}$/);
+  const assigned = db.sqlite.prepare('SELECT * FROM cnr_account_wechat_qr WHERE login_code = ?').get(body.code);
+  assert.equal(assigned.scene, scene(2), 'the soonest-expiring ticket with at least 15 minutes left');
+  assert(assigned.assigned_at);
+  assert.equal(body.qr, 'https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=' + encodeURIComponent(assigned.ticket));
+  assert.match(body.qr, /%2B%2FT2%3D%3D$/);
+  const binding = cookiePair(started, '__Host-cnr_wx');
+  assert.equal(field(await (await wxPush(wxScan(OPENID_A, 'unknownscene0000000000'))).text(), 'Content'), '二维码已过期，请刷新网页后重新扫码。');
+  assert.deepEqual(await (await wxStatus(body.code, binding)).json(), { status: 'pending' });
+  const pushed = await wxPush(wxScan(OPENID_A, scene(2)));
+  assert.equal(field(await pushed.text(), 'Content'), '登录成功！回到网页即可继续。');
+  assert.equal(field(await (await wxPush(wxScan(OPENID_A, scene(2)))).text(), 'Content'), '登录成功！回到网页即可继续。', 'a retried push gets the same answer');
+  assert.equal(field(await (await wxPush(wxScan(OPENID_B, scene(2)))).text(), 'Content'), '二维码已过期，请刷新网页后重新扫码。', 'another reader cannot take over a confirmed login');
+  const done = await wxStatus(body.code, binding);
+  assert.deepEqual(await done.json(), { status: 'done' });
+  const current = await sessionOf(cookiePair(done, '__Host-cnr_session'));
+  assert.equal(current.user.wechatLinked, true);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scene(2)).n, 0, 'the consumed ticket is deleted');
+  // Scanning the same QR again later cannot confirm anyone else's login.
+  const next = await wxStart();
+  const nextBody = await next.json();
+  assert.equal(sceneOf(nextBody.code), scene(1));
+  assert.equal(field(await (await wxPush(wxScan(OPENID_B, scene(2)))).text(), 'Content'), '二维码已过期，请刷新网页后重新扫码。');
+  assert.deepEqual(await (await wxStatus(nextBody.code, cookiePair(next, '__Host-cnr_wx'))).json(), { status: 'pending' });
+  // The pool now holds only the 10-minute ticket: too short to assign, so the fallback is the chat code.
+  const fallback = await wxStart();
+  const fallbackBody = await fallback.json();
+  assert.equal(fallbackBody.mode, 'code');
+  assert.equal(fallbackBody.qr, undefined);
+  await wxPush(wxText(OPENID_B, fallbackBody.code));
+  assert.deepEqual(await (await wxStatus(fallbackBody.code, cookiePair(fallback, '__Host-cnr_wx'))).json(), { status: 'done' });
+});
+
+test('subscribe with qrscene_ signs a new follower in with a welcome; expired logins and expired tickets are cleaned up', async () => {
+  enableWechat({ WECHAT_POOL_SECRET: POOL_SECRET });
+  await wxPool('POST', { tickets: [poolTicket(1), poolTicket(2)] });
+  const started = await wxStart();
+  const { code, mode } = await started.json();
+  assert.equal(mode, 'scan');
+  const reply = field(await (await wxPush(wxScan(OPENID_A, 'qrscene_' + sceneOf(code), 'subscribe'))).text(), 'Content');
+  assert.match(reply, /^关注成功，网页已登录。/); assert.match(reply, /代码酷/); assert.match(reply, /https:\/\/www\.compilenrun\.com/);
+  const done = await wxStatus(code, cookiePair(started, '__Host-cnr_wx'));
+  assert.deepEqual(await done.json(), { status: 'done' });
+  assert(cookiePair(done, '__Host-cnr_session'));
+  // An unknown scene on subscribe still welcomes the reader, then says the QR expired.
+  const stale = field(await (await wxPush(wxScan(OPENID_B, 'qrscene_' + scene(9), 'subscribe'))).text(), 'Content');
+  assert.match(stale, /欢迎关注代码酷/); assert.match(stale, /二维码已过期/);
+  // An expired login: status reports it and its ticket goes with it.
+  const second = await wxStart();
+  const secondBody = await second.json();
+  const secondScene = sceneOf(secondBody.code);
+  assert(secondScene);
+  db.sqlite.prepare('UPDATE cnr_account_wechat_logins SET expires_at = 1 WHERE code = ?').run(secondBody.code);
+  assert.match(field(await (await wxPush(wxScan(OPENID_B, secondScene))).text(), 'Content'), /二维码已过期/);
+  assert.deepEqual(await (await wxStatus(secondBody.code, cookiePair(second, '__Host-cnr_wx'))).json(), { status: 'expired' });
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr').get().n, 0, 'both used tickets are gone');
+  // Restarting in the same browser drops the previous login and its ticket; an expired ticket is never assigned.
+  await wxPool('POST', { tickets: [poolTicket(3), poolTicket(4)] });
+  const third = await wxStart();
+  const thirdScene = sceneOf((await third.json()).code);
+  const fourth = await wxStart(cookiePair(third, '__Host-cnr_wx'));
+  const fourthBody = await fourth.json();
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(thirdScene).n, 0);
+  assert.equal(fourthBody.mode, 'scan');
+  db.sqlite.prepare('UPDATE cnr_account_wechat_qr SET expires_at = ? WHERE login_code IS NULL').run(Math.floor(Date.now() / 1000) - 1);
+  db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at) VALUES (?, 't', 1, ?)").run(scene(5), Math.floor(Date.now() / 1000) + 899);
+  const fifth = await wxStart();
+  assert.equal((await fifth.json()).mode, 'code', 'expired and nearly expired tickets are skipped');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE expires_at <= ?').get(Math.floor(Date.now() / 1000)).n, 0, 'start sweeps expired tickets');
+});
+
+test('an empty pool keeps the chat-code flow (mode code), and a missing qr table does not break start', async () => {
+  enableWechat({ WECHAT_POOL_SECRET: POOL_SECRET });
+  const started = await wxStart();
+  const body = await started.json();
+  assert.equal(body.mode, 'code');
+  await wxPush(wxText(OPENID_A, body.code));
+  assert.deepEqual(await (await wxStatus(body.code, cookiePair(started, '__Host-cnr_wx'))).json(), { status: 'done' });
+  db.sqlite.exec('DROP TABLE cnr_account_wechat_qr');
+  const unmigrated = await wxStart();
+  assert.equal(unmigrated.status, 200);
+  assert.equal((await unmigrated.json()).mode, 'code');
+});
+
+test('WeChat link mode by scan attaches the openid to the signed-in account', async () => {
+  enableWechat({ WECHAT_POOL_SECRET: POOL_SECRET });
+  await wxPool('POST', { tickets: [poolTicket(1)] });
+  const google = await login('google-user-1');
+  const started = await wxStart(google.cookie);
+  const { code, mode } = await started.json();
+  assert.equal(mode, 'scan');
+  assert.equal(db.sqlite.prepare('SELECT user_id FROM cnr_account_wechat_logins WHERE code = ?').get(code).user_id, google.user.id);
+  assert.equal(field(await (await wxPush(wxScan(OPENID_A, sceneOf(code)))).text(), 'Content'), '登录成功！回到网页即可继续。');
+  const linked = await wxStatus(code, [cookiePair(started, '__Host-cnr_wx'), google.cookie].join('; '));
+  assert.deepEqual(await linked.json(), { status: 'linked' });
+  const both = await sessionOf(google.cookie);
+  assert.deepEqual([both.user.googleLinked, both.user.wechatLinked], [true, true]);
+  assert.equal(db.sqlite.prepare('SELECT user_id FROM cnr_account_wechat_identities WHERE wechat_openid = ?').get(OPENID_A).user_id, google.user.id);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr').get().n, 0);
 });

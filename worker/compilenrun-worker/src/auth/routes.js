@@ -1,7 +1,7 @@
 import { EMAIL_ROUTES, PUBLIC_EMAIL_ROUTES, handleEmailAccount } from '../email-accounts.js';
 import { limitedJSON } from '../lib/body.js';
 import { handleLearning } from '../learning/routes.js';
-import { WECHAT_ROUTES, WECHAT_START, WECHAT_EVENTS, WECHAT_STATUS, handleWechatEvents, startWechatLogin, wechatLoginStatus } from './wechat.js';
+import { WECHAT_ROUTES, WECHAT_START, WECHAT_EVENTS, WECHAT_STATUS, WECHAT_POOL, handleWechatEvents, handleWechatPool, wechatPoolConfigured, startWechatLogin, wechatLoginStatus } from './wechat.js';
 import { siteOrigin, PROVIDERS, OAUTH_PROVIDERS, wechatConfigured, wechatEventsReady, GOOGLE_CREDENTIAL_ROUTE, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
 const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/account', '/api/learning', GOOGLE_CREDENTIAL_ROUTE, ...Object.keys(EMAIL_ROUTES),
   ...Object.keys(WECHAT_ROUTES), ...OAUTH_PROVIDERS.flatMap(p => [p.start, p.link, p.callback]), PROVIDERS.wechat.link]);
@@ -16,6 +16,13 @@ export async function handleAccounts(request, env, ctx) {
     if (!['GET', 'POST'].includes(request.method)) return response(405, { error: 'method_not_allowed' });
     if (!wechatEventsReady(env)) return response(404, { error: 'not_found' });
     try { return await handleWechatEvents(request, env); } catch (_) { return new Response('success', { headers: { 'content-type': 'text/plain' } }); }
+  }
+  // The QR ticket generator (tools/wechat_qr_pool.py) is a server, not a page: no Origin check or per-IP limit; the
+  // WECHAT_POOL_SECRET bearer token authenticates it. 404 while the secret is not configured.
+  if (url.pathname === WECHAT_POOL) {
+    if (!wechatPoolConfigured(env)) return response(404, { error: 'not_found' });
+    if (!['GET', 'POST'].includes(request.method)) return response(405, { error: 'method_not_allowed' });
+    try { return await handleWechatPool(request, env); } catch (_) { return response(503, { error: 'accounts_unavailable' }); }
   }
   const origin = request.headers.get('origin');
   if (origin && origin !== site) return response(403, { error: 'origin_not_allowed' });

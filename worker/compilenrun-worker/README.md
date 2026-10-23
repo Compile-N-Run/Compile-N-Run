@@ -275,30 +275,49 @@ prompts will not appear.
 ## WeChat Official Account login
 
 echo.cool readers can sign in with the WeChat Official Account (公众号) instead of OAuth. Cloudflare Workers have no
-fixed egress IP, so the Official Account API (`access_token`, parametric QR codes), which requires an IP whitelist,
-is not used. Everything runs over message push (服务器配置), which only needs WeChat to reach the Worker. The code is
+fixed egress IP, so the Worker never calls the Official Account API (`access_token` requires an IP whitelist).
+Everything the Worker does runs over message push (服务器配置), which only needs WeChat to reach the Worker. The code is
 in `src/auth/wechat.js`; the provider entry (`wechat`, `oauth: false`) is in `src/auth/core.js`.
+
+There are two modes. The default is **scan** (mode `scan`): the page shows a per-login parametric QR code and the
+reader only scans it. Those QR codes come from a pool of temporary tickets that a job on a server with a fixed,
+whitelisted IP creates and uploads (see "QR ticket pool" below). When the pool is empty or the job is not set up,
+`start` falls back to **code** (mode `code`): the page shows the account's static QR and a 6-digit code to send.
 
 1. The page calls `POST /api/auth/wechat/start` (same-origin). The Worker stores a pending login with a random
    6-digit code (unique among stored logins), the hash of a binding token sent as the `__Host-cnr_wx` cookie (HttpOnly,
-   10 minutes), and a 10-minute expiry, and replies `{code, expiresAt}` (ms). With a valid session the pending login
-   is a link for that user and that session; otherwise it is a sign-in. Starting again drops the browser's previous code.
-2. The page shows the account's QR code (a static image) and the code. The reader follows the account and sends the
-   6 digits as a message.
+   10 minutes), and a 10-minute expiry, and replies `{code, expiresAt, mode}` (ms). With a valid session the pending
+   login is a link for that user and that session; otherwise it is a sign-in. Starting again drops the browser's
+   previous code. It also assigns the login one pooled ticket (unassigned, at least 15 minutes left, soonest expiry
+   first, atomically via `UPDATE ... WHERE login_code IS NULL RETURNING`); if one is assigned the reply has
+   `mode: 'scan'` and `qr: 'https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=<urlencoded ticket>'`, otherwise
+   `mode: 'code'`.
+2. Scan mode: the page shows the `qr` image. A reader who does not follow the account yet follows it from the scan
+   and WeChat pushes `subscribe` with `EventKey = qrscene_<scene>`; a follower gets `SCAN` with `EventKey = <scene>`.
+   Code mode: the page shows the account's QR code (a static image) and the code; the reader follows the account and
+   sends the 6 digits as a message. Both keep working at the same time (the code is returned in scan mode too, and
+   `status` is polled with it).
 3. WeChat posts the message to `POST /api/auth/wechat/events`. The Worker checks `signature` (sha1 of the sorted
    token, timestamp and nonce), rejects timestamps more than 5 minutes off, and confirms the unexpired pending login
    with that code, storing the sender's openid. It sends a passive text reply ("登录成功！回到网页即可继续。" or
    "验证码无效或已过期，请在网页上重新获取。"). One openid gets 10 wrong codes per hour, then it is refused for the rest
-   of the hour, so nobody can guess another reader's pending code. A `subscribe` event gets a welcome text with the
-   site URL and how to sign in. Other text gets a short help text. Everything else gets `success`. No upstream calls
-   are made, so replies are well inside WeChat's 5-second limit.
+   of the hour, so nobody can guess another reader's pending code. A scan event looks the scene up in
+   `cnr_account_wechat_qr` and confirms the pending login it is assigned to the same way (`openid = FromUserName`; a
+   retried push by the same openid gets the same answer, any other openid cannot take over a confirmed login). Replies:
+   `subscribe` + scene → "关注成功，网页已登录。" plus a line about the site; `SCAN` → "登录成功！回到网页即可继续。";
+   unknown or expired scene → "二维码已过期，请刷新网页后重新扫码。" (after the welcome on `subscribe`). A plain
+   `subscribe` (no scene) gets a neutral welcome with the site URL. Other text gets a short help text. Everything else
+   gets `success`. No upstream calls are made, so replies are well inside WeChat's 5-second limit.
 4. The page polls `GET /api/auth/wechat/status?code=NNNNNN` (every 2-3 s; it shares the 60/min `AUTH_LIMIT`) with the
    `__Host-cnr_wx` cookie (403 without it or with another browser's cookie). Replies: `{status:'pending'}`,
    `{status:'expired'}` (row deleted), `{status:'done'}` (sign-in: the account for that openid is found or created,
    the session and `cnr_signed_in` cookies are set, the binding cookie is cleared), `{status:'linked'}` or
    `{status:'conflict'}` (the openid already belongs to another account, or this account has a different WeChat
    linked). A link only completes if the request still carries the session that started it. A confirmed row is
-   consumed exactly once (`DELETE ... RETURNING`); a second poll gets 404.
+   consumed exactly once (`DELETE ... RETURNING`); a second poll gets 404. A ticket is single-use: its row references
+   the login (`ON DELETE CASCADE`), so it disappears when the login is consumed, expires, or is replaced by a new
+   `start` in the same browser; `start` also sweeps expired tickets and orphans. Scanning an old QR code later only
+   gets the "expired" reply.
 
 Session discovery reports `providers.wechat`, and `user.wechatLinked`. `DELETE /api/auth/wechat/link` unlinks with
 the same rule as the other providers: another usable sign-in method must remain. `POST` on that path returns 405;
@@ -308,7 +327,13 @@ account is named "微信用户" and `cnr_account_wechat_profiles` only records `
 
 **Schema:** `accounts-wechat-schema.sql` (version 5) must be applied to **both** databases (`compilenrun-data` and
 `echocool-data`) before deploying this code, even to the compilenrun Worker where WeChat stays off: `session()`
-joins `cnr_account_wechat_identities` for every signed-in request.
+joins `cnr_account_wechat_identities` for every signed-in request. `accounts-wechat-qr-schema.sql` (version 6, the
+ticket pool) goes to both databases too. Without it `start` still works in code mode, but apply it before deploying:
+
+```sh
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-qr-schema.sql
+npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-wechat-qr-schema.sql
+```
 
 **Configuration** (echocool-worker only; compilenrun-worker has no WeChat settings, so `providers.wechat` is false
 there):
@@ -317,11 +342,36 @@ there):
   is set, the AppID inside every encrypted push must match it.
 - secret `WECHAT_TOKEN`: the 服务器配置 Token. WeChat login is enabled when this is set.
 - secret `WECHAT_AES_KEY`: the EncodingAESKey (43 characters), needed only in 兼容模式 or 安全模式.
+- secret `WECHAT_POOL_SECRET`: a long random string shared with the ticket generator (`openssl rand -base64 32`).
+  Without it `/api/auth/wechat/pool` is 404 and every login uses code mode.
 
 ```sh
 npx wrangler@4 secret put WECHAT_TOKEN --config wrangler.echocool.jsonc
 npx wrangler@4 secret put WECHAT_AES_KEY --config wrangler.echocool.jsonc
+npx wrangler@4 secret put WECHAT_POOL_SECRET --config wrangler.echocool.jsonc
 ```
+
+**QR ticket pool.** Per-login QR codes (带参数二维码) need an `access_token`, and WeChat issues one only to servers whose
+IP is on the account's whitelist (公众平台 → 设置与开发 → 基本配置 → IP白名单; error `40164` otherwise). The Worker has
+no fixed IP, so `tools/wechat_qr_pool.py` runs on the home server (fixed IP, on the whitelist) every 6 hours from a
+systemd timer (unit files and env layout in `tools/README.md`). It asks `GET /api/auth/wechat/pool` for
+`{available, expiringSoon}`, and when `available - expiringSoon` is below `POOL_TARGET` (300) it fetches an
+`access_token` with the AppSecret, creates the missing tickets (`POST /cgi-bin/qrcode/create`, `QR_STR_SCENE`, a
+random 32-character `scene_str`, `expire_seconds` 2592000 = 30 days, the maximum) and uploads them in batches of 100.
+Temporary QR codes cost nothing and have no total cap; the API's daily call quota is far above what this needs.
+
+- `POST /api/auth/wechat/pool` with `Authorization: Bearer <WECHAT_POOL_SECRET>` (compared in constant time) and
+  `{tickets: [{scene, ticket, expiresAt}]}` (at most 500; `scene` matches `^[A-Za-z0-9_-]{16,64}$`, `ticket` is
+  printable ASCII up to 512 characters, `expiresAt` in seconds, in the future and at most ~31 days out). Rows are
+  inserted with `INSERT OR IGNORE`, expired rows are deleted, and the reply is `{ok:true, inserted, available}`
+  (`available` = unassigned tickets with at least 10 minutes left). 401 for a wrong or missing secret, 400 for a bad
+  ticket (`{error:'invalid_ticket', index}`).
+- `GET /api/auth/wechat/pool` (same auth) replies `{available, expiringSoon}` (`expiringSoon` = available tickets that
+  expire within 24 hours).
+- No Origin check and no `AUTH_LIMIT` (it is a server, not a page); the route is covered by `www.echo.cool/api/auth/*`.
+
+Each login uses one ticket, so 300 covers 300 sign-ins per 6 hours; raise `POOL_TARGET` if logins outgrow it. If the
+generator stops, logins quietly fall back to code mode once the pool runs dry.
 
 **公众平台 settings** (设置与开发 → 基本配置 → 服务器配置): URL `https://www.echo.cool/api/auth/wechat/events`; Token: the
 same value as `WECHAT_TOKEN` (3-32 letters or digits); EncodingAESKey: generate it and store it as `WECHAT_AES_KEY`;

@@ -1,15 +1,21 @@
-// WeChat Official Account (公众号) sign-in through message push. No access_token and no API calls (Workers have no
-// fixed egress IP for the API whitelist): the page gets a 6-digit code, the reader sends it to the account, WeChat
-// posts the message here with the sender's openid, and the browser that started the login (binding cookie) polls
-// /status to consume the confirmed row once. Protocol reference: 公众号「消息管理 / 接收普通消息 / 被动回复用户消息」
-// and the message encryption guide (WXBizMsgCrypt: AES-256-CBC, PKCS#7 with a 32-byte block).
+// WeChat Official Account (公众号) sign-in through message push. The Worker makes no API calls (Workers have no
+// fixed egress IP for the API whitelist). Default (mode 'scan'): `start` assigns the pending login a temporary
+// parametric QR ticket from a pool that tools/wechat_qr_pool.py (on a whitelisted server) uploads to /pool; the
+// reader scans it, WeChat pushes subscribe (EventKey qrscene_<scene>) or SCAN (EventKey <scene>) with the reader's
+// openid, and that confirms the login. Fallback (mode 'code', pool empty): the page shows the account's static QR
+// and a 6-digit code, and the reader sends the code as a message. Either way the browser that started the login
+// (binding cookie) polls /status to consume the confirmed row once. Protocol reference: 公众号「消息管理 / 接收普通消息 /
+// 接收事件推送 / 被动回复用户消息」, 「账号管理 / 生成带参数的二维码」 and the message encryption guide (WXBizMsgCrypt:
+// AES-256-CBC, PKCS#7 with a 32-byte block).
 import { siteName, siteOrigin, text } from '../lib/http.js';
+import { limitedJSON } from '../lib/body.js';
 import { PROVIDERS, response, cookie, readCookie, hash, randomToken, session, sameToken, now, providerIdentity, signInIdentity, saveProfile } from './core.js';
 
 export const WECHAT_START = '/api/auth/wechat/start';
 export const WECHAT_EVENTS = '/api/auth/wechat/events';
 export const WECHAT_STATUS = '/api/auth/wechat/status';
-export const WECHAT_ROUTES = { [WECHAT_START]: 'POST', [WECHAT_EVENTS]: 'GET,POST', [WECHAT_STATUS]: 'GET' };
+export const WECHAT_POOL = '/api/auth/wechat/pool';
+export const WECHAT_ROUTES = { [WECHAT_START]: 'POST', [WECHAT_EVENTS]: 'GET,POST', [WECHAT_STATUS]: 'GET', [WECHAT_POOL]: 'GET,POST' };
 const WX_COOKIE = '__Host-cnr_wx';
 const LOGIN_SECONDS = 600;
 const MAX_SKEW = 300;
@@ -17,6 +23,14 @@ const MAX_PENDING = 20000;
 const MAX_FAILURES = 10, FAILURE_WINDOW = 3600;
 const OPENID = /^[A-Za-z0-9_-]{1,64}$/;
 const CODE = /^\d{6}$/;
+const SCENE = /^[A-Za-z0-9_-]{16,64}$/;
+const TICKET = /^[\x21-\x7e]{1,512}$/;  // printable ASCII; WeChat tickets are base64
+const QR_IMAGE = 'https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=';
+const POOL_BATCH = 500, POOL_BODY = 512 * 1024;
+const TICKET_MAX_SECONDS = 2592000 + 86400;   // WeChat's 30-day maximum, plus clock slack
+const ASSIGN_MARGIN = 900;    // a ticket handed to a login has at least 15 minutes left (the login lasts 10)
+const AVAILABLE_MARGIN = 600; // what /pool counts as available
+const EXPIRING_SOON = 86400;  // what /pool reports as expiringSoon: available now, gone within a day
 const encoder = new TextEncoder(), decoder = new TextDecoder('utf-8', { fatal: true });
 
 // ---- helpers ----
@@ -51,7 +65,7 @@ export function xmlField(xml, tag) {
 }
 function parseMessage(xml) {
   const fields = {};
-  for (const tag of ['ToUserName', 'FromUserName', 'CreateTime', 'MsgType', 'Content', 'Event', 'EventKey', 'MsgId', 'Encrypt']) fields[tag] = xmlField(xml, tag);
+  for (const tag of ['ToUserName', 'FromUserName', 'CreateTime', 'MsgType', 'Content', 'Event', 'EventKey', 'Ticket', 'MsgId', 'Encrypt']) fields[tag] = xmlField(xml, tag);
   return fields;
 }
 
@@ -135,13 +149,45 @@ async function confirmCode(env, openid, code) {
   return 'invalid';
 }
 
+// A scan of a pooled ticket confirms the login the ticket is assigned to. A retried push (or a second scan by the same
+// reader) finds its own confirmation; anyone else scanning the same code gets 'invalid'. No attempt counting: scenes
+// are long random strings and only WeChat's signed pushes can carry one.
+async function confirmScene(env, openid, scene) {
+  const time = now();
+  const confirmed = await env.DB.prepare(`UPDATE cnr_account_wechat_logins SET openid = ?1, confirmed_at = ?2
+    WHERE code = (SELECT login_code FROM cnr_account_wechat_qr WHERE scene = ?3 AND expires_at > ?2 AND login_code IS NOT NULL)
+    AND expires_at > ?2 AND (confirmed_at IS NULL OR openid = ?1) RETURNING code`).bind(openid, time, scene).first();
+  return confirmed ? 'confirmed' : 'invalid';
+}
+
+const welcome = env => text(env,
+  `Welcome to ${siteName(env)}! You can sign in on ${siteOrigin(env)} with WeChat: choose WeChat in the sign-in window.`,
+  `欢迎关注${siteName(env)}！在 ${siteOrigin(env)} 登录时选择「微信登录」即可用微信登录。`);
+const expiredQR = env => text(env, 'This QR code has expired. Please refresh the web page to get a new one.', '二维码已过期，请刷新网页后重新扫码。');
+
+async function answerScan(env, message, scene, subscribed) {
+  let outcome = 'invalid';
+  if (SCENE.test(scene) && OPENID.test(message.FromUserName)) {
+    try { outcome = await confirmScene(env, message.FromUserName, scene); } catch (_) {
+      return text(env, 'Sign-in is temporarily unavailable. Please try again shortly.', '登录服务暂时不可用，请稍后再试。');
+    }
+  }
+  if (outcome === 'confirmed') return subscribed
+    ? text(env, `Thanks for following ${siteName(env)}! You are now signed in on the web page.\nWe publish programming tutorials at ${siteOrigin(env)}.`,
+      `关注成功，网页已登录。\n欢迎来到${siteName(env)}，更多编程教程请访问 ${siteOrigin(env)}`)
+    : text(env, 'Signed in! Go back to the web page to continue.', '登录成功！回到网页即可继续。');
+  return subscribed ? welcome(env) + '\n' + expiredQR(env) : expiredQR(env);
+}
+
 async function answer(env, message) {
   const type = message.MsgType.toLowerCase();
   if (type === 'event') {
-    const event = message.Event.toLowerCase();
-    if (event === 'subscribe') return text(env,
-      `Welcome to ${siteName(env)}! To sign in on ${siteOrigin(env)}, choose WeChat in the sign-in window and send the 6-digit code it shows to this account.`,
-      `欢迎关注${siteName(env)}！在 ${siteOrigin(env)} 登录时选择「微信登录」，把网页上显示的 6 位验证码发送到本公众号即可完成登录。`);
+    const event = message.Event.toLowerCase(), key = message.EventKey;
+    // A non-follower scanning a parametric QR follows first: subscribe with EventKey qrscene_<scene>. A follower
+    // gets SCAN with EventKey <scene>. A plain follow (static QR, search) has no EventKey.
+    if (event === 'subscribe' && key.startsWith('qrscene_')) return answerScan(env, message, key.slice('qrscene_'.length), true);
+    if (event === 'scan' && key) return answerScan(env, message, key, false);
+    if (event === 'subscribe') return welcome(env);
     return null;
   }
   if (type !== 'text') return null;
@@ -194,6 +240,31 @@ export async function handleWechatEvents(request, env) {
 }
 
 // ---- browser → Worker ----
+// Hands the new pending login one free ticket (the one expiring soonest with at least 15 minutes left). Concurrent
+// starts can pick the same row; `login_code IS NULL` lets only one win, and the loser tries the next one. Any failure
+// (empty pool, table not migrated yet) falls back to the chat-code flow.
+async function assignTicket(env, code, time) {
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const row = await env.DB.prepare(`UPDATE cnr_account_wechat_qr SET login_code = ?1, assigned_at = ?2
+        WHERE scene = (SELECT scene FROM cnr_account_wechat_qr WHERE assigned_at IS NULL AND expires_at > ?3 ORDER BY expires_at LIMIT 1)
+        AND login_code IS NULL RETURNING scene, ticket`).bind(code, time, time + ASSIGN_MARGIN).first();
+      if (row) return row.ticket;
+      const free = await env.DB.prepare('SELECT 1 AS ok FROM cnr_account_wechat_qr WHERE assigned_at IS NULL AND expires_at > ?1 LIMIT 1').bind(time + ASSIGN_MARGIN).first();
+      if (!free) return null;
+    }
+  } catch (_) { /* fall back to the code flow */ }
+  return null;
+}
+// Removes expired tickets and assigned ones whose login is gone. The foreign key cascade already does the latter when
+// a login row is deleted; this also covers rows left by a database without foreign key enforcement.
+async function sweepTickets(env, time) {
+  try {
+    await env.DB.prepare(`DELETE FROM cnr_account_wechat_qr WHERE expires_at <= ?1 OR (login_code IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM cnr_account_wechat_logins WHERE code = cnr_account_wechat_qr.login_code))`).bind(time).run();
+  } catch (_) { /* table not migrated yet */ }
+}
+
 export async function startWechatLogin(request, env) {
   const time = now(), binding = randomToken(), bindingHash = await hash(binding);
   const login = await session(request, env.DB);
@@ -203,6 +274,7 @@ export async function startWechatLogin(request, env) {
     // A browser has one pending login at a time: starting again drops its previous code.
     env.DB.prepare('DELETE FROM cnr_account_wechat_logins WHERE binding_hash = ?1').bind(previous ? await hash(previous) : ''),
   ]);
+  await sweepTickets(env, time);
   const pending = await env.DB.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_logins WHERE expires_at > ?1').bind(time).first();
   if (pending && pending.n >= MAX_PENDING) return response(503, { error: 'wechat_busy' });
   for (let attempt = 0; attempt < 8; attempt++) {
@@ -211,7 +283,10 @@ export async function startWechatLogin(request, env) {
     const inserted = await env.DB.prepare(`INSERT INTO cnr_account_wechat_logins (code, binding_hash, user_id, session_hash, created_at, expires_at)
       VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(code) DO NOTHING RETURNING code`)
       .bind(code, bindingHash, login ? login.user.id : null, login ? login.tokenHash : null, time, time + LOGIN_SECONDS).first();
-    if (inserted) return response(200, { code, expiresAt: (time + LOGIN_SECONDS) * 1000 }, [cookie(WX_COOKIE, binding, LOGIN_SECONDS)]);
+    if (!inserted) continue;
+    const ticket = await assignTicket(env, code, time);
+    return response(200, { code, expiresAt: (time + LOGIN_SECONDS) * 1000, ...(ticket ? { mode: 'scan', qr: QR_IMAGE + encodeURIComponent(ticket) } : { mode: 'code' }) },
+      [cookie(WX_COOKIE, binding, LOGIN_SECONDS)]);
   }
   return response(503, { error: 'wechat_busy' });
 }
@@ -254,4 +329,47 @@ export async function wechatLoginStatus(request, env) {
   }
   await saveProfile(p, env.DB, identity, time);
   return response(200, { status: 'linked' }, [clear]);
+}
+
+
+// ---- ticket generator → Worker ----
+// tools/wechat_qr_pool.py authenticates with `Authorization: Bearer <WECHAT_POOL_SECRET>`. Hashing both sides first
+// makes the comparison constant-time and length-independent.
+async function poolAuthorized(request, env) {
+  const header = request.headers.get('authorization') || '';
+  const match = /^Bearer ([\x21-\x7e]{1,512})$/.exec(header);
+  if (!match) return false;
+  return sameToken(await hash(match[1]), await hash(env.WECHAT_POOL_SECRET.trim()));
+}
+async function poolCounts(env, time) {
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS available, COALESCE(SUM(expires_at <= ?2), 0) AS expiringSoon
+    FROM cnr_account_wechat_qr WHERE assigned_at IS NULL AND expires_at > ?1`).bind(time + AVAILABLE_MARGIN, time + AVAILABLE_MARGIN + EXPIRING_SOON).first();
+  return { available: row?.available || 0, expiringSoon: row?.expiringSoon || 0 };
+}
+export const wechatPoolConfigured = env => typeof env.WECHAT_POOL_SECRET === 'string' && !!env.WECHAT_POOL_SECRET.trim() && !!env.DB;
+
+export async function handleWechatPool(request, env) {
+  if (!(await poolAuthorized(request, env))) return response(401, { error: 'unauthorized' });
+  const time = now();
+  if (request.method === 'GET') return response(200, await poolCounts(env, time));
+  let body;
+  try { body = await limitedJSON(request, POOL_BODY); } catch (error) {
+    return response(error instanceof RangeError ? 413 : 400, { error: error instanceof RangeError ? 'body_too_large' : 'invalid_request' });
+  }
+  const tickets = body?.tickets;
+  if (!Array.isArray(tickets) || tickets.length > POOL_BATCH) return response(400, { error: 'invalid_request' });
+  for (const [index, t] of tickets.entries()) {
+    if (!t || typeof t.scene !== 'string' || !SCENE.test(t.scene) || typeof t.ticket !== 'string' || !TICKET.test(t.ticket) ||
+      !Number.isSafeInteger(t.expiresAt) || t.expiresAt <= time || t.expiresAt > time + TICKET_MAX_SECONDS) {
+      return response(400, { error: 'invalid_ticket', index });
+    }
+  }
+  const statements = tickets.map(t => env.DB.prepare(`INSERT OR IGNORE INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at)
+    VALUES (?1, ?2, ?3, ?4)`).bind(t.scene, t.ticket, time, t.expiresAt));
+  // Expired rows are useless whether or not they were ever assigned (an assigned ticket always outlives its login).
+  statements.push(env.DB.prepare('DELETE FROM cnr_account_wechat_qr WHERE expires_at <= ?1').bind(time));
+  const results = await env.DB.batch(statements);
+  const inserted = results.slice(0, tickets.length).reduce((n, r) => n + (r.meta?.changes || 0), 0);
+  const { available } = await poolCounts(env, time);
+  return response(200, { ok: true, inserted, available });
 }

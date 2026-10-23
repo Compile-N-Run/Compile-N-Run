@@ -5,13 +5,17 @@ const fs=require('node:fs'),path=require('node:path'),http=require('node:http');
 const {chromium}=require(process.env.CNR_PLAYWRIGHT_MODULE||'playwright');
 const root=path.resolve(__dirname,'..');
 const WECHAT_PANEL=`  <div class="cnr-auth-dialog__wechat" data-auth-wechat-panel hidden>
-    <img class="cnr-auth-dialog__wechat-qr" data-auth-wechat-qr alt="WeChat Official Account QR code" width="180" height="180" loading="lazy" draggable="false">
-    <ol class="cnr-auth-dialog__wechat-steps">
+    <img class="cnr-auth-dialog__wechat-qr" data-auth-wechat-qr src="/img/wechat-qrcode.jpg" alt="WeChat Official Account QR code" width="180" height="180" loading="lazy" draggable="false">
+    <ol class="cnr-auth-dialog__wechat-steps" data-auth-wechat-steps="scan" hidden>
+      <li>Open WeChat and scan this QR code.</li>
+      <li>Follow the account and you are signed in.</li>
+    </ol>
+    <ol class="cnr-auth-dialog__wechat-steps" data-auth-wechat-steps="code" hidden>
       <li>Open WeChat and scan this QR code.</li>
       <li>Follow the Official Account.</li>
       <li>Send the code below in the chat.</li>
     </ol>
-    <p class="cnr-auth-dialog__wechat-code" data-auth-wechat-code aria-label="Sign-in code"></p>
+    <p class="cnr-auth-dialog__wechat-code" data-auth-wechat-code aria-label="Sign-in code" hidden></p>
     <p class="cnr-auth-dialog__wechat-expires" data-auth-wechat-expires aria-live="off"></p>
     <p class="cnr-auth-dialog__wechat-status" data-auth-wechat-status role="status"></p>
     <div class="cnr-auth-dialog__wechat-actions">
@@ -26,6 +30,7 @@ const WECHAT_BUTTON=`  <button type="button" class="cnr-auth-dialog__google" dat
 const partial=fs.readFileSync(path.join(root,'hugo/layouts/partials/account-menu.html'),'utf8')
  .replace('  <div class="cnr-auth-dialog__gsi" data-auth-google-gsi hidden></div>',WECHAT_PANEL+'  <div class="cnr-auth-dialog__gsi" data-auth-google-gsi hidden></div>')
  .replace('  <div class="cnr-auth-dialog__divider" data-auth-divider hidden>',WECHAT_BUTTON+'  <div class="cnr-auth-dialog__divider" data-auth-divider hidden>');
+const QR_TICKET='https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=gQTicket';
 const user=(id='user-a',name='Alex Learner')=>({id,name,email:'alex@example.invalid',emailVerified:true,hasPassword:true,googleLinked:true});
 const state=()=>({configured:true,providers:{google:true,github:true,email:true,wechat:false},user:null,csrfToken:'csrf-a',calls:[],offline:false,loginError:false});
 let browser,server,origin;
@@ -50,6 +55,7 @@ async function setup(t,account=state(),init,pagePath='/'){
  if(init)await context.addInitScript(init);
  if(account.user)await context.addInitScript(()=>{document.cookie='cnr_signed_in=1; Path=/';}); // the Worker sets this hint beside the session cookie
  await context.route('https://accounts.google.com/**',route=>route.fulfill({contentType:'text/javascript',body:FAKE_GSI}));
+ await context.route('https://mp.weixin.qq.com/**',route=>route.fulfill({contentType:'image/gif',body:Buffer.from('R0lGODlhAQABAAAAACw=','base64')})); // the per-login QR image
  await context.route('**/api/**',async route=>{
   const request=route.request(),url=new URL(request.url()),body=request.postData()?JSON.parse(request.postData()):null;
   account.calls.push({path:url.pathname,method:request.method(),headers:request.headers(),body});
@@ -86,7 +92,9 @@ async function setup(t,account=state(),init,pagePath='/'){
   }
   if(url.pathname==='/api/auth/wechat/start'){
    account.wechatStarts=(account.wechatStarts||0)+1;account.wechatPolls=0;
-   account.wechatCode=String(483920+account.wechatStarts);return reply({code:account.wechatCode,expiresAt:Date.now()+300000});
+   account.wechatCode=String(483920+account.wechatStarts);
+   if(account.wechatMode==='code')return reply({code:account.wechatCode,expiresAt:Date.now()+300000,mode:'code'});
+   return reply({code:account.wechatCode,expiresAt:Date.now()+300000,mode:'scan',qr:QR_TICKET+account.wechatStarts});
   }
   if(url.pathname==='/api/auth/wechat/status'){
    if(url.searchParams.get('code')!==account.wechatCode)return reply({error:'not_found'},404);
@@ -410,7 +418,10 @@ test('the popup shows the Google-rendered button when the script loads, and the 
  assert.equal(await blocked.locator('[data-auth-google-gsi]').isVisible(),false);
 });
 
-test('WeChat sign-in shows the QR and a 6-digit code, polls until done, and goes through the learning gate',async t=>{
+const wechatQrSrc=page=>page.locator('[data-auth-wechat-qr]').getAttribute('src');
+const waitForTicket=page=>page.waitForFunction(()=>/ticket=/.test(document.querySelector('[data-auth-wechat-qr]').getAttribute('src')||''));
+
+test('WeChat sign-in shows the per-login QR code without a code, polls until done, and goes through the learning gate',async t=>{
  const account=state();account.providers.wechat=true;
  const{page,errors}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=400;});
  await open(page);
@@ -420,9 +431,15 @@ test('WeChat sign-in shows the QR and a 6-digit code, polls until done, and goes
  await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});
  assert.equal(await page.locator('[data-auth-wechat-qr]').isVisible(),true);
  for(const hidden of ['[data-auth-google]','[data-auth-github]','[data-auth-email]','[data-auth-wechat]'])assert.equal(await page.locator(hidden).isVisible(),false,hidden+' hides while the WeChat panel is open');
- await page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
- assert.equal(await page.locator('[data-auth-wechat-code]').textContent(),'483921');
- assert.match(await page.locator('[data-auth-wechat-expires]').textContent(),/Code expires in \d+:\d\d/);
+ await waitForTicket(page);
+ assert.equal(await wechatQrSrc(page),QR_TICKET+'1','the QR code is the one made for this login');
+ assert.equal(await page.locator('[data-auth-wechat-code]').count(),1,'the code element stays in the page');
+ assert.equal(await page.locator('[data-auth-wechat-code]').isVisible(),false);assert.equal(await page.locator('[data-auth-wechat-code]').textContent(),'');
+ assert.equal(await page.locator('[data-auth-wechat-steps="scan"]').isVisible(),true);assert.equal(await page.locator('[data-auth-wechat-steps="code"]').isVisible(),false);
+ assert.match(await page.locator('[data-auth-wechat-steps="scan"]').textContent(),/Follow the account and you are signed in\./);
+ assert.match(await page.locator('[data-auth-wechat-expires]').textContent(),/^QR code expires in \d+:\d\d$/);
+ assert.equal(await page.locator('[data-auth-wechat-status]').textContent(),'Waiting for your scan…');
+ assert.doesNotMatch(await page.locator('[data-auth-message]').textContent(),/send this code/);
  await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
  assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-w');
  assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.wechatLinked),true);
@@ -433,28 +450,46 @@ test('WeChat sign-in shows the QR and a 6-digit code, polls until done, and goes
  assert.deepEqual(errors,[]);
 });
 
+test('without tickets the Worker falls back to the code: static QR, the 6-digit code and the code steps',async t=>{
+ const account=state();account.providers.wechat=true;account.wechatMode='code';
+ const{page,errors}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=400;});
+ await open(page);await page.locator('[data-auth-wechat]').click();
+ await page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
+ assert.equal(await page.locator('[data-auth-wechat-code]').textContent(),'483921');assert.equal(await page.locator('[data-auth-wechat-code]').isVisible(),true);
+ assert.equal(await wechatQrSrc(page),'/img/wechat-qrcode.jpg');
+ assert.equal(await page.locator('[data-auth-wechat-steps="code"]').isVisible(),true);assert.equal(await page.locator('[data-auth-wechat-steps="scan"]').isVisible(),false);
+ assert.match(await page.locator('[data-auth-wechat-expires]').textContent(),/^Code expires in \d+:\d\d$/);
+ assert.equal(await page.locator('[data-auth-wechat-status]').textContent(),'Waiting for your message…');
+ assert.equal(await page.locator('[data-auth-message]').textContent(),'Scan the QR code with WeChat to follow the account, then send this code in the chat:');
+ await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-w');
+ assert.deepEqual(errors,[]);
+});
+
 test('WeChat stays hidden when the Worker does not offer it, and Back restores the other sign-in options',async t=>{
  const{page}=await setup(t);await open(page);await page.evaluate(()=>CNRAuth.refresh({force:true}));
  assert.equal(await page.locator('[data-auth-wechat]').isVisible(),false);assert.equal(await page.locator('[data-auth-github]').isVisible(),true);
  const account=state();account.providers.wechat=true;
  const second=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=60000;});
  await open(second.page);await second.page.locator('[data-auth-wechat]').click();
- await second.page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
+ await waitForTicket(second.page);
  await second.page.locator('[data-auth-wechat-back]').click();
  assert.equal(await second.page.locator('[data-auth-wechat-panel]').isVisible(),false);
+ assert.equal(await wechatQrSrc(second.page),'/img/wechat-qrcode.jpg','Back restores the static QR code');
  assert.equal(await second.page.locator('[data-auth-github]').isVisible(),true);assert.equal(await second.page.locator('[data-auth-email]').isVisible(),true);
  await second.page.waitForFunction(()=>authChanges.some(change=>change.reason==='login-failed')); // learning is told the login did not happen
 });
 
-test('an expired WeChat code offers a new one',async t=>{
+test('an expired WeChat QR code offers a new one',async t=>{
  const account=state();account.providers.wechat=true;account.wechatExpire=true;
  const{page}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=400;});
  await open(page);await page.locator('[data-auth-wechat]').click();
  const renew=page.locator('[data-auth-wechat-renew]');await renew.waitFor({state:'visible'});
- assert.match(await page.locator('[data-auth-message]').textContent(),/This code has expired/);
+ assert.match(await page.locator('[data-auth-message]').textContent(),/This QR code has expired/);
+ assert.equal((await renew.textContent()).trim(),'Get a new QR code');
  assert.equal(account.wechatStarts,1);
  await renew.click();
- await page.waitForFunction(()=>document.querySelector('[data-auth-wechat-code]').textContent==='483922');
+ await page.waitForFunction(ticket=>document.querySelector('[data-auth-wechat-qr]').getAttribute('src')===ticket,QR_TICKET+'2');
  assert.equal(account.wechatStarts,2);assert.equal(await renew.isVisible(),false);
  await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
  assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-w');
@@ -479,7 +514,7 @@ test('with data-auth-default="wechat" the login form opens on the QR code and ke
  const{page,errors}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=50;},'/?wechat-default=1');
  await open(page);
  await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});
- await page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
+ await waitForTicket(page);
  assert.equal(await page.locator('#cnr-auth-title').textContent(),'Sign in');
  assert.equal(await page.locator('[data-auth-wechat]').isVisible(),false);
  assert.equal(await page.locator('[data-auth-wechat-back]').isVisible(),false);
@@ -488,7 +523,7 @@ test('with data-auth-default="wechat" the login form opens on the QR code and ke
  assert.equal(await page.locator('[data-auth-email]').isVisible(),true,'the email form stays available under the QR code');
  assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/start').length,1,'one code per opening');
  await page.keyboard.press('Escape');await open(page);
- await page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
+ await page.waitForFunction(ticket=>document.querySelector('[data-auth-wechat-qr]').getAttribute('src')===ticket,QR_TICKET+'2');
  assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/start').length,2,'reopening asks for a fresh code');
  assert.deepEqual(errors,[]);
 });
