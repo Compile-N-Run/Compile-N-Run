@@ -57,6 +57,7 @@ async function setup(t, account = model(), suffix = '') {
     if (pathname === '/api/auth/email' && method === 'POST') { account.pending = { email: body.email, password: body.password, name: account.user.name }; account.user.email = body.email; account.user.emailVerified = false; return reply({ ok: true }, 202); }
     if (pathname === '/api/auth/google/link' && method === 'POST') return reply({ url: account.linkURL });
     if (pathname === '/api/auth/google/link' && method === 'DELETE') { if (!(account.user.hasPassword && account.user.emailVerified)) return reply({ error: 'last_method' }, 409); account.lastUnlinked = { ...account.user, googleLinked: false }; account.user = null; return reply({ ok: true }); }
+    if (pathname === '/api/auth/wechat/link' && method === 'DELETE') { if (!(account.user.hasPassword && account.user.emailVerified) && !account.user.googleLinked) return reply({ error: 'last_login_method' }, 409); account.lastUnlinked = { ...account.user, wechatLinked: false }; account.user = null; return reply({ ok: true }); }
     if (pathname === '/api/auth/logout') { account.user = null; return reply({ ok: true }); }
     if (pathname === '/api/auth/account' && method === 'DELETE') { account.user = null; account.credential = null; return reply({ ok: true }); }
     return reply({ error: 'not_found' }, 404);
@@ -159,4 +160,26 @@ test('a Google user can replace or cancel a pending email without losing the Goo
   const { page, account } = await setup(t, a);
   await submit(page, 'enroll', { email: 'corrected@example.test', password: PASSWORD, confirm: PASSWORD }); assert.equal(account.pending.email, 'corrected@example.test');
   await page.locator('[data-profile-cancel-email]').click(); await idle(page); assert.equal(account.pending, null); assert.equal(account.user.email, null); assert.equal(account.user.googleLinked, true); assert.equal(await page.locator('[data-profile-cancel-email]').isVisible(), false);
+});
+
+test('WeChat status shows only where the Worker offers it, and unlinking needs another method and confirmation', async t => {
+  const off = model(); off.user = user(); const first = await setup(t, off);
+  assert.equal(await first.page.locator('[data-profile-wechat-status]').isVisible(), false); assert.equal(await first.page.locator('[data-profile-unlink-wechat]').isVisible(), false);
+  const a = model(); a.providers.wechat = true; a.user = user({ email: null, emailVerified: false, hasPassword: false, wechatLinked: true }); const { page, account } = await setup(t, a);
+  assert.equal(await page.locator('[data-profile-wechat-status]').innerText(), 'WeChat is linked through the Official Account.');
+  assert.equal(await page.locator('[data-profile-unlink-wechat]').isDisabled(), true, 'the only sign-in method cannot be unlinked');
+  assert.match(await page.locator('[data-profile-wechat-help]').innerText(), /Keep WeChat linked/);
+  account.user.googleLinked = true; await signInFromPopup(page, account, { ...account.user });
+  assert.equal(await page.locator('[data-profile-unlink-wechat]').isDisabled(), false);
+  page.once('dialog', d => d.dismiss()); await page.locator('[data-profile-unlink-wechat]').click(); assert.equal(account.calls.filter(c => c.method === 'DELETE').length, 0);
+  page.once('dialog', d => d.accept()); await page.locator('[data-profile-unlink-wechat]').click(); await idle(page);
+  const call = account.calls.find(c => c.pathname === '/api/auth/wechat/link'); assert.equal(call.method, 'DELETE'); assert.equal(call.headers['x-csrf-token'], 'profile-csrf');
+  assert.equal(account.lastUnlinked.wechatLinked, false); assert.match(await page.locator('[data-profile-status]').innerText(), /WeChat was unlinked/);
+});
+
+test('a refused WeChat unlink (last sign-in method) explains that another method must remain', async t => {
+  const a = model(); a.providers.wechat = true; a.user = user({ email: null, emailVerified: false, hasPassword: false, googleLinked: true, wechatLinked: true }); const { page, account } = await setup(t, a);
+  account.user.googleLinked = false; // the server knows better than the page
+  page.once('dialog', d => d.accept()); await page.locator('[data-profile-unlink-wechat]').click(); await idle(page);
+  assert.match(await page.locator('[data-profile-status]').innerText(), /could not be unlinked/); assert.equal(account.user.wechatLinked, true);
 });

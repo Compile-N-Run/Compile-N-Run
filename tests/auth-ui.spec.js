@@ -6,7 +6,7 @@ const {chromium}=require(process.env.CNR_PLAYWRIGHT_MODULE||'playwright');
 const root=path.resolve(__dirname,'..');
 const partial=fs.readFileSync(path.join(root,'hugo/layouts/partials/account-menu.html'),'utf8');
 const user=(id='user-a',name='Alex Learner')=>({id,name,email:'alex@example.invalid',emailVerified:true,hasPassword:true,googleLinked:true});
-const state=()=>({configured:true,providers:{google:true,github:true,email:true},user:null,csrfToken:'csrf-a',calls:[],offline:false,loginError:false});
+const state=()=>({configured:true,providers:{google:true,github:true,email:true,wechat:false},user:null,csrfToken:'csrf-a',calls:[],offline:false,loginError:false});
 let browser,server,origin;
 before(async()=>{
  server=http.createServer((req,res)=>{
@@ -62,6 +62,23 @@ async function setup(t,account=state(),init,pagePath='/'){
    if(request.headers()['x-cnr-user']!==account.user?.id)return reply({error:'account_changed'},409);
    if(request.headers()['x-csrf-token']!==account.csrfToken)return reply({error:'csrf_failed'},403);
    account.user=null;return reply({ok:true});
+  }
+  if(url.pathname==='/api/auth/wechat/start'){
+   account.wechatStarts=(account.wechatStarts||0)+1;account.wechatPolls=0;
+   account.wechatCode=String(483920+account.wechatStarts);return reply({code:account.wechatCode,expiresAt:Date.now()+300000});
+  }
+  if(url.pathname==='/api/auth/wechat/status'){
+   if(url.searchParams.get('code')!==account.wechatCode)return reply({error:'not_found'},404);
+   account.wechatPolls=(account.wechatPolls||0)+1;
+   if(account.wechatExpire){account.wechatExpire=false;return reply({status:'expired'});}
+   if(account.wechatPolls<=2)return reply({status:'pending'});
+   if(account.user){account.user={...account.user,wechatLinked:true};return reply({status:'linked'});}
+   account.user={...user('user-w','Wei Learner'),wechatLinked:true};account.csrfToken='csrf-wechat';return reply({status:'done'});
+  }
+  if(url.pathname==='/api/auth/wechat/link'&&request.method()==='DELETE'){
+   if(request.headers()['x-csrf-token']!==account.csrfToken)return reply({error:'csrf_failed'},403);
+   if(!account.user?.wechatLinked)return reply({error:'not_linked'},404);
+   account.user={...account.user,wechatLinked:false};return reply({ok:true});
   }
   if(['/api/auth/register','/api/auth/forgot-password','/api/auth/resend-verification'].includes(url.pathname))return reply({ok:true},202);
   return reply({error:'not_found'},404);
@@ -370,4 +387,68 @@ test('the popup shows the Google-rendered button when the script loads, and the 
  await blocked.waitForTimeout(300);
  assert.equal(await blocked.locator('[data-auth-google]').isVisible(),true,'without the Google script the OAuth link remains');
  assert.equal(await blocked.locator('[data-auth-google-gsi]').isVisible(),false);
+});
+
+test('WeChat sign-in shows the QR and a 6-digit code, polls until done, and goes through the learning gate',async t=>{
+ const account=state();account.providers.wechat=true;
+ const{page,errors}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=400;});
+ await open(page);
+ const button=page.locator('[data-auth-wechat]');await button.waitFor({state:'visible'});
+ assert.equal((await button.textContent()).trim(),'Sign in with WeChat');
+ await button.click();
+ await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});
+ assert.equal(await page.locator('[data-auth-wechat-qr]').isVisible(),true);
+ for(const hidden of ['[data-auth-google]','[data-auth-github]','[data-auth-email]','[data-auth-wechat]'])assert.equal(await page.locator(hidden).isVisible(),false,hidden+' hides while the WeChat panel is open');
+ await page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
+ assert.equal(await page.locator('[data-auth-wechat-code]').textContent(),'483921');
+ assert.match(await page.locator('[data-auth-wechat-expires]').textContent(),/Code expires in \d+:\d\d/);
+ await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-w');
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.wechatLinked),true);
+ assert.deepEqual(await page.evaluate(()=>authChanging),['wechat']);
+ assert.equal((await page.evaluate(()=>authChanges.at(-1))).reason,'login');
+ const start=account.calls.find(call=>call.path==='/api/auth/wechat/start');assert.equal(start.method,'POST');
+ assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/status').length,3);
+ assert.deepEqual(errors,[]);
+});
+
+test('WeChat stays hidden when the Worker does not offer it, and Back restores the other sign-in options',async t=>{
+ const{page}=await setup(t);await open(page);await page.evaluate(()=>CNRAuth.refresh({force:true}));
+ assert.equal(await page.locator('[data-auth-wechat]').isVisible(),false);assert.equal(await page.locator('[data-auth-github]').isVisible(),true);
+ const account=state();account.providers.wechat=true;
+ const second=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=60000;});
+ await open(second.page);await second.page.locator('[data-auth-wechat]').click();
+ await second.page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
+ await second.page.locator('[data-auth-wechat-back]').click();
+ assert.equal(await second.page.locator('[data-auth-wechat-panel]').isVisible(),false);
+ assert.equal(await second.page.locator('[data-auth-github]').isVisible(),true);assert.equal(await second.page.locator('[data-auth-email]').isVisible(),true);
+ await second.page.waitForFunction(()=>authChanges.some(change=>change.reason==='login-failed')); // learning is told the login did not happen
+});
+
+test('an expired WeChat code offers a new one',async t=>{
+ const account=state();account.providers.wechat=true;account.wechatExpire=true;
+ const{page}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=400;});
+ await open(page);await page.locator('[data-auth-wechat]').click();
+ const renew=page.locator('[data-auth-wechat-renew]');await renew.waitFor({state:'visible'});
+ assert.match(await page.locator('[data-auth-message]').textContent(),/This code has expired/);
+ assert.equal(account.wechatStarts,1);
+ await renew.click();
+ await page.waitForFunction(()=>document.querySelector('[data-auth-wechat-code]').textContent==='483922');
+ assert.equal(account.wechatStarts,2);assert.equal(await renew.isVisible(),false);
+ await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-w');
+ assert.deepEqual(await page.evaluate(()=>authChanging),['wechat'],'renewing does not repeat the learning gate');
+});
+
+test('signed-in readers link WeChat through the same panel without a learning transition',async t=>{
+ const account=state();account.providers.wechat=true;account.user=user();
+ const{page}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=400;});
+ await page.evaluate(()=>CNRAuth.open('wechat'));
+ await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});
+ assert.equal(await page.locator('#cnr-auth-title').textContent(),'Link WeChat');
+ const start=account.calls.find(call=>call.path==='/api/auth/wechat/start');assert.equal(start.headers['x-cnr-user'],'user-a');assert.equal(start.headers['x-csrf-token'],'csrf-a');
+ await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.wechatLinked),true);
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-a');
+ assert.deepEqual(await page.evaluate(()=>authChanging),[]);
 });
