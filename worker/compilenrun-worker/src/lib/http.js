@@ -16,3 +16,5 @@ export function corsFor(origin, env) {
 }
 
 export const validPath = (p) => typeof p === 'string' && /^\/(docs|blog)\/[\w\-./%]*$/.test(p) && !p.includes('..') && p.length <= 300;
+// Reader-facing message in the site's language.
+export const text = (env, en, zh) => siteIsChinese(env) ? zh : en;

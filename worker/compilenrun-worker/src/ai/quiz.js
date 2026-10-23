@@ -1,4 +1,4 @@
-import { json, validPath, siteIsChinese } from '../lib/http.js';
+import { json, validPath, siteIsChinese, text } from '../lib/http.js';
 import { humanCheck } from '../lib/turnstile.js';
 import { getPage } from './page-content.js';
 
@@ -110,18 +110,18 @@ async function solves(env, page, q) {
 
 export async function quiz(request, env, ctx, cors, ip) {
   const { success } = await env.ASK_LIMIT.limit({ key: ip });
-  if (!success) return json(429, { error: 'Too many requests. Please wait a minute and try again.' }, cors);
+  if (!success) return json(429, { error: text(env, 'Too many requests. Please wait a minute and try again.', '请求太频繁了，请稍等一分钟再试。') }, cors);
   let input;
   try {
     input = await request.json();
   } catch {
-    return json(400, { error: 'Invalid request.' }, cors);
+    return json(400, { error: text(env, 'Invalid request.', '请求无效。') }, cors);
   }
   const { path } = input;
-  if (!validPath(path)) return json(400, { error: 'Quizzes are only available on tutorial pages.' }, cors);
+  if (!validPath(path)) return json(400, { error: text(env, 'Quizzes are only available on tutorial pages.', '测验只能在教程页面使用。') }, cors);
   const round = Math.abs(parseInt(input.round, 10) || 0) % QUIZ_ROUNDS;
   if (!(await humanCheck(input.turnstile, ip, env.TURNSTILE_SECRET))) {
-    return json(403, { error: 'Could not verify that you are human. Please reload the page and try again.', turnstile: true }, cors);
+    return json(403, { error: text(env, 'Could not verify that you are human. Please reload the page and try again.', '无法完成人机验证，请刷新页面后重试。'), turnstile: true }, cors);
   }
   const key = `quiz:v1:${round}:${path}`;
   const cached = await env.ASK_KV.get(key, 'json');
@@ -130,11 +130,11 @@ export async function quiz(request, env, ctx, cors, ip) {
   const day = new Date().toISOString().slice(0, 10);
   const used = parseInt((await env.ASK_KV.get(`quizcount:${day}`)) || '0', 10);
   if (used >= parseInt(env.QUIZ_DAILY_LIMIT || '50', 10)) {
-    return json(429, { error: "Today's new quizzes have run out. They reset at 00:00 UTC — please try again tomorrow." }, cors);
+    return json(429, { error: text(env, "Today's new quizzes have run out. They reset at 00:00 UTC — please try again tomorrow.", '今天的新测验额度已用完，将在 UTC 时间 00:00 重置，请明天再试。') }, cors);
   }
   ctx.waitUntil(env.ASK_KV.put(`quizcount:${day}`, String(used + 1), { expirationTtl: 3 * 86400 }));
   const page = await getPage(path, ctx, env);
-  if (!page) return json(404, { error: 'Could not read this page.' }, cors);
+  if (!page) return json(404, { error: text(env, 'Could not read this page.', '无法读取本页内容。') }, cors);
 
   // New quiz: stream it. Each question is checked as soon as the model has written it, and sent on (in order)
   // when it passes, so the reader starts on question 1 while the rest are still being written.
@@ -181,14 +181,14 @@ export async function quiz(request, env, ctx, cors, ip) {
           await chain;
         }
         if (!kept.length) {
-          await send({ error: 'Could not write a quiz for this page right now. Please try again later.' });
+          await send({ error: text(env, 'Could not write a quiz for this page right now. Please try again later.', '暂时无法为本页生成测验，请稍后再试。') });
         } else {
           await send({ done: true, count: kept.length });
           if (kept.length >= 3) await env.ASK_KV.put(key, JSON.stringify({ title: page.title, round, questions: kept }), { expirationTtl: QUIZ_TTL });
         }
       } catch (e) {
         console.error('quiz error', e && e.message);
-        await send({ error: 'Something went wrong while writing the quiz. Please try again.' });
+        await send({ error: text(env, 'Something went wrong while writing the quiz. Please try again.', '生成测验时出了点问题，请重试。') });
       } finally {
         await writer.close().catch(() => {});
       }

@@ -1,4 +1,4 @@
-import { siteOrigin, siteName, siteIsChinese, json, validPath } from '../lib/http.js';
+import { siteOrigin, siteName, siteIsChinese, json, validPath, text } from '../lib/http.js';
 import { humanCheck } from '../lib/turnstile.js';
 import { getPage } from './page-content.js';
 
@@ -27,18 +27,18 @@ ${chinese ? '- Answer in Simplified Chinese (简体中文), unless the reader cl
 
 export async function ask(request, env, ctx, cors, ip) {
   const { success } = await env.ASK_LIMIT.limit({ key: ip });
-  if (!success) return json(429, { error: 'You are asking too quickly. Please wait a minute and try again.' }, cors);
+  if (!success) return json(429, { error: text(env, 'You are asking too quickly. Please wait a minute and try again.', '提问太频繁了，请稍等一分钟再试。') }, cors);
 
   let input;
   try {
     input = await request.json();
   } catch {
-    return json(400, { error: 'Invalid request.' }, cors);
+    return json(400, { error: text(env, 'Invalid request.', '请求无效。') }, cors);
   }
   const path = typeof input.path === 'string' ? input.path : '';
   const question = typeof input.question === 'string' ? input.question.trim() : '';
-  if (!validPath(path)) return json(400, { error: 'Ask AI only works on tutorial pages.' }, cors);
-  if (!question) return json(400, { error: 'Please type a question.' }, cors);
+  if (!validPath(path)) return json(400, { error: text(env, 'Ask AI only works on tutorial pages.', 'AI 助手只能在教程页面使用。') }, cors);
+  if (!question) return json(400, { error: text(env, 'Please type a question.', '请输入你的问题。') }, cors);
   if (question.length > MAX_QUESTION) return json(400, { error: `Please keep your question under ${MAX_QUESTION} characters.` }, cors);
   const history = (Array.isArray(input.history) ? input.history : [])
     .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
@@ -46,19 +46,19 @@ export async function ask(request, env, ctx, cors, ip) {
     .map((m) => ({ role: m.role, content: m.content.slice(0, MAX_HISTORY_CHARS) }));
 
   if (!(await humanCheck(input.turnstile, ip, env.TURNSTILE_SECRET))) {
-    return json(403, { error: 'Could not verify that you are human. Please reload the page and try again.', turnstile: true }, cors);
+    return json(403, { error: text(env, 'Could not verify that you are human. Please reload the page and try again.', '无法完成人机验证，请刷新页面后重试。'), turnstile: true }, cors);
   }
 
   // Site-wide daily cap so the free Workers AI allocation is not exhausted (or billed) by a few heavy users.
   const day = new Date().toISOString().slice(0, 10);
   const used = parseInt((await env.ASK_KV.get(`count:${day}`)) || '0', 10);
   if (used >= parseInt(env.DAILY_LIMIT || '200', 10)) {
-    return json(429, { error: "Ask AI has reached today's limit. It resets at 00:00 UTC — please try again tomorrow." }, cors);
+    return json(429, { error: text(env, "Ask AI has reached today's limit. It resets at 00:00 UTC — please try again tomorrow.", 'AI 助手今天的额度已用完，将在 UTC 时间 00:00 重置，请明天再试。') }, cors);
   }
   ctx.waitUntil(env.ASK_KV.put(`count:${day}`, String(used + 1), { expirationTtl: 3 * 86400 }));
 
   const page = await getPage(path, ctx, env);
-  if (!page) return json(404, { error: 'Could not read this page.' }, cors);
+  if (!page) return json(404, { error: text(env, 'Could not read this page.', '无法读取本页内容。') }, cors);
 
   const messages = [
     { role: 'system', content: `${systemPrompt(env)}\n\nPage: ${page.title}\nURL: ${siteOrigin(env)}${path}\n\n<tutorial>\n${page.text}\n</tutorial>` },
