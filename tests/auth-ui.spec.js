@@ -11,7 +11,7 @@ let browser,server,origin;
 before(async()=>{
  server=http.createServer((req,res)=>{
   if(['/auth-ui.js','/auth-ui.css','/learning.js','/learning-sync.js'].includes(req.url)){const ext=req.url.endsWith('.js')?'js':'css';res.setHeader('Content-Type',ext==='js'?'text/javascript':'text/css');res.end(fs.readFileSync(path.join(root,'hugo/assets',ext,req.url.slice(1))));return;}
-  res.setHeader('Content-Type','text/html');res.end(`<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auth UI test</title><meta name="cnr-google-client-id" content="test-client.apps.googleusercontent.com"><style>*{box-sizing:border-box}body{margin:0;font:16px/1.5 system-ui}:root{--ifm-font-family-base:system-ui;--ifm-color-primary:#176647;--ifm-background-color:white;--ifm-background-surface-color:white;--ifm-font-color-base:#20313e;--ifm-navbar-background-color:white;--ifm-color-emphasis-100:#f4f6f8;--ifm-color-emphasis-200:#dce2e8;--ifm-color-emphasis-300:#adb9c5;--ifm-color-emphasis-700:#52606d}header{display:flex;align-items:center;justify-content:space-between;padding:12px;gap:12px}main{padding:2rem}</style><link rel="stylesheet" href="/auth-ui.css"></head><body><header><a href="/">Compile N Run</a>${partial}</header><main><h1>Keep learning</h1><button id="outside">Outside control</button></main>${req.url.startsWith('/integrated')?'<script>window.CNR_SYNC_ENABLED=true;window.CNR_PAGE={};</script><script src="/learning.js" defer></script><script src="/learning-sync.js" defer></script>':''}<script src="/auth-ui.js" defer></script></body></html>`);
+  res.setHeader('Content-Type','text/html');res.end(`<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auth UI test</title><meta name="cnr-google-client-id" content="test-client.apps.googleusercontent.com"><style>*{box-sizing:border-box}body{margin:0;font:16px/1.5 system-ui}:root{--ifm-font-family-base:system-ui;--ifm-color-primary:#176647;--ifm-background-color:white;--ifm-background-surface-color:white;--ifm-font-color-base:#20313e;--ifm-navbar-background-color:white;--ifm-color-emphasis-100:#f4f6f8;--ifm-color-emphasis-200:#dce2e8;--ifm-color-emphasis-300:#adb9c5;--ifm-color-emphasis-700:#52606d}header{display:flex;align-items:center;justify-content:space-between;padding:12px;gap:12px}main{padding:2rem}</style><link rel="stylesheet" href="/auth-ui.css"></head><body><header><a href="/">Compile N Run</a>${req.url.includes('wechat-default=1')?partial.replace('data-auth-dialog','data-auth-dialog data-auth-default="wechat"'):partial}</header><main><h1>Keep learning</h1><button id="outside">Outside control</button></main>${req.url.startsWith('/integrated')?'<script>window.CNR_SYNC_ENABLED=true;window.CNR_PAGE={};</script><script src="/learning.js" defer></script><script src="/learning-sync.js" defer></script>':''}<script src="/auth-ui.js" defer></script></body></html>`);
  });
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));origin='http://127.0.0.1:'+server.address().port;browser=await chromium.launch({headless:true});
 });
@@ -451,4 +451,23 @@ test('signed-in readers link WeChat through the same panel without a learning tr
  assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.wechatLinked),true);
  assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.id),'user-a');
  assert.deepEqual(await page.evaluate(()=>authChanging),[]);
+});
+
+test('with data-auth-default="wechat" the login form opens on the QR code and keeps the other methods below it',async t=>{
+ const account=state();account.providers.wechat=true;
+ const{page,errors}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=50;},'/?wechat-default=1');
+ await open(page);
+ await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});
+ await page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
+ assert.equal(await page.locator('#cnr-auth-title').textContent(),'Sign in');
+ assert.equal(await page.locator('[data-auth-wechat]').isVisible(),false);
+ assert.equal(await page.locator('[data-auth-wechat-back]').isVisible(),false);
+ assert.equal(await page.locator('[data-auth-wechat-others]').isVisible(),true);
+ assert.equal(await page.locator('[data-auth-github]').isVisible(),true);
+ assert.equal(await page.locator('[data-auth-email]').isVisible(),true,'the email form stays available under the QR code');
+ assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/start').length,1,'one code per opening');
+ await page.keyboard.press('Escape');await open(page);
+ await page.waitForFunction(()=>/^\d{6}$/.test(document.querySelector('[data-auth-wechat-code]').textContent));
+ assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/start').length,2,'reopening asks for a fresh code');
+ assert.deepEqual(errors,[]);
 });
