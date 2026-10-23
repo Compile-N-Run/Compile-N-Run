@@ -1,23 +1,31 @@
 import { EMAIL_ROUTES, PUBLIC_EMAIL_ROUTES, handleEmailAccount } from '../email-accounts.js';
 import { limitedJSON } from '../lib/body.js';
 import { handleLearning } from '../learning/routes.js';
-import { siteOrigin, PROVIDERS, GOOGLE_CREDENTIAL_ROUTE, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
+import { WECHAT_ROUTES, WECHAT_START, WECHAT_EVENTS, WECHAT_STATUS, handleWechatEvents, startWechatLogin, wechatLoginStatus } from './wechat.js';
+import { siteOrigin, PROVIDERS, OAUTH_PROVIDERS, wechatConfigured, wechatEventsReady, GOOGLE_CREDENTIAL_ROUTE, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
 const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/account', '/api/learning', GOOGLE_CREDENTIAL_ROUTE, ...Object.keys(EMAIL_ROUTES),
-  ...Object.values(PROVIDERS).flatMap(p => [p.start, p.link, p.callback])]);
+  ...Object.keys(WECHAT_ROUTES), ...OAUTH_PROVIDERS.flatMap(p => [p.start, p.link, p.callback]), PROVIDERS.wechat.link]);
 
 export async function handleAccounts(request, env, ctx) {
   const url = new URL(request.url);
   const site = siteOrigin(env);
   if (!ROUTES.has(url.pathname)) return url.pathname.startsWith('/api/auth/') ? response(404, { error: 'not_found' }) : null;
   if (url.origin !== site) return response(403, { error: 'origin_not_allowed' });
+  // WeChat's servers post messages here: no Origin or rate limit (shared WeChat IPs); the signature authenticates.
+  if (url.pathname === WECHAT_EVENTS) {
+    if (!['GET', 'POST'].includes(request.method)) return response(405, { error: 'method_not_allowed' });
+    if (!wechatEventsReady(env)) return response(404, { error: 'not_found' });
+    try { return await handleWechatEvents(request, env); } catch (_) { return new Response('success', { headers: { 'content-type': 'text/plain' } }); }
+  }
   const origin = request.headers.get('origin');
   if (origin && origin !== site) return response(403, { error: 'origin_not_allowed' });
-  const methods = { ...EMAIL_ROUTES, '/api/auth/session': 'GET', '/api/auth/logout': 'POST', '/api/auth/account': 'DELETE', '/api/learning': 'GET,PUT,PATCH', [GOOGLE_CREDENTIAL_ROUTE]: 'POST' };
-  for (const p of Object.values(PROVIDERS)) Object.assign(methods, { [p.start]: 'GET', [p.link]: 'POST,DELETE', [p.callback]: 'GET' });
+  const methods = { ...EMAIL_ROUTES, ...WECHAT_ROUTES, '/api/auth/session': 'GET', '/api/auth/logout': 'POST', '/api/auth/account': 'DELETE', '/api/learning': 'GET,PUT,PATCH', [GOOGLE_CREDENTIAL_ROUTE]: 'POST' };
+  for (const p of OAUTH_PROVIDERS) Object.assign(methods, { [p.start]: 'GET', [p.link]: 'POST,DELETE', [p.callback]: 'GET' });
+  methods[PROVIDERS.wechat.link] = 'DELETE';  // linking WeChat goes through /api/auth/wechat/start while signed in
   if (!methods[url.pathname].split(',').includes(request.method)) return response(405, { error: 'method_not_allowed' });
   const starting = providerFor(url.pathname, 'start'), finishing = providerFor(url.pathname, 'callback'), linkingProvider = providerFor(url.pathname, 'link');
   if (!configured(env)) {
-    if (url.pathname === '/api/auth/session') return response(200, { configured: false, providers: { google: false, github: false, email: false }, googleConfigured: false, emailConfigured: false, user: null });
+    if (url.pathname === '/api/auth/session') return response(200, { configured: false, providers: { google: false, github: false, wechat: false, email: false }, googleConfigured: false, emailConfigured: false, user: null });
     if (starting || finishing) return oauthError(env);
     return response(503, { error: 'accounts_not_configured' });
   }
@@ -31,6 +39,11 @@ export async function handleAccounts(request, env, ctx) {
     if (PUBLIC_EMAIL_ROUTES.has(url.pathname)) {
       if (origin !== site) return response(403, { error: 'csrf_failed' });
       return await handleEmailAccount(request, env, ctx, null, kit);
+    }
+    if (url.pathname === WECHAT_START || url.pathname === WECHAT_STATUS) {
+      if (url.pathname === WECHAT_START && origin !== site) return response(403, { error: 'csrf_failed' });
+      if (!wechatConfigured(env)) return response(503, { error: 'wechat_not_configured' });
+      return url.pathname === WECHAT_START ? await startWechatLogin(request, env) : await wechatLoginStatus(request, env);
     }
     if (url.pathname === GOOGLE_CREDENTIAL_ROUTE) {
       if (origin !== site) return response(403, { error: 'csrf_failed' });

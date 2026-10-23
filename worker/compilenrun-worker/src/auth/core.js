@@ -59,7 +59,14 @@ export const PROVIDERS = {
         email, emailVerified, login: clean(user.login, 39) || null };
     },
   },
+  // Not OAuth: the reader sends a one-time code to the Official Account and WeChat's message push reports the
+  // sender's openid (src/auth/wechat.js). No start/callback routes; linking goes through /api/auth/wechat/start.
+  wechat: {
+    key: 'wechat', label: '微信公众号', oauth: false, link: '/api/auth/wechat/link',
+    identities: 'cnr_account_wechat_identities', profiles: 'cnr_account_wechat_profiles', column: 'wechat_openid', hasLogin: false,
+  },
 };
+export const OAUTH_PROVIDERS = Object.values(PROVIDERS).filter(p => p.oauth !== false);
 const providerFor = (pathname, field) => Object.values(PROVIDERS).find(p => p[field] === pathname) || null;
 export const GOOGLE_CREDENTIAL_ROUTE = '/api/auth/google/credential';
 const GOOGLE_JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
@@ -176,14 +183,19 @@ function sameToken(a, b) {
   for (let index = 0; index < a.length; index++) difference |= a.charCodeAt(index) ^ b.charCodeAt(index);
   return difference === 0;
 }
+// The events endpoint only needs the Token (so the 公众平台 URL check can pass first); readers see the WeChat
+// sign-in option only once WECHAT_APP_ID is also set to a real AppID, i.e. when the account is wired up.
+const wechatEventsReady = env => typeof env.WECHAT_TOKEN === 'string' && !!env.WECHAT_TOKEN.trim() && !!env.DB && !!env.AUTH_LIMIT;
 function providerConfigured(p, env) {
+  if (p.oauth === false) return wechatEventsReady(env) && typeof env.WECHAT_APP_ID === 'string' && /^wx[0-9a-z]{10,}$/i.test(env.WECHAT_APP_ID);
   const id = p.clientId(env), secret = p.secret(env);
   return typeof id === 'string' && !!id.trim() && typeof secret === 'string' && !!secret.trim() && !!env.DB && !!env.AUTH_LIMIT;
 }
 const googleConfigured = env => providerConfigured(PROVIDERS.google, env);
 const githubConfigured = env => providerConfigured(PROVIDERS.github, env);
-function configured(env) { return googleConfigured(env) || githubConfigured(env) || emailConfigured(env); }
-function providerFlags(env) { return { google: googleConfigured(env), github: githubConfigured(env), email: emailConfigured(env) }; }
+const wechatConfigured = env => providerConfigured(PROVIDERS.wechat, env);
+function configured(env) { return googleConfigured(env) || githubConfigured(env) || wechatConfigured(env) || emailConfigured(env); }
+function providerFlags(env) { return { google: googleConfigured(env), github: githubConfigured(env), wechat: wechatConfigured(env), email: emailConfigured(env) }; }
 
 async function session(request, db) {
   const token = readCookie(request, SESSION_COOKIE);
@@ -193,18 +205,20 @@ async function session(request, db) {
   // first-unconstrained D1 Session: revoked logins must not reappear on replicas.
   const row = await db.prepare(`SELECT u.id, u.display_name, c.email, c.email_verified_at,
     CASE WHEN c.email_verified_at IS NOT NULL THEN 1 ELSE 0 END AS has_password, g.google_sub AS google_identity, gp.email AS google_email,
-    h.github_id AS github_identity, hp.login AS github_login, hp.email AS github_email
+    h.github_id AS github_identity, hp.login AS github_login, hp.email AS github_email, w.wechat_openid AS wechat_identity
     FROM cnr_account_sessions s JOIN cnr_account_users u ON u.id = s.user_id
     LEFT JOIN cnr_account_password_credentials c ON c.user_id = u.id
     LEFT JOIN cnr_account_google_identities g ON g.user_id = u.id
     LEFT JOIN cnr_account_google_profiles gp ON gp.google_sub = g.google_sub
     LEFT JOIN cnr_account_github_identities h ON h.user_id = u.id
     LEFT JOIN cnr_account_github_profiles hp ON hp.github_id = h.github_id
+    LEFT JOIN cnr_account_wechat_identities w ON w.user_id = u.id
     WHERE s.token_hash = ?1 AND s.expires_at > ?2`).bind(tokenHash, now()).first();
   return row ? { user: { id: row.id, name: row.display_name, email: row.email || null,
     emailVerified: !!row.email_verified_at, hasPassword: !!row.has_password, googleLinked: !!row.google_identity,
     googleEmail: row.google_identity && row.google_email || null, githubLinked: !!row.github_identity,
-    githubLogin: row.github_identity && row.github_login || null, githubEmail: row.github_identity && row.github_email || null },
+    githubLogin: row.github_identity && row.github_login || null, githubEmail: row.github_identity && row.github_email || null,
+    wechatLinked: !!row.wechat_identity },
     tokenHash, csrfToken: await hash('csrf:' + token) } : null;
 }
 
@@ -272,7 +286,12 @@ async function googleLegacyIdentity(db, subject) {
 // authenticate or to match password accounts); a failure must not block sign-in.
 async function saveProfile(p, db, identity, stamp) {
   try {
-    if (p.hasLogin) {
+    if (p.oauth === false) {
+      // WeChat message push carries no nickname or email; the row only records when the openid was last seen.
+      await db.prepare(`INSERT INTO ${p.profiles} (${p.column}, updated_at)
+        SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM ${p.identities} WHERE ${p.column} = ?1)
+        ON CONFLICT(${p.column}) DO UPDATE SET updated_at = excluded.updated_at`).bind(identity.subject, stamp).run();
+    } else if (p.hasLogin) {
       await db.prepare(`INSERT INTO ${p.profiles} (${p.column}, login, email, email_verified, name, updated_at)
         SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM ${p.identities} WHERE ${p.column} = ?1)
         ON CONFLICT(${p.column}) DO UPDATE SET login = excluded.login, email = excluded.email, email_verified = excluded.email_verified, name = excluded.name, updated_at = excluded.updated_at`)
@@ -377,4 +396,4 @@ async function googleCredentialLogin(request, env) {
 }
 
 
-export { response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, verifyGoogleCredential, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE };
+export { response, cookie, readCookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, wechatConfigured, wechatEventsReady, emailConfigured, providerIdentity, signInIdentity, saveProfile, beginOAuth, finishOAuth, googleCredentialLogin, verifyGoogleCredential, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE };

@@ -92,7 +92,8 @@ async function changeCredential(env, kit, credential, newHash, tokenHash, purpos
       AND credential_version = ?5 AND email = ?6 AND EXISTS (SELECT 1 FROM cnr_account_password_credentials
       WHERE user_id = ?2 AND version = ?5 AND email = ?6 AND (?3 != 'reset' OR email_verified_at IS NOT NULL OR NOT EXISTS
         (SELECT 1 FROM cnr_account_google_identities WHERE user_id = ?2) AND NOT EXISTS
-        (SELECT 1 FROM cnr_account_github_identities WHERE user_id = ?2)))`).bind(tokenHash, credential.user_id, purpose, time, credential.version, credential.email),
+        (SELECT 1 FROM cnr_account_github_identities WHERE user_id = ?2) AND NOT EXISTS
+        (SELECT 1 FROM cnr_account_wechat_identities WHERE user_id = ?2)))`).bind(tokenHash, credential.user_id, purpose, time, credential.version, credential.email),
     env.DB.prepare(`UPDATE cnr_account_password_credentials SET password_hash = ?1, email_verified_at = ?2, version = version + 1,
       last_action = ?3, updated_at = ?2 WHERE user_id = ?4 AND version = ?5 AND changes() = 1`)
       .bind(newHash, time, action, credential.user_id, credential.version),
@@ -118,7 +119,8 @@ export async function handleEmailAccount(request, env, ctx, login, kit) {
   if (route === '/api/auth/email' && request.method === 'DELETE') {
     const result = await env.DB.batch([
       env.DB.prepare(`DELETE FROM cnr_account_password_credentials WHERE user_id = ?1 AND email_verified_at IS NULL
-        AND (EXISTS (SELECT 1 FROM cnr_account_google_identities WHERE user_id = ?1) OR EXISTS (SELECT 1 FROM cnr_account_github_identities WHERE user_id = ?1))
+        AND (EXISTS (SELECT 1 FROM cnr_account_google_identities WHERE user_id = ?1) OR EXISTS (SELECT 1 FROM cnr_account_github_identities WHERE user_id = ?1)
+          OR EXISTS (SELECT 1 FROM cnr_account_wechat_identities WHERE user_id = ?1))
         AND EXISTS (SELECT 1 FROM cnr_account_sessions WHERE user_id = ?1 AND token_hash = ?2 AND expires_at > ?3)`)
         .bind(login.user.id, login.tokenHash, stamp()),
       env.DB.prepare('DELETE FROM cnr_account_email_tokens WHERE user_id = ?1 AND changes() = 1').bind(login.user.id),
@@ -209,7 +211,8 @@ export async function handleEmailAccount(request, env, ctx, login, kit) {
   if (route === '/api/auth/resend-verification' || route === '/api/auth/forgot-password') {
     const credential = await env.DB.prepare('SELECT * FROM cnr_account_password_credentials WHERE email = ?1').bind(email).first();
     const oauth = credential ? await env.DB.prepare(`SELECT user_id FROM cnr_account_google_identities WHERE user_id = ?1
-      UNION SELECT user_id FROM cnr_account_github_identities WHERE user_id = ?1`).bind(credential.user_id).first() : null;
+      UNION SELECT user_id FROM cnr_account_github_identities WHERE user_id = ?1
+      UNION SELECT user_id FROM cnr_account_wechat_identities WHERE user_id = ?1`).bind(credential.user_id).first() : null;
     const eligible = route === '/api/auth/forgot-password' ? credential && (credential.email_verified_at || !oauth) : credential && !credential.email_verified_at;
     if (eligible) {
       await issueEmailToken(env, ctx, kit, credential, route === '/api/auth/forgot-password' ? 'reset' : 'verify');

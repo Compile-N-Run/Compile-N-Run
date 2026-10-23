@@ -73,6 +73,7 @@ Simplified Chinese and Chinese quizzes). Unset, they fall back to the compilenru
 | Google client id | `718000240736-hnrumls0f481uteljtu6779dpdnv9qrp.apps.googleusercontent.com` | `1072237482521-hqchdphppq230u5agnavq59kvhjnr4iu.apps.googleusercontent.com` |
 | GitHub client id | `Ov23liduwQHgsDYpjinC` | `Ov23lio0cF8OkEi6J4gI` |
 | OAuth callbacks | `/auth/google_oauth2/callback`, `/auth/github_oauth2/callback` on the site host | the same paths on www.echo.cool |
+| WeChat 公众号 login | off (no `WECHAT_TOKEN`); `providers.wechat` is false | on once the `WECHAT_TOKEN` secret is set; see "WeChat Official Account login" |
 | Email accounts | on | off (no `BREVO_API_KEY`); session discovery reports `email: false`, email routes return `503 email_not_configured` |
 
 Deploy (from this folder, wrangler 4):
@@ -92,6 +93,7 @@ npx wrangler@4 d1 execute echocool-data --remote --file accounts-email-schema.sq
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-google-profile-schema.sql
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-github-schema.sql
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-learning-records-schema.sql
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-schema.sql
 ```
 
 Secrets, set per Worker with `npx wrangler@4 secret put NAME` (add `--config wrangler.echocool.jsonc` for echo.cool):
@@ -137,11 +139,12 @@ The flow uses a random state nonce bound to a separate HttpOnly cookie, S256 PKC
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-google-profile-schema.sql
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-github-schema.sql
    npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-learning-records-schema.sql
+   npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-wechat-schema.sql
    ```
 
 4. Deploy with Wrangler 4 after validating the migration, secret, and Worker changes. The configuration adds only the auth, learning, and Google callback routes (patterns end in `*`: Cloudflare skips the Worker for a wildcard-less pattern once a query string is present) plus the `AUTH_LIMIT` binding (60 account requests per minute per IP). It preserves existing AI/quiz/feedback routes and bindings.
 
-Google and email/password availability are evaluated independently. Session discovery includes `providers: {google, email}`, `googleConfigured`, and `emailConfigured`; `configured` is true if either method is available. Missing Google credentials disable Google without disabling a configured email method. Missing all provider prerequisites disables account operations. Missing database tables return a safe service-unavailable response. Use `node --test tests/accounts-worker.test.mjs tests/auth-security.test.mjs` from the repository root for local validation with real SQLite and mocked Google/Brevo endpoints. These tests do not authenticate a real person or prove the deployed OAuth consent or mail-delivery configuration works. Account endpoints intentionally accept only the production site origin; they do not inherit the AI widget's localhost CORS exception.
+Google and email/password availability are evaluated independently. Session discovery includes `providers: {google, github, wechat, email}`, `googleConfigured`, and `emailConfigured`; `configured` is true if either method is available. Missing Google credentials disable Google without disabling a configured email method. Missing all provider prerequisites disables account operations. Missing database tables return a safe service-unavailable response. Use `node --test tests/accounts-worker.test.mjs tests/auth-security.test.mjs` from the repository root for local validation with real SQLite and mocked Google/Brevo endpoints. These tests do not authenticate a real person or prove the deployed OAuth consent or mail-delivery configuration works. Account endpoints intentionally accept only the production site origin; they do not inherit the AI widget's localhost CORS exception.
 
 ### Browser/API contract
 
@@ -268,3 +271,69 @@ Google to embed (a 43-character token the page generates per load), then finds o
 `hugo/assets/js/auth-ui.js`; the client id comes from `googleClientId` in `hugo/hugo.toml`. In the Google Cloud
 console the OAuth client must list `https://www.compilenrun.com` under "Authorized JavaScript origins" or the
 prompts will not appear.
+
+## WeChat Official Account login
+
+echo.cool readers can sign in with the WeChat Official Account (公众号) instead of OAuth. Cloudflare Workers have no
+fixed egress IP, so the Official Account API (`access_token`, parametric QR codes), which requires an IP whitelist,
+is not used. Everything runs over message push (服务器配置), which only needs WeChat to reach the Worker. The code is
+in `src/auth/wechat.js`; the provider entry (`wechat`, `oauth: false`) is in `src/auth/core.js`.
+
+1. The page calls `POST /api/auth/wechat/start` (same-origin). The Worker stores a pending login with a random
+   6-digit code (unique among stored logins), the hash of a binding token sent as the `__Host-cnr_wx` cookie (HttpOnly,
+   10 minutes), and a 10-minute expiry, and replies `{code, expiresAt}` (ms). With a valid session the pending login
+   is a link for that user and that session; otherwise it is a sign-in. Starting again drops the browser's previous code.
+2. The page shows the account's QR code (a static image) and the code. The reader follows the account and sends the
+   6 digits as a message.
+3. WeChat posts the message to `POST /api/auth/wechat/events`. The Worker checks `signature` (sha1 of the sorted
+   token, timestamp and nonce), rejects timestamps more than 5 minutes off, and confirms the unexpired pending login
+   with that code, storing the sender's openid. It sends a passive text reply ("登录成功！回到网页即可继续。" or
+   "验证码无效或已过期，请在网页上重新获取。"). One openid gets 10 wrong codes per hour, then it is refused for the rest
+   of the hour, so nobody can guess another reader's pending code. A `subscribe` event gets a welcome text with the
+   site URL and how to sign in. Other text gets a short help text. Everything else gets `success`. No upstream calls
+   are made, so replies are well inside WeChat's 5-second limit.
+4. The page polls `GET /api/auth/wechat/status?code=NNNNNN` (every 2-3 s; it shares the 60/min `AUTH_LIMIT`) with the
+   `__Host-cnr_wx` cookie (403 without it or with another browser's cookie). Replies: `{status:'pending'}`,
+   `{status:'expired'}` (row deleted), `{status:'done'}` (sign-in: the account for that openid is found or created,
+   the session and `cnr_signed_in` cookies are set, the binding cookie is cleared), `{status:'linked'}` or
+   `{status:'conflict'}` (the openid already belongs to another account, or this account has a different WeChat
+   linked). A link only completes if the request still carries the session that started it. A confirmed row is
+   consumed exactly once (`DELETE ... RETURNING`); a second poll gets 404.
+
+Session discovery reports `providers.wechat`, and `user.wechatLinked`. `DELETE /api/auth/wechat/link` unlinks with
+the same rule as the other providers: another usable sign-in method must remain. `POST` on that path returns 405;
+linking goes through `start` while signed in. A WeChat identity counts as a sign-in method for the email rules
+(forgot-password and pending-email cancel), like Google and GitHub. Message push carries no nickname or email: a new
+account is named "微信用户" and `cnr_account_wechat_profiles` only records `updated_at`.
+
+**Schema:** `accounts-wechat-schema.sql` (version 5) must be applied to **both** databases (`compilenrun-data` and
+`echocool-data`) before deploying this code, even to the compilenrun Worker where WeChat stays off: `session()`
+joins `cnr_account_wechat_identities` for every signed-in request.
+
+**Configuration** (echocool-worker only; compilenrun-worker has no WeChat settings, so `providers.wechat` is false
+there):
+
+- var `WECHAT_APP_ID` in `wrangler.echocool.jsonc`: the account's AppID (replace `REPLACE_ME_WECHAT_APPID`). When it
+  is set, the AppID inside every encrypted push must match it.
+- secret `WECHAT_TOKEN`: the 服务器配置 Token. WeChat login is enabled when this is set.
+- secret `WECHAT_AES_KEY`: the EncodingAESKey (43 characters), needed only in 兼容模式 or 安全模式.
+
+```sh
+npx wrangler@4 secret put WECHAT_TOKEN --config wrangler.echocool.jsonc
+npx wrangler@4 secret put WECHAT_AES_KEY --config wrangler.echocool.jsonc
+```
+
+**公众平台 settings** (设置与开发 → 基本配置 → 服务器配置): URL `https://www.echo.cool/api/auth/wechat/events`; Token: the
+same value as `WECHAT_TOKEN` (3-32 letters or digits); EncodingAESKey: generate it and store it as `WECHAT_AES_KEY`;
+消息加解密方式: 明文模式, 兼容模式 or 安全模式 (recommended) all work. Deploy the Worker with the secrets first: on 提交,
+WeChat sends the `GET` verification and the Worker echoes `echostr` only for a valid signature. Then click 启用. The
+existing `www.echo.cool/api/auth/*` route already covers the URL.
+
+> **Warning:** enabling 服务器配置 turns off the console's own 自动回复 (subscribe reply, keyword replies) and the
+> 自定义菜单 configured in the console. The Worker's replies (welcome, code confirmation, help text) replace them.
+> Disabling 服务器配置 later brings the console's settings back, but WeChat login stops working.
+
+Encrypted modes follow WeChat's WXBizMsgCrypt: AES-256-CBC with the IV set to the first 16 key bytes, plaintext =
+16 random bytes + 4-byte big-endian length + XML + AppID, and PKCS#7 padding to a 32-byte block. WebCrypto only
+handles 16-byte padding, so the Worker appends one block that decrypts to a full block of `0x10` before decrypting,
+and drops the extra block after encrypting. Replies to encrypted pushes are encrypted and signed (`MsgSignature`).

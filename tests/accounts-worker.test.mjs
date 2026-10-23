@@ -2,6 +2,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
+import { createHash, createDecipheriv } from 'node:crypto';
 import { handleAccounts, ACCOUNT_SITE as SITE, OAUTH_CALLBACK, GITHUB_CALLBACK, SNAPSHOT_MAX_BYTES } from '../worker/compilenrun-worker/src/accounts.js';
 import worker from '../worker/compilenrun-worker/src/index.js';
 
@@ -14,6 +15,7 @@ class D1 {
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-google-profile-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-github-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-learning-records-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -173,7 +175,7 @@ async function passwordLogin(email, password = PASSWORD) {
 test('disabled accounts expose configured:false without querying D1 or affecting AI paths', async () => {
   const disabled = { DB: { prepare() { throw new Error('Must not query'); } } };
   const response = await handleAccounts(request('/api/auth/session'), disabled);
-  assert.deepEqual(await response.json(), { configured: false, providers: { google: false, github: false, email: false }, googleConfigured: false, emailConfigured: false, user: null });
+  assert.deepEqual(await response.json(), { configured: false, providers: { google: false, github: false, wechat: false, email: false }, googleConfigured: false, emailConfigured: false, user: null });
   assert.match(response.headers.get('cache-control'), /no-store/);
   assert.equal(await handleAccounts(request('/api/ask'), disabled), null);
   assert.equal(await handleAccounts(request('/api/feedback'), disabled), null);
@@ -741,4 +743,216 @@ test('emails and the Ask AI prompt follow SITE_NAME / SITE_LANG', async () => {
   assert.match(systemPrompt(echo), /Simplified Chinese/);
   assert.match(systemPrompt({}), /Compile N Run \(compilenrun\.com\)/);
   assert.equal(pageText('<title>列表 | 代码酷</title><article data-pagefind-body><p>x</p></article>', '代码酷').title, '列表');
+});
+
+// ---- WeChat Official Account sign-in (message push) ----
+const WX_TOKEN = 'wechat-test-token', WX_ACCOUNT = 'gh_0123456789ab', WX_APPID = 'wx0123456789abcdef';
+const OPENID_A = 'oAbCdEfGhIjKlMnOpQrStUvWxYz0', OPENID_B = 'oZyXwVuTsRqPoNmLkJiHgFeDcBa9';
+const wxSign = parts => createHash('sha1').update([...parts].map(String).sort().join('')).digest('hex');
+function enableWechat(extra = {}) { Object.assign(env, { SITE_NAME: '代码酷', SITE_LANG: 'zh-CN', WECHAT_TOKEN: WX_TOKEN, WECHAT_APP_ID: WX_APPID }, extra); }
+const wxStart = (cookie = '', headers = { Origin: SITE }) => handleAccounts(request('/api/auth/wechat/start', { method: 'POST', cookie, headers }), env);
+const wxStatus = (code, cookie = '') => handleAccounts(request('/api/auth/wechat/status?code=' + code, { cookie }), env);
+const wxText = (openid, content) => `<xml><ToUserName><![CDATA[${WX_ACCOUNT}]]></ToUserName><FromUserName><![CDATA[${openid}]]></FromUserName><CreateTime>${Math.floor(Date.now() / 1000)}</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[${content}]]></Content><MsgId>1234567890123456</MsgId></xml>`;
+const wxEvent = (openid, event) => `<xml><ToUserName><![CDATA[${WX_ACCOUNT}]]></ToUserName><FromUserName><![CDATA[${openid}]]></FromUserName><CreateTime>${Math.floor(Date.now() / 1000)}</CreateTime><MsgType><![CDATA[event]]></MsgType><Event><![CDATA[${event}]]></Event></xml>`;
+function wxQuery({ timestamp = Math.floor(Date.now() / 1000), nonce = '1405498239', token = WX_TOKEN, extra = {} } = {}) {
+  return new URLSearchParams({ signature: wxSign([token, timestamp, nonce]), timestamp: String(timestamp), nonce, ...extra });
+}
+const wxPush = (xml, options = {}) => handleAccounts(new Request(SITE + '/api/auth/wechat/events?' + wxQuery(options), { method: 'POST', headers: { 'content-type': 'text/xml' }, body: xml }), env);
+const field = (xml, tag) => new RegExp(`<${tag}>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([^<]*))</${tag}>`).exec(xml)?.slice(1).find(v => v !== undefined);
+async function wxLogin(openid) {
+  const started = await wxStart();
+  const { code } = await started.json();
+  const binding = cookiePair(started, '__Host-cnr_wx');
+  await wxPush(wxText(openid, code));
+  const done = await wxStatus(code, binding);
+  assert.deepEqual(await done.json(), { status: 'done' });
+  const cookie = cookiePair(done, '__Host-cnr_session');
+  return { cookie, ...(await sessionOf(cookie)) };
+}
+
+test('WeChat URL verification echoes echostr only for a valid, fresh signature; the provider flag follows WECHAT_TOKEN', async () => {
+  assert.equal((await sessionOf('')).providers.wechat, false);
+  assert.equal((await handleAccounts(new Request(SITE + '/api/auth/wechat/events?' + wxQuery({ extra: { echostr: 'x' } })), env)).status, 404, 'off without WECHAT_TOKEN');
+  enableWechat({ WECHAT_APP_ID: undefined });
+  assert.equal((await sessionOf('')).providers.wechat, false, 'the sign-in option waits for a real AppID');
+  assert.equal((await handleAccounts(new Request(SITE + '/api/auth/wechat/events?' + wxQuery({ extra: { echostr: 'ok' } })), env)).status, 200, 'but the URL check already works with the Token alone');
+  enableWechat();
+  assert.equal((await sessionOf('')).providers.wechat, true);
+  const good = await handleAccounts(new Request(SITE + '/api/auth/wechat/events?' + wxQuery({ extra: { echostr: '4719852374382910' } })), env);
+  assert.equal(good.status, 200);
+  assert.match(good.headers.get('content-type'), /^text\/plain/);
+  assert.equal(await good.text(), '4719852374382910');
+  const bad = await handleAccounts(new Request(SITE + '/api/auth/wechat/events?' + wxQuery({ token: 'wrong-token', extra: { echostr: '1' } })), env);
+  assert.equal(bad.status, 403); assert.notEqual(await bad.text(), '1');
+  const stale = await handleAccounts(new Request(SITE + '/api/auth/wechat/events?' + wxQuery({ timestamp: Math.floor(Date.now() / 1000) - 301, extra: { echostr: '1' } })), env);
+  assert.equal(stale.status, 403);
+});
+
+test('WeChat start issues a unique 6-digit code bound to an HttpOnly cookie; status needs that cookie', async () => {
+  enableWechat();
+  assert.equal((await wxStart('', {})).status, 403, 'start is same-origin only');
+  const original = crypto.getRandomValues, forced = [123456, 123456, 654321];
+  crypto.getRandomValues = function (array) {
+    if (array instanceof Uint32Array && array.length === 1 && forced.length) { array[0] = forced.shift(); return array; }
+    return original.call(crypto, array);
+  };
+  let first, second;
+  try { first = await wxStart(); second = await wxStart(); } finally { crypto.getRandomValues = original; }
+  const one = await first.json(), two = await second.json();
+  assert.equal(one.code, '123456');
+  assert.equal(two.code, '654321', 'a code already pending is never handed out twice');
+  assert.match(one.code, /^\d{6}$/);
+  assert(Math.abs(one.expiresAt - (Date.now() + 600000)) < 5000);
+  assert.match(first.headers.getSetCookie().find(v => v.startsWith('__Host-cnr_wx=')), /^__Host-cnr_wx=[A-Za-z0-9_-]{43}; Path=\/; Max-Age=600; HttpOnly; Secure; SameSite=Lax$/);
+  const row = db.sqlite.prepare('SELECT * FROM cnr_account_wechat_logins WHERE code = ?').get('123456');
+  assert.notEqual(row.binding_hash, cookiePair(first, '__Host-cnr_wx').split('=')[1], 'only the hash is stored');
+  assert.equal(row.user_id, null);
+  assert.equal((await wxStatus('123456')).status, 403);
+  assert.equal((await wxStatus('123456', cookiePair(second, '__Host-cnr_wx'))).status, 403, "another browser's cookie");
+  assert.deepEqual(await (await wxStatus('123456', cookiePair(first, '__Host-cnr_wx'))).json(), { status: 'pending' });
+  assert.equal((await wxStatus('12345x', cookiePair(first, '__Host-cnr_wx'))).status, 400);
+});
+
+test('sending the code to the account confirms the login once; the same openid is the same account next time', async () => {
+  enableWechat();
+  const started = await wxStart();
+  const { code } = await started.json();
+  const binding = cookiePair(started, '__Host-cnr_wx');
+  const wrong = await wxPush(wxText(OPENID_A, code === '000000' ? '000001' : '000000'));
+  assert.equal(field(await wrong.text(), 'Content'), '验证码无效或已过期，请在网页上重新获取。');
+  const help = await wxPush(wxText(OPENID_A, '你好'));
+  assert.match(field(await help.text(), 'Content'), /6 位验证码/);
+  assert.equal((await wxPush(wxText(OPENID_A, code), { timestamp: Math.floor(Date.now() / 1000) - 400 })).status, 403, 'stale push');
+  assert.equal((await wxPush(wxText(OPENID_A, code), { token: 'forged' })).status, 403, 'forged push');
+  assert.deepEqual(await (await wxStatus(code, binding)).json(), { status: 'pending' });
+  const pushed = await wxPush(wxText(OPENID_A, ' ' + code + '\n'));
+  assert.equal(pushed.status, 200);
+  assert.match(pushed.headers.get('content-type'), /^application\/xml/);
+  const reply = await pushed.text();
+  assert.deepEqual([field(reply, 'ToUserName'), field(reply, 'FromUserName'), field(reply, 'MsgType'), field(reply, 'Content')],
+    [OPENID_A, WX_ACCOUNT, 'text', '登录成功！回到网页即可继续。']);
+  assert.match(field(reply, 'CreateTime'), /^\d+$/);
+  const done = await wxStatus(code, binding);
+  assert.deepEqual(await done.json(), { status: 'done' });
+  assert.match(done.headers.getSetCookie().find(v => v.startsWith('__Host-cnr_wx=')), /Max-Age=0/);
+  assert.match(done.headers.getSetCookie().find(v => v.startsWith('cnr_signed_in=')), /cnr_signed_in=1/);
+  const cookie = cookiePair(done, '__Host-cnr_session');
+  const current = await sessionOf(cookie);
+  assert.deepEqual([current.user.wechatLinked, current.user.googleLinked, current.user.name], [true, false, '微信用户']);
+  assert.equal((await wxStatus(code, binding)).status, 404, 'a confirmed login is consumed once');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_logins').get().n, 0);
+  assert(db.sqlite.prepare('SELECT updated_at FROM cnr_account_wechat_profiles WHERE wechat_openid = ?').get(OPENID_A));
+  const again = await wxLogin(OPENID_A);
+  assert.equal(again.user.id, current.user.id);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_users').get().n, 1);
+});
+
+test('an expired WeChat login is reported and deleted, and its code no longer confirms', async () => {
+  enableWechat();
+  const started = await wxStart();
+  const { code } = await started.json();
+  db.sqlite.prepare('UPDATE cnr_account_wechat_logins SET expires_at = 1').run();
+  assert.equal(field(await (await wxPush(wxText(OPENID_A, code))).text(), 'Content'), '验证码无效或已过期，请在网页上重新获取。');
+  assert.deepEqual(await (await wxStatus(code, cookiePair(started, '__Host-cnr_wx'))).json(), { status: 'expired' });
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_logins').get().n, 0);
+});
+
+test('one openid cannot keep guessing codes', async () => {
+  enableWechat();
+  const started = await wxStart();
+  const { code } = await started.json();
+  const other = code === '999999' ? '999998' : '999999';
+  for (let i = 0; i < 10; i++) await wxPush(wxText(OPENID_B, other));
+  assert.match(field(await (await wxPush(wxText(OPENID_B, code))).text(), 'Content'), /错误次数过多/);
+  assert.deepEqual(await (await wxStatus(code, cookiePair(started, '__Host-cnr_wx'))).json(), { status: 'pending' });
+  assert.equal(field(await (await wxPush(wxText(OPENID_A, code))).text(), 'Content'), '登录成功！回到网页即可继续。', 'other readers are unaffected');
+});
+
+test('WeChat link mode attaches the openid to the signed-in account, refuses one owned elsewhere, and unlink needs another method', async () => {
+  enableWechat();
+  const owner = await wxLogin(OPENID_B);  // OPENID_B already has its own account
+  const google = await login('google-user-1');
+  const started = await wxStart(google.cookie);
+  const { code } = await started.json();
+  const binding = cookiePair(started, '__Host-cnr_wx');
+  assert.equal(db.sqlite.prepare('SELECT user_id FROM cnr_account_wechat_logins WHERE code = ?').get(code).user_id, google.user.id);
+  await wxPush(wxText(OPENID_A, code));
+  const linked = await wxStatus(code, [binding, google.cookie].join('; '));
+  assert.deepEqual(await linked.json(), { status: 'linked' });
+  assert.equal(cookiePair(linked, '__Host-cnr_session'), undefined, 'linking keeps the current session');
+  const both = await sessionOf(google.cookie);
+  assert.deepEqual([both.user.googleLinked, both.user.wechatLinked], [true, true]);
+  assert.equal((await wxLogin(OPENID_A)).user.id, google.user.id, 'the linked openid signs in to the Google account');
+  // An openid that belongs to another account cannot be moved.
+  const second = await login('google-user-2');
+  const taken = await wxStart(second.cookie);
+  const takenCode = (await taken.json()).code;
+  await wxPush(wxText(OPENID_B, takenCode));
+  assert.deepEqual(await (await wxStatus(takenCode, [cookiePair(taken, '__Host-cnr_wx'), second.cookie].join('; '))).json(), { status: 'conflict' });
+  assert.equal(db.sqlite.prepare('SELECT user_id FROM cnr_account_wechat_identities WHERE wechat_openid = ?').get(OPENID_B).user_id, owner.user.id);
+  // POST is not an OAuth begin for WeChat.
+  assert.equal((await handleAccounts(request('/api/auth/wechat/link', { method: 'POST', cookie: google.cookie, headers: authHeaders(both) }), env)).status, 405);
+  const unlinked = await handleAccounts(request('/api/auth/wechat/link', { method: 'DELETE', cookie: google.cookie, headers: authHeaders(both) }), env);
+  assert.equal(unlinked.status, 200, 'Google remains');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_identities WHERE user_id = ?').get(google.user.id).n, 0);
+  const only = await wxLogin(OPENID_B);
+  const refused = await handleAccounts(request('/api/auth/wechat/link', { method: 'DELETE', cookie: only.cookie, headers: authHeaders(only) }), env);
+  assert.equal(refused.status, 409);
+});
+
+test('subscribe gets a welcome, unsubscribe and non-text messages get "success"', async () => {
+  enableWechat();
+  const welcome = field(await (await wxPush(wxEvent(OPENID_A, 'subscribe'))).text(), 'Content');
+  assert.match(welcome, /代码酷/); assert.match(welcome, /https:\/\/www\.compilenrun\.com/); assert.match(welcome, /6 位验证码/);
+  assert.equal(await (await wxPush(wxEvent(OPENID_A, 'unsubscribe'))).text(), 'success');
+  const image = `<xml><ToUserName><![CDATA[${WX_ACCOUNT}]]></ToUserName><FromUserName><![CDATA[${OPENID_A}]]></FromUserName><MsgType><![CDATA[image]]></MsgType></xml>`;
+  assert.equal(await (await wxPush(image)).text(), 'success');
+});
+
+test('encrypted (safe mode) pushes are verified, decrypted, and answered encrypted', async () => {
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const aesKey = Buffer.from(raw).toString('base64').slice(0, 43);
+  enableWechat({ WECHAT_AES_KEY: aesKey, WECHAT_APP_ID: WX_APPID });
+  const key = await crypto.subtle.importKey('raw', raw, { name: 'AES-CBC' }, false, ['encrypt']);
+  async function seal(xml, appId = WX_APPID) {
+    const message = Buffer.from(xml), length = Buffer.alloc(4); length.writeUInt32BE(message.length);
+    const body = Buffer.concat([Buffer.from(crypto.getRandomValues(new Uint8Array(16))), length, message, Buffer.from(appId)]);
+    const pad = 32 - body.length % 32;
+    const padded = Buffer.concat([body, Buffer.alloc(pad, pad)]);
+    const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-CBC', iv: raw.slice(0, 16) }, key, padded)).slice(0, padded.length);
+    return Buffer.from(cipher).toString('base64');
+  }
+  function open(encrypted) {
+    const decipher = createDecipheriv('aes-256-cbc', Buffer.from(raw), Buffer.from(raw.slice(0, 16))); decipher.setAutoPadding(false);
+    const plain = Buffer.concat([decipher.update(Buffer.from(encrypted, 'base64')), decipher.final()]);
+    const pad = plain[plain.length - 1];
+    assert(pad >= 1 && pad <= 32);
+    const body = plain.subarray(16, plain.length - pad), length = body.readUInt32BE(0);
+    return { xml: body.subarray(4, 4 + length).toString(), appId: body.subarray(4 + length).toString() };
+  }
+  async function pushEncrypted(inner, { appId, msgSignature } = {}) {
+    const encrypted = await seal(inner, appId), timestamp = Math.floor(Date.now() / 1000), nonce = '987654321';
+    const query = wxQuery({ timestamp, nonce, extra: { encrypt_type: 'aes', msg_signature: msgSignature || wxSign([WX_TOKEN, timestamp, nonce, encrypted]) } });
+    const outer = `<xml><ToUserName><![CDATA[${WX_ACCOUNT}]]></ToUserName><Encrypt><![CDATA[${encrypted}]]></Encrypt></xml>`;
+    return handleAccounts(new Request(SITE + '/api/auth/wechat/events?' + query, { method: 'POST', body: outer }), env);
+  }
+  const started = await wxStart();
+  const { code } = await started.json();
+  const result = await pushEncrypted(wxText(OPENID_A, code));
+  assert.equal(result.status, 200);
+  const reply = await result.text();
+  assert.equal(field(reply, 'Content'), undefined, 'no plaintext in the reply');
+  const [encrypted, signature, timestamp, nonce] = ['Encrypt', 'MsgSignature', 'TimeStamp', 'Nonce'].map(tag => field(reply, tag));
+  assert.equal(signature, wxSign([WX_TOKEN, timestamp, nonce, encrypted]), 'MsgSignature verifies');
+  const opened = open(encrypted);
+  assert.equal(opened.appId, WX_APPID);
+  assert.deepEqual([field(opened.xml, 'ToUserName'), field(opened.xml, 'FromUserName'), field(opened.xml, 'Content')], [OPENID_A, WX_ACCOUNT, '登录成功！回到网页即可继续。']);
+  assert.deepEqual(await (await wxStatus(code, cookiePair(started, '__Host-cnr_wx'))).json(), { status: 'done' });
+  assert.equal((await pushEncrypted(wxText(OPENID_A, '123456'), { msgSignature: 'f'.repeat(40) })).status, 403, 'bad msg_signature');
+  assert.equal((await pushEncrypted(wxText(OPENID_A, '123456'), { appId: 'wxsomeoneelse00000' })).status, 403, 'foreign appid');
+  // Every padding length WeChat can produce (1-32 bytes) decrypts.
+  for (let extra = 0; extra < 32; extra++) {
+    const res = await pushEncrypted(wxText(OPENID_A, 'x'.repeat(extra)));
+    assert.equal(res.status, 200, 'padding case ' + extra);
+  }
 });
