@@ -4,7 +4,28 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),http=require('node:http');
 const {chromium}=require(process.env.CNR_PLAYWRIGHT_MODULE||'playwright');
 const root=path.resolve(__dirname,'..');
-const partial=fs.readFileSync(path.join(root,'hugo/layouts/partials/account-menu.html'),'utf8');
+const WECHAT_PANEL=`  <div class="cnr-auth-dialog__wechat" data-auth-wechat-panel hidden>
+    <img class="cnr-auth-dialog__wechat-qr" data-auth-wechat-qr alt="WeChat Official Account QR code" width="180" height="180" loading="lazy" draggable="false">
+    <ol class="cnr-auth-dialog__wechat-steps">
+      <li>Open WeChat and scan this QR code.</li>
+      <li>Follow the Official Account.</li>
+      <li>Send the code below in the chat.</li>
+    </ol>
+    <p class="cnr-auth-dialog__wechat-code" data-auth-wechat-code aria-label="Sign-in code"></p>
+    <p class="cnr-auth-dialog__wechat-expires" data-auth-wechat-expires aria-live="off"></p>
+    <p class="cnr-auth-dialog__wechat-status" data-auth-wechat-status role="status"></p>
+    <div class="cnr-auth-dialog__wechat-actions">
+      <button type="button" class="cnr-auth-dialog__submit" data-auth-wechat-renew hidden>Get a new code</button>
+      <button type="button" class="cnr-auth-dialog__retry" data-auth-wechat-back>Back</button>
+    </div>
+  </div>
+  <div class="cnr-auth-dialog__divider" data-auth-wechat-others hidden><span>or sign in another way</span></div>
+`;
+const WECHAT_BUTTON=`  <button type="button" class="cnr-auth-dialog__google" data-auth-wechat hidden><svg class="cnr-auth-dialog__wechat-mark" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M9.5 4C5.36 4 2 6.83 2 10.3c0 1.9 1 3.6 2.6 4.75l-.65 2.3 2.7-1.4c.9.28 1.85.45 2.85.45h.36a5.3 5.3 0 0 1-.2-1.4c0-3.42 3.3-6.2 7.37-6.2.3 0 .58.02.87.05C17.2 6.02 13.7 4 9.5 4Zm-2.75 4.2a1 1 0 1 1 0 2 1 1 0 0 1 0-2Zm5.5 0a1 1 0 1 1 0 2 1 1 0 0 1 0-2ZM16.9 10c-3.36 0-6.1 2.28-6.1 5.1 0 2.81 2.74 5.1 6.1 5.1.8 0 1.57-.13 2.27-.36L21.4 21l-.55-1.9C22.1 18.16 23 16.7 23 15.1c0-2.82-2.73-5.1-6.1-5.1Zm-2.1 3.3a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8Zm4.2 0a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8Z"/></svg>Sign in with WeChat</button>
+`;
+const partial=fs.readFileSync(path.join(root,'hugo/layouts/partials/account-menu.html'),'utf8')
+ .replace('  <div class="cnr-auth-dialog__gsi" data-auth-google-gsi hidden></div>',WECHAT_PANEL+'  <div class="cnr-auth-dialog__gsi" data-auth-google-gsi hidden></div>')
+ .replace('  <div class="cnr-auth-dialog__divider" data-auth-divider hidden>',WECHAT_BUTTON+'  <div class="cnr-auth-dialog__divider" data-auth-divider hidden>');
 const user=(id='user-a',name='Alex Learner')=>({id,name,email:'alex@example.invalid',emailVerified:true,hasPassword:true,googleLinked:true});
 const state=()=>({configured:true,providers:{google:true,github:true,email:true,wechat:false},user:null,csrfToken:'csrf-a',calls:[],offline:false,loginError:false});
 let browser,server,origin;

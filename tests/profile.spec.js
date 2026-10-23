@@ -12,7 +12,16 @@ const LOCAL = { v: 1, done: { '/docs/language/css/': 1 }, tuts: {} };
 function user(extra = {}) { return { id: 'account-a', name: 'Alex', email: EMAIL, emailVerified: true, hasPassword: true, googleLinked: false, ...extra }; }
 function model() { return { configured: true, providers: { google: true, email: true }, user: null, csrfToken: 'profile-csrf', credential: null, pending: null, calls: [], offline: false, linkURL: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=test&state=one-time-test' }; }
 let server, browser, origin;
-const template = fs.readFileSync(path.join(root, 'hugo/layouts/profile/single.html'), 'utf8').replace(/{{[^}]*}}/g, '');
+// The English profile page has no WeChat block; the harness adds 代码酷's (English wording) so profile.js stays covered.
+const WECHAT_BLOCK = `      <p data-profile-wechat-status hidden></p>
+      <div class="cnr-profile__actions">
+        <button type="button" class="cnr-profile__button" data-profile-link-wechat hidden>Link WeChat</button>
+        <button type="button" class="cnr-profile__button" data-profile-unlink-wechat hidden>Unlink WeChat</button>
+      </div>
+      <p data-profile-wechat-help class="cnr-profile__muted" hidden></p>
+`;
+const template = fs.readFileSync(path.join(root, 'hugo/layouts/profile/single.html'), 'utf8').replace(/{{[^}]*}}/g, '')
+  .replace('      <button type="button" class="cnr-profile__button" data-profile-cancel-email hidden>', WECHAT_BLOCK + '      <button type="button" class="cnr-profile__button" data-profile-cancel-email hidden>');
 before(async () => {
   server = http.createServer((req, res) => {
     if (req.url === '/profile.js' || req.url === '/profile.css') { const ext = req.url.endsWith('.js') ? 'js' : 'css'; res.setHeader('Content-Type', ext === 'js' ? 'text/javascript' : 'text/css'); return res.end(fs.readFileSync(path.join(root, `hugo/assets/${ext}/profile.${ext}`))); }
