@@ -57,8 +57,8 @@ for (const width of [997, 1024, 1100, 1200, 1280, 1320, 1440, 1480]) {
     for (const href of ['/roadmap/', '/playground/', '/learn/']) await expect(learn.locator(`a[href="${href}"]`)).toBeVisible();
     const learnBox = await learn.boundingBox();
     expect(learnBox.x + learnBox.width).toBeLessThanOrEqual(width);
-    const forumVisible = await nav.locator('.cnr-nav__forum').isVisible();
-    if (!forumVisible) await expect(learn.locator('a[href="https://forum.compilenrun.com/"]')).toBeVisible();
+    const moodleVisible = await nav.locator('.cnr-nav__moodle').isVisible();
+    if (!moodleVisible) await expect(learn.locator('a[href="https://moodle.compilenrun.com/"]')).toBeVisible();
     await page.keyboard.press('Escape');
     await expect(learn).not.toBeVisible();
     await expect(nav.locator('.navbar__inner > .navbar__items--right > .cnr-nav__link[href="/roadmap/"]')).toHaveCount(0);
