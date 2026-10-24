@@ -715,8 +715,8 @@ const config = {
                             position: 'right',
                         },
                         {
-                            label: 'Forum',
-                            href: 'https://forum.compilenrun.com/',
+                            label: 'Moodle',
+                            href: 'https://moodle.compilenrun.com/',
                             position: 'right',
                         },
                         {
@@ -754,8 +754,8 @@ const config = {
                             title: 'Links',
                             items: [
                                 {
-                                    label: 'Forum',
-                                    href: 'https://forum.compilenrun.com/',
+                                    label: 'Moodle courses',
+                                    href: 'https://moodle.compilenrun.com/',
                                 },
                                 {
                                     label: 'About',
