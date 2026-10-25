@@ -387,3 +387,25 @@ Encrypted modes follow WeChat's WXBizMsgCrypt: AES-256-CBC with the IV set to th
 16 random bytes + 4-byte big-endian length + XML + AppID, and PKCS#7 padding to a 32-byte block. WebCrypto only
 handles 16-byte padding, so the Worker appends one block that decrypts to a full block of `0x10` before decrypting,
 and drops the extra block after encrypting. Replies to encrypted pushes are encrypted and signed (`MsgSignature`).
+
+## Behaviour events (first-party analytics)
+
+`POST /api/events` (src/events/routes.js) stores page views and interaction events in the `cnr_events` table
+(accounts-events-schema.sql) together with the account id, so activity can be joined to names and emails. The same
+events go to Google Analytics 4 with the account id as `user_id` (hugo/assets/js/analytics.js). Two senders:
+
+- the site: beacons from `analytics.js`; the session cookie identifies the reader. Origin must be SITE_ORIGIN (or a
+  same-origin request without Origin, which browsers mark with `Sec-Fetch-Site: same-origin`).
+- Moodle: the plugin `local_cnranalytics` (kept in ~/moodle-python-course/plugins, installed by
+  install_cnranalytics.sh) ships a copy of `analytics.js` and a token `base64url(JSON{mu,su,em,nm,exp}).base64url(HMAC)`
+  signed with the SSO client secret (SSO_CLIENT_SECRET). The Worker resolves the account from the SSO-linked id,
+  else by verified email; unmatched Moodle users keep their name/email in `props`. Allowed origins: EVENTS_EXTRA_ORIGINS.
+
+Limits: 25 events and 32 KB per request, EVENTS_LIMIT 120 requests per minute per IP, props up to 2000 characters.
+Consent: EEA/UK/CH readers see a consent bar (timezone heuristic; GA Consent Mode uses the real region) and nothing is
+sent before they accept; the profile page has an opt-out switch and Global Privacy Control is honoured. Retention: the
+cron trigger (`17 3 * * *`) deletes rows older than 400 days; deleting an account sets its rows' user_id to NULL.
+
+Reports: `python3 tools/events_report.py overview|users|user <id|email|name>|pages|events|funnel|moodle|sql|export`
+(runs `npx wrangler@4 d1 execute --remote`; see the docstring). Export CSV for a spreadsheet or BigQuery when SQL is
+not enough.
