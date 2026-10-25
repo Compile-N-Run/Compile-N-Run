@@ -409,3 +409,18 @@ cron trigger (`17 3 * * *`) deletes rows older than 400 days; deleting an accoun
 Reports: `python3 tools/events_report.py overview|users|user <id|email|name>|pages|events|funnel|moodle|sql|export`
 (runs `npx wrangler@4 d1 execute --remote`; see the docstring). Export CSV for a spreadsheet or BigQuery when SQL is
 not enough.
+
+## Analytics dashboard (analytics.compilenrun.com)
+
+`analytics-dashboard/` is a static front end deployed with `npx wrangler@4 deploy` from that folder (Cloudflare static
+assets, custom domain created by wrangler; also https://cnr-analytics.echo-cool.workers.dev). It reads
+`/api/analytics/*` on this Worker (src/analytics/routes.js): summary, daily, events, pages, learners, learner?id=,
+funnel, moodle, live, countries, hours, retention, logout, and `POST query` (one SELECT, wrapped and capped at 1000
+rows; statements and sensitive tables are refused by a keyword list).
+
+Access: only accounts in `ANALYTICS_ADMINS` (account ids or verified emails). The dashboard origin has no site cookie
+(the session cookie is `__Host-`/Lax), so the dashboard sends the browser to `/api/analytics/connect?return=<origin>`
+on www; the Worker checks the session (sending signed-out readers through the login dialog with `?auth=login&next=`),
+issues a 12-hour bearer token stored hashed in `cnr_account_sso_grants` (kind token, client analytics-dashboard) and
+redirects back with `#token=`. `ANALYTICS_ORIGINS` lists the origins allowed for CORS and as return targets.
+To add an administrator: append their account id or verified email to `ANALYTICS_ADMINS` in wrangler.jsonc and deploy.
