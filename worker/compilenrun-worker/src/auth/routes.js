@@ -1,9 +1,10 @@
 import { EMAIL_ROUTES, PUBLIC_EMAIL_ROUTES, handleEmailAccount } from '../email-accounts.js';
 import { limitedJSON } from '../lib/body.js';
+import { SSO_ROUTES, ssoConfigured, handleSSO } from './sso.js';
 import { handleLearning } from '../learning/routes.js';
 import { WECHAT_ROUTES, WECHAT_START, WECHAT_EVENTS, WECHAT_STATUS, WECHAT_POOL, handleWechatEvents, handleWechatPool, wechatPoolConfigured, startWechatLogin, wechatLoginStatus } from './wechat.js';
 import { siteOrigin, PROVIDERS, OAUTH_PROVIDERS, wechatConfigured, wechatEventsReady, GOOGLE_CREDENTIAL_ROUTE, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
-const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/account', '/api/learning', GOOGLE_CREDENTIAL_ROUTE, ...Object.keys(EMAIL_ROUTES),
+const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/account', '/api/learning', GOOGLE_CREDENTIAL_ROUTE, ...Object.keys(EMAIL_ROUTES), ...Object.keys(SSO_ROUTES),
   ...Object.keys(WECHAT_ROUTES), ...OAUTH_PROVIDERS.flatMap(p => [p.start, p.link, p.callback]), PROVIDERS.wechat.link]);
 
 export async function handleAccounts(request, env, ctx) {
@@ -26,7 +27,7 @@ export async function handleAccounts(request, env, ctx) {
   }
   const origin = request.headers.get('origin');
   if (origin && origin !== site) return response(403, { error: 'origin_not_allowed' });
-  const methods = { ...EMAIL_ROUTES, ...WECHAT_ROUTES, '/api/auth/session': 'GET', '/api/auth/logout': 'POST', '/api/auth/account': 'DELETE', '/api/learning': 'GET,PUT,PATCH', [GOOGLE_CREDENTIAL_ROUTE]: 'POST' };
+  const methods = { ...EMAIL_ROUTES, ...WECHAT_ROUTES, ...SSO_ROUTES, '/api/auth/session': 'GET', '/api/auth/logout': 'POST', '/api/auth/account': 'DELETE', '/api/learning': 'GET,PUT,PATCH', [GOOGLE_CREDENTIAL_ROUTE]: 'POST' };
   for (const p of OAUTH_PROVIDERS) Object.assign(methods, { [p.start]: 'GET', [p.link]: 'POST,DELETE', [p.callback]: 'GET' });
   methods[PROVIDERS.wechat.link] = 'DELETE';  // linking WeChat goes through /api/auth/wechat/start while signed in
   if (!methods[url.pathname].split(',').includes(request.method)) return response(405, { error: 'method_not_allowed' });
@@ -40,6 +41,9 @@ export async function handleAccounts(request, env, ctx) {
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     const rate = await env.AUTH_LIMIT.limit({ key: await hash(ip) });
     if (!rate.success) return finishing ? oauthError(env) : response(429, { error: 'rate_limited' });
+    // Sister-site sign-on: the authorize step runs in the reader's browser; token and userinfo are server-to-server
+    // calls from Moodle (no Origin header, authenticated by the client secret / access token).
+    if (SSO_ROUTES[url.pathname]) return ssoConfigured(env) ? await handleSSO(request, env) : response(404, { error: 'not_found' });
     if (starting) return providerConfigured(starting, env) ? await beginOAuth(starting, request, env) : oauthError(env);
     if (finishing) return providerConfigured(finishing, env) ? await finishOAuth(finishing, request, env) : oauthError(env);
     const kit = { reply: response, readJSON: limitedJSON, hash, randomToken, issueSession, expiredSessionCookie: () => cookie(SESSION_COOKIE, '', 0) };

@@ -99,11 +99,18 @@
   // remembered from the last real answer so the popup can render before it asks.
   const HINT='cnr_signed_in', PROVIDERS_KEY='cnr-auth-providers';
   const hinted=()=>new RegExp('(?:^|;\\s*)'+HINT+'=1(?:;|$)').test(document.cookie);
-  function setHint(on){try{document.cookie=HINT+'='+(on?'1':'')+'; Path=/; Max-Age='+(on?2592000:0)+'; SameSite=Lax'+(location.protocol==='https:'?'; Secure':'');}catch(_){}}
+  // Domain-wide (compilenrun.com) so Moodle can sign readers in automatically; clearing also drops the older host-only cookie.
+  const HINT_DOMAIN=(h=>h.length>=2&&!/^\d+$/.test(h[h.length-1])?'; Domain='+h.slice(-2).join('.'):'')(location.hostname.split('.'));
+  function setHint(on){try{const base=HINT+'='+(on?'1':'')+'; Path=/; Max-Age='+(on?2592000:0)+'; SameSite=Lax'+(location.protocol==='https:'?'; Secure':'');if(!on)document.cookie=base;document.cookie=base+HINT_DOMAIN;}catch(_){}}
+  // Sister-site sign-on (Moodle): /api/auth/oauth/authorize sends signed-out readers here with ?auth=login&next=<authorize url>.
+  // The target survives a full-page Google/GitHub round trip in sessionStorage and is used once the session exists.
+  const SSO_KEY='cnr-sso-next';
+  const ssoNext=(()=>{try{const p=new URLSearchParams(location.search);const n=p.get('auth')==='login'?p.get('next')||'':'';if(/^\/api\/auth\/oauth\/authorize\?[\w%&=.+-]+$/.test(n)){sessionStorage.setItem(SSO_KEY,n);return n;}return sessionStorage.getItem(SSO_KEY)||'';}catch(_){return '';}})();
+  function ssoContinue(user){if(!ssoNext||!user)return false;try{sessionStorage.removeItem(SSO_KEY);}catch(_){}location.replace(ssoNext);return true;}
   function rememberProviders(p){try{localStorage.setItem(PROVIDERS_KEY,JSON.stringify({google:p.google===true,github:p.github===true,email:p.email===true,wechat:p.wechat===true}));}catch(_){}}
   function guestSession(){let p=null;try{p=JSON.parse(localStorage.getItem(PROVIDERS_KEY));}catch(_){p=null;}
     return {configured:true,providers:p&&typeof p==='object'?{google:p.google===true,github:p.github===true,email:p.email===true,wechat:p.wechat===true}:{google:true,github:true,email:true,wechat:false},user:null};}
-  const mustCheck=()=>hinted()||/^\/profile\//.test(location.pathname)||/[?&#]auth=/.test(location.search+location.hash);
+  const mustCheck=()=>hinted()||/^\/profile\//.test(location.pathname)||/[?&#]auth=/.test(location.search+location.hash)||(()=>{try{return !!sessionStorage.getItem('cnr-sso-next');}catch(_){return false;}})();
   // Sign-in invitations (the popup and Google One Tap) share one snooze record.
   const INVITE_KEY='cnr-auth-invite',DAY=86400000;
   const inviteStore={get(){try{return JSON.parse(localStorage.getItem(INVITE_KEY))||{};}catch(_){return{};}},set(v){try{localStorage.setItem(INVITE_KEY,JSON.stringify(v));}catch(_){}}};
@@ -615,4 +622,8 @@
   // A recovered network immediately retries an unknown/failed session check.
   // Guests (no hint cookie) start from a synthetic guest session and only ask the server when the popup opens.
   initial=Promise.resolve().then(()=>mustCheck()?fetchSession({force:true,reason:'initial'}):accept(guestSession(),'initial')).catch(()=>clone(current));
+  if(ssoNext){
+    window.addEventListener('cnr:auth-changed',event=>{if(event.detail?.session?.user)ssoContinue(event.detail.session.user);});
+    initial.then(s=>{if(!ssoContinue(s?.user)&&/[?&]auth=login/.test(location.search))openDialog('login');}).catch(()=>{});
+  }
 })();

@@ -125,13 +125,29 @@ const now = () => Math.floor(Date.now() / 1000);
 // A readable "signed in" hint next to the HttpOnly session cookie, so pages only ask /api/auth/session when a
 // session may exist (guests skip the request entirely). It carries no secret: only the presence matters.
 const HINT_COOKIE = 'cnr_signed_in';
+// Registrable domain of the site (www.compilenrun.com -> compilenrun.com); empty for localhost-style origins.
+let hintDomainValue = null;
+function hintDomain() {
+  if (hintDomainValue === null) {
+    const host = new URL(SITE).hostname.split('.');
+    hintDomainValue = host.length >= 2 ? host.slice(-2).join('.') : '';
+  }
+  return hintDomainValue;
+}
 function withHint(cookies) {
   const out = [];
   for (const value of cookies) {
     out.push(value);
     if (!value.startsWith(`${SESSION_COOKIE}=`)) continue;
-    out.push(value.includes('Max-Age=0') ? `${HINT_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Lax`
-      : `${HINT_COOKIE}=1; Path=/; Max-Age=${SESSION_SECONDS}; Secure; SameSite=Lax`);
+    // Domain-wide so sister sites (moodle.compilenrun.com) can tell a reader is signed in; on sign-out clear both
+    // the domain cookie and the host-only cookie that older sessions still carry.
+    // Both a host-only and a domain cookie are written: the host-only one keeps deployments on other domains
+    // (echocool-worker) working, where browsers ignore the compilenrun.com Domain attribute.
+    const domain = hintDomain();
+    const clearing = value.includes('Max-Age=0');
+    const attrs = clearing ? 'Path=/; Max-Age=0; Secure; SameSite=Lax' : `Path=/; Max-Age=${SESSION_SECONDS}; Secure; SameSite=Lax`;
+    out.push(`${HINT_COOKIE}=${clearing ? '' : '1'}; ${attrs}`);
+    if (domain) out.push(`${HINT_COOKIE}=${clearing ? '' : '1'}; ${attrs}; Domain=${domain}`);
   }
   return out;
 }
