@@ -4,6 +4,7 @@ import { corsFor, json } from './lib/http.js';
 import { ask } from './ai/ask.js';
 import { quiz } from './ai/quiz.js';
 import { feedback } from './feedback.js';
+import { EVENTS_ROUTE, handleEvents, purgeOldEvents } from './events/routes.js';
 
 // Preserve the helper imports used by existing integrations.
 export { pageText } from './ai/page-content.js';
@@ -12,6 +13,8 @@ export { questionSplitter } from './ai/quiz.js';
 const handlers = { '/api/ask': ask, '/api/quiz': quiz, '/api/feedback': feedback };
 export default {
   async fetch(request, env, ctx) {
+    // Behaviour events accept beacons from the site and from Moodle (own CORS rules), so they come first.
+    if (new URL(request.url).pathname === EVENTS_ROUTE) return handleEvents(request, env, ctx);
     const accountResponse = await handleAccounts(request, env, ctx);
     if (accountResponse) return accountResponse;
     const cors = corsFor(request.headers.get('Origin') || '', env);
@@ -22,4 +25,5 @@ export default {
     if (!handler) return json(404, { error: 'not_found' }, cors);
     return handler(request, env, ctx, cors, request.headers.get('CF-Connecting-IP') || 'unknown');
   },
+  async scheduled(controller, env, ctx) { ctx.waitUntil(purgeOldEvents(env)); },
 };

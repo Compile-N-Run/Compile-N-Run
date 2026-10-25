@@ -5,7 +5,7 @@ description: The Compile N Run privacy policy explains what data we collect, how
 
 # Privacy Policy
 
-**Last updated: October 15, 2026**
+**Last updated: October 24, 2026**
 
 This Privacy Policy describes how **Compile N Run** ("we", "us", or "our"), operator of [https://www.compilenrun.com](https://www.compilenrun.com) (the "Site"), collects, uses, and shares information when you visit the Site. By using the Site, you agree to the practices described in this policy.
 
@@ -59,13 +59,14 @@ For more information about how Google uses data when you use our partners' sites
 
 ## Analytics
 
-To understand how our content is used and to improve it, we use privacy-conscious analytics services, which may include:
+To understand how our content is used and to improve it, we use the following analytics services:
 
+- **Google Analytics** — collects page views and interaction events (for example running a code example, marking a lesson as read, or opening a course). When you are signed in, we send Google Analytics a random account number so that your visits on different days and devices can be counted as one learner. We never send Google your name or email address. Google's use of this data is described at [https://policies.google.com/technologies/partner-sites](https://policies.google.com/technologies/partner-sites).
+- **Our own usage log** — the same page views and interaction events are also recorded on our own servers, together with your account when you are signed in, on both www.compilenrun.com and our course site moodle.compilenrun.com. We use this log to see which tutorials, exercises and course activities help learners, to answer support questions about your account, and to improve the Site. This log is deleted after 400 days, and is deleted immediately when you delete your account.
 - **Umami Analytics** — a privacy-focused analytics tool that does not use cookies to track individuals across sites.
 - **Microsoft Clarity** — which helps us understand how visitors interact with the Site through usage metrics and aggregated session data.
-- **Google services** — which may collect usage statistics as described above.
 
-These services collect aggregated, non-identifying usage information that helps us improve the Site.
+If you are in the European Economic Area, the United Kingdom or Switzerland, analytics and advertising storage stay off until you accept them in the choice bar shown on your first visit. Everyone can turn usage analytics off at any time with the switch on the [profile page](/profile/); browsers that send a Global Privacy Control signal are treated as having turned it off.
 
 ## Third-Party Links
 
@@ -77,7 +78,7 @@ The Site is intended for a general audience and is not directed to children unde
 
 ## Your Rights and Choices
 
-Depending on your location, you may have rights regarding your personal data, including the right to access, correct, or delete it, and the right to opt out of personalized advertising. To exercise any of these rights, or to ask a question about your data, please contact us using the details below.
+Depending on your location, you may have rights regarding your personal data, including the right to access, correct, or delete it, and the right to opt out of personalized advertising. You can turn usage analytics off on the [profile page](/profile/) and delete your account, including its usage log, from the same page. To exercise any other rights, or to ask a question about your data, please contact us using the details below.
 
 ## Data Retention and Security
 
