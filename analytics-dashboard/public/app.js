@@ -106,7 +106,7 @@
     const multi = datasets.length > 1;
     datasets.forEach((d, i) => {
       const color = d.color || css('--s' + (i + 1));
-      if (type === 'line') Object.assign(d, { borderColor: color, backgroundColor: color, borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, pointHitRadius: 12, tension: 0, fill: false });
+      if (type === 'line') Object.assign(d, { borderColor: color, backgroundColor: color, borderWidth: 2, pointRadius: labels.length > 1 ? 0 : 4, pointHoverRadius: 4, pointHitRadius: 12, tension: 0, fill: false });
       else Object.assign(d, { backgroundColor: color, borderColor: css('--surface'), borderWidth: d.stack ? { top: 2, right: 0, bottom: 0, left: 0 } : 0, borderRadius: 4, borderSkipped: 'start', maxBarThickness: 26 });
     });
     const axes = extra && extra.horizontal;
