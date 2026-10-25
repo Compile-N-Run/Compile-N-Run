@@ -5,6 +5,7 @@ import { ask } from './ai/ask.js';
 import { quiz } from './ai/quiz.js';
 import { feedback } from './feedback.js';
 import { EVENTS_ROUTE, handleEvents, purgeOldEvents } from './events/routes.js';
+import { ANALYTICS_PREFIX, handleAnalytics } from './analytics/routes.js';
 
 // Preserve the helper imports used by existing integrations.
 export { pageText } from './ai/page-content.js';
@@ -14,7 +15,10 @@ const handlers = { '/api/ask': ask, '/api/quiz': quiz, '/api/feedback': feedback
 export default {
   async fetch(request, env, ctx) {
     // Behaviour events accept beacons from the site and from Moodle (own CORS rules), so they come first.
-    if (new URL(request.url).pathname === EVENTS_ROUTE) return handleEvents(request, env, ctx);
+    const pathname = new URL(request.url).pathname;
+    if (pathname === EVENTS_ROUTE) return handleEvents(request, env, ctx);
+    // Read-only reports for the analytics dashboard (admin bearer token; own CORS rules).
+    if (pathname.startsWith(ANALYTICS_PREFIX)) return handleAnalytics(request, env);
     const accountResponse = await handleAccounts(request, env, ctx);
     if (accountResponse) return accountResponse;
     const cors = corsFor(request.headers.get('Origin') || '', env);
