@@ -141,7 +141,7 @@ def main(argv=None):
             print(f'[dry-run] would GET {origin}/api/auth/wechat/pool; assuming an empty pool')
         else:
             available, expiring = pool_status(origin, pool_secret)
-        usable = available - expiring          # what will still be there at the next run (every 6 hours)
+        usable = available - expiring          # what will still be there at the next run
         need = max(0, target - usable)
         if need == 0:
             print(f'pool ok: available={available} expiringSoon={expiring} target={target}')
@@ -154,18 +154,31 @@ def main(argv=None):
             return 0
         token = None if args.mock else access_token(env['WECHAT_APP_ID'].strip(), env['WECHAT_APP_SECRET'].strip())
         make = mock_ticket if args.mock else wechat_ticket
-        tickets = []
+        # Uploaded as they are created, so a long first fill (a WeChat call takes about half a second) starts
+        # serving scans right away and nothing is lost if the run is interrupted.
+        created = inserted = 0
+        now_available = available
+        pending = []
+
+        def flush():
+            nonlocal created, inserted, now_available, pending
+            if pending:
+                added, now_available = upload(origin, pool_secret, pending)
+                created += len(pending)
+                inserted += added
+                pending = []
         try:
             for index in range(need):
                 if index and not args.mock:
                     time.sleep(CREATE_DELAY)
-                tickets.append(make(token, new_scene()))
+                pending.append(make(token, new_scene()))
+                if len(pending) >= UPLOAD_BATCH:
+                    flush()
         except PoolError:
-            if tickets:   # keep what was created; the error is still reported below
-                upload(origin, pool_secret, tickets)
+            flush()   # keep what was created; the error is still reported below
             raise
-        inserted, now_available = upload(origin, pool_secret, tickets)
-        print(f'pool topped up: created={len(tickets)} inserted={inserted} available={now_available} target={target}'
+        flush()
+        print(f'pool topped up: created={created} inserted={inserted} available={now_available} target={target}'
               + (' (mock)' if args.mock else ''))
         return 0
     except PoolError as error:
