@@ -19,7 +19,7 @@ const seconds = () => Math.floor(Date.now() / 1000);
 class D1 {
   constructor() {
     this.sqlite = new DatabaseSync(':memory:');
-    for (const file of ['accounts-schema.sql', 'accounts-email-schema.sql', 'accounts-google-profile-schema.sql', 'accounts-github-schema.sql', 'accounts-wechat-schema.sql', 'accounts-wechat-qr-schema.sql']) {
+    for (const file of ['accounts-schema.sql', 'accounts-email-schema.sql', 'accounts-google-profile-schema.sql', 'accounts-github-schema.sql', 'accounts-wechat-schema.sql', 'accounts-wechat-qr-schema.sql', 'accounts-wechat-userinfo-schema.sql']) {
       this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/' + file, import.meta.url), 'utf8'));
     }
     this.beforeBatch = null;

@@ -94,6 +94,8 @@ npx wrangler@4 d1 execute echocool-data --remote --file accounts-google-profile-
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-github-schema.sql
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-learning-records-schema.sql
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-schema.sql
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-qr-schema.sql
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-userinfo-schema.sql
 ```
 
 Secrets, set per Worker with `npx wrangler@4 secret put NAME` (add `--config wrangler.echocool.jsonc` for echo.cool):
@@ -325,6 +327,20 @@ linking goes through `start` while signed in. A WeChat identity counts as a sign
 (forgot-password and pending-email cancel), like Google and GitHub. Message push carries no nickname or email: a new
 account is named "微信用户" and `cnr_account_wechat_profiles` only records `updated_at`.
 
+**Nickname and avatar (网页授权).** Message push carries only the openid, and `cgi-bin/user/info` stopped returning
+nicknames and avatars in 2021, so the account's replies (after a scan/code login, and to any other text) end with a
+link to `GET /api/auth/wechat/profile` once the `WECHAT_APP_SECRET` secret is set. Tapped inside WeChat, that page
+offers a button to `GET /api/auth/wechat/profile/start`, which sets a state cookie (`__Host-cnr_wxp`, 10 minutes) and
+redirects to `open.weixin.qq.com/connect/oauth2/authorize` with `scope=snsapi_userinfo`. The callback
+(`/api/auth/wechat/profile/callback?code&state`) checks the state, trades the code at
+`api.weixin.qq.com/sns/oauth2/access_token` (a 网页授权 token; unlike `cgi-bin/token` it has no IP whitelist), reads
+`sns/userinfo`, and, only if that openid is already linked to an account, stores nickname/avatar/unionid in
+`cnr_account_wechat_userinfo` (`accounts-wechat-userinfo-schema.sql`, v7, both databases: `session()` joins it) and
+copies the nickname to `display_name`. The avatar must be on `*.qlogo.cn`/`*.qpic.cn` (rewritten to https) and is
+returned by `/api/auth/session` as `user.avatar`; the account menu shows it over the initials. The pages are plain
+HTML with a strict CSP, 404 while the AppSecret is missing. 公众平台 prerequisite: 设置与开发 → 公众号设置 → 功能设置 →
+网页授权域名 = `www.echo.cool` (upload the `MP_verify_….txt` WeChat gives you to the site root).
+
 **Schema:** `accounts-wechat-schema.sql` (version 5) must be applied to **both** databases (`compilenrun-data` and
 `echocool-data`) before deploying this code, even to the compilenrun Worker where WeChat stays off: `session()`
 joins `cnr_account_wechat_identities` for every signed-in request. `accounts-wechat-qr-schema.sql` (version 6, the
@@ -348,14 +364,15 @@ there):
 ```sh
 npx wrangler@4 secret put WECHAT_TOKEN --config wrangler.echocool.jsonc
 npx wrangler@4 secret put WECHAT_AES_KEY --config wrangler.echocool.jsonc
+npx wrangler@4 secret put WECHAT_APP_SECRET --config wrangler.echocool.jsonc   # 网页授权 (nickname/avatar)
 npx wrangler@4 secret put WECHAT_POOL_SECRET --config wrangler.echocool.jsonc
 ```
 
 **QR ticket pool.** Per-login QR codes (带参数二维码) need an `access_token`, and WeChat issues one only to servers whose
 IP is on the account's whitelist (公众平台 → 设置与开发 → 基本配置 → IP白名单; error `40164` otherwise). The Worker has
-no fixed IP, so `tools/wechat_qr_pool.py` runs on the home server (fixed IP, on the whitelist) every 6 hours from a
+no fixed IP, so `tools/wechat_qr_pool.py` runs on oci1.echo.cool (fixed IP, on the whitelist) every 20 minutes from a
 systemd timer (unit files and env layout in `tools/README.md`). It asks `GET /api/auth/wechat/pool` for
-`{available, expiringSoon}`, and when `available - expiringSoon` is below `POOL_TARGET` (300) it fetches an
+`{available, expiringSoon}`, and when `available - expiringSoon` is below `POOL_TARGET` (2000) it fetches an
 `access_token` with the AppSecret, creates the missing tickets (`POST /cgi-bin/qrcode/create`, `QR_STR_SCENE`, a
 random 32-character `scene_str`, `expire_seconds` 2592000 = 30 days, the maximum) and uploads them in batches of 100.
 Temporary QR codes cost nothing and have no total cap; the API's daily call quota is far above what this needs.
@@ -370,8 +387,11 @@ Temporary QR codes cost nothing and have no total cap; the API's daily call quot
   expire within 24 hours).
 - No Origin check and no `AUTH_LIMIT` (it is a server, not a page); the route is covered by `www.echo.cool/api/auth/*`.
 
-Each login uses one ticket, so 300 covers 300 sign-ins per 6 hours; raise `POOL_TARGET` if logins outgrow it. If the
-generator stops, logins quietly fall back to code mode once the pool runs dry.
+Every opened sign-in dialog takes one ticket (the QR is shown immediately, scanned or not), and echo.cool opens
+several thousand a day, so the pool is sized in hours, not logins: 2000 tickets every 20 minutes. A browser that
+starts again (another tab, or renewing an expired QR) keeps its own unscanned ticket instead of taking a new one;
+a scanned ticket is always deleted with its login. If the generator stops, logins quietly fall back to code mode
+once the pool runs dry (`GET /pool` shows `available`).
 
 **公众平台 settings** (设置与开发 → 基本配置 → 服务器配置): URL `https://www.echo.cool/api/auth/wechat/events`; Token: the
 same value as `WECHAT_TOKEN` (3-32 letters or digits); EncodingAESKey: generate it and store it as `WECHAT_AES_KEY`;

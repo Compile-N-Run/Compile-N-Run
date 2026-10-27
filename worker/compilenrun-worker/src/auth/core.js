@@ -221,7 +221,7 @@ async function session(request, db) {
   // first-unconstrained D1 Session: revoked logins must not reappear on replicas.
   const row = await db.prepare(`SELECT u.id, u.display_name, c.email, c.email_verified_at,
     CASE WHEN c.email_verified_at IS NOT NULL THEN 1 ELSE 0 END AS has_password, g.google_sub AS google_identity, gp.email AS google_email,
-    h.github_id AS github_identity, hp.login AS github_login, hp.email AS github_email, w.wechat_openid AS wechat_identity
+    h.github_id AS github_identity, hp.login AS github_login, hp.email AS github_email, w.wechat_openid AS wechat_identity, wu.avatar_url AS wechat_avatar
     FROM cnr_account_sessions s JOIN cnr_account_users u ON u.id = s.user_id
     LEFT JOIN cnr_account_password_credentials c ON c.user_id = u.id
     LEFT JOIN cnr_account_google_identities g ON g.user_id = u.id
@@ -229,12 +229,13 @@ async function session(request, db) {
     LEFT JOIN cnr_account_github_identities h ON h.user_id = u.id
     LEFT JOIN cnr_account_github_profiles hp ON hp.github_id = h.github_id
     LEFT JOIN cnr_account_wechat_identities w ON w.user_id = u.id
+    LEFT JOIN cnr_account_wechat_userinfo wu ON wu.wechat_openid = w.wechat_openid
     WHERE s.token_hash = ?1 AND s.expires_at > ?2`).bind(tokenHash, now()).first();
   return row ? { user: { id: row.id, name: row.display_name, email: row.email || null,
     emailVerified: !!row.email_verified_at, hasPassword: !!row.has_password, googleLinked: !!row.google_identity,
     googleEmail: row.google_identity && row.google_email || null, githubLinked: !!row.github_identity,
     githubLogin: row.github_identity && row.github_login || null, githubEmail: row.github_identity && row.github_email || null,
-    wechatLinked: !!row.wechat_identity },
+    wechatLinked: !!row.wechat_identity, avatar: row.wechat_identity && /^https:\/\//.test(row.wechat_avatar || '') ? row.wechat_avatar : null },
     tokenHash, csrfToken: await hash('csrf:' + token) } : null;
 }
 

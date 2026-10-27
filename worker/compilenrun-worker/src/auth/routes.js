@@ -2,7 +2,7 @@ import { EMAIL_ROUTES, PUBLIC_EMAIL_ROUTES, handleEmailAccount } from '../email-
 import { limitedJSON } from '../lib/body.js';
 import { SSO_ROUTES, ssoConfigured, handleSSO } from './sso.js';
 import { handleLearning } from '../learning/routes.js';
-import { WECHAT_ROUTES, WECHAT_START, WECHAT_EVENTS, WECHAT_STATUS, WECHAT_POOL, handleWechatEvents, handleWechatPool, wechatPoolConfigured, startWechatLogin, wechatLoginStatus } from './wechat.js';
+import { WECHAT_ROUTES, WECHAT_START, WECHAT_EVENTS, WECHAT_STATUS, WECHAT_POOL, WECHAT_PROFILE_PATHS, handleWechatEvents, handleWechatPool, handleWechatProfile, wechatPoolConfigured, wechatProfileConfigured, startWechatLogin, wechatLoginStatus } from './wechat.js';
 import { siteOrigin, PROVIDERS, OAUTH_PROVIDERS, wechatConfigured, wechatEventsReady, GOOGLE_CREDENTIAL_ROUTE, response, cookie, oauthError, hash, randomToken, issueSession, session, configured, providerFlags, providerFor, providerConfigured, googleConfigured, emailConfigured, beginOAuth, finishOAuth, googleCredentialLogin, sameToken, now, SESSION_COOKIE, OAUTH_COOKIE } from './core.js';
 const ROUTES = new Set(['/api/auth/session', '/api/auth/logout', '/api/auth/account', '/api/learning', GOOGLE_CREDENTIAL_ROUTE, ...Object.keys(EMAIL_ROUTES), ...Object.keys(SSO_ROUTES),
   ...Object.keys(WECHAT_ROUTES), ...OAUTH_PROVIDERS.flatMap(p => [p.start, p.link, p.callback]), PROVIDERS.wechat.link]);
@@ -55,6 +55,11 @@ export async function handleAccounts(request, env, ctx) {
       if (url.pathname === WECHAT_START && origin !== site) return response(403, { error: 'csrf_failed' });
       if (!wechatConfigured(env)) return response(503, { error: 'wechat_not_configured' });
       return url.pathname === WECHAT_START ? await startWechatLogin(request, env) : await wechatLoginStatus(request, env);
+    }
+    // HTML pages opened inside WeChat from the account's reply (no Origin header on navigations).
+    if (WECHAT_PROFILE_PATHS.has(url.pathname)) {
+      if (!wechatConfigured(env) || !wechatProfileConfigured(env)) return response(404, { error: 'not_found' });
+      return await handleWechatProfile(request, env);
     }
     if (url.pathname === GOOGLE_CREDENTIAL_ROUTE) {
       if (origin !== site) return response(403, { error: 'csrf_failed' });

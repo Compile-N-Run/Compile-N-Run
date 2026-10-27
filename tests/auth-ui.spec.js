@@ -56,6 +56,7 @@ async function setup(t,account=state(),init,pagePath='/'){
  if(account.user)await context.addInitScript(()=>{document.cookie='cnr_signed_in=1; Path=/';}); // the Worker sets this hint beside the session cookie
  await context.route('https://accounts.google.com/**',route=>route.fulfill({contentType:'text/javascript',body:FAKE_GSI}));
  await context.route('https://mp.weixin.qq.com/**',route=>route.fulfill({contentType:'image/gif',body:Buffer.from('R0lGODlhAQABAAAAACw=','base64')})); // the per-login QR image
+ await context.route('https://thirdwx.qlogo.cn/**',route=>route.request().url().includes('/broken/')?route.fulfill({status:404,body:''}):route.fulfill({contentType:'image/gif',body:Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7','base64')})); // WeChat avatars (a complete 1x1 GIF, so the load event fires)
  await context.route('**/api/**',async route=>{
   const request=route.request(),url=new URL(request.url()),body=request.postData()?JSON.parse(request.postData()):null;
   account.calls.push({path:url.pathname,method:request.method(),headers:request.headers(),body});
@@ -525,5 +526,21 @@ test('with data-auth-default="wechat" the login form opens on the QR code and ke
  await page.keyboard.press('Escape');await open(page);
  await page.waitForFunction(ticket=>document.querySelector('[data-auth-wechat-qr]').getAttribute('src')===ticket,QR_TICKET+'2');
  assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/start').length,2,'reopening asks for a fresh code');
+ assert.deepEqual(errors,[]);
+});
+
+test('a profile picture covers the initials and a broken one falls back to them',async t=>{
+ const account=state();account.user={...user(),avatar:'https://thirdwx.qlogo.cn/mmopen/ok/132'};
+ const{page,errors}=await setup(t,account);
+ await page.locator('[data-auth-avatar]').waitFor({state:'visible'});
+ const picture=page.locator('[data-auth-picture]');
+ await picture.waitFor({state:'visible'});assert.equal(await picture.getAttribute('src'),'https://thirdwx.qlogo.cn/mmopen/ok/132');assert.equal(await page.locator('[data-auth-initials]').textContent(),'AL');
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.avatar),'https://thirdwx.qlogo.cn/mmopen/ok/132');
+ account.user={...user(),avatar:'https://thirdwx.qlogo.cn/mmopen/broken/132'};await page.evaluate(()=>CNRAuth.refresh({force:true}));
+ await page.waitForFunction(()=>document.querySelector('[data-auth-picture]').hidden===true); // the image failed to load
+ assert.equal(await page.locator('[data-auth-initials]').isVisible(),true);
+ account.user=user();await page.evaluate(()=>CNRAuth.refresh({force:true}));
+ await page.waitForFunction(()=>document.querySelector('[data-auth-picture]').hidden&&!document.querySelector('[data-auth-picture]').getAttribute('src'));
+ assert.equal(await page.evaluate(()=>CNRAuth.getSession().user.avatar),null);
  assert.deepEqual(errors,[]);
 });

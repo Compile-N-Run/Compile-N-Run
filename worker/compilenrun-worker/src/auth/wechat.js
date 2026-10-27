@@ -7,7 +7,7 @@
 // (binding cookie) polls /status to consume the confirmed row once. Protocol reference: 公众号「消息管理 / 接收普通消息 /
 // 接收事件推送 / 被动回复用户消息」, 「账号管理 / 生成带参数的二维码」 and the message encryption guide (WXBizMsgCrypt:
 // AES-256-CBC, PKCS#7 with a 32-byte block).
-import { siteName, siteOrigin, text } from '../lib/http.js';
+import { siteName, siteOrigin, siteIsChinese, text } from '../lib/http.js';
 import { limitedJSON } from '../lib/body.js';
 import { PROVIDERS, response, cookie, readCookie, hash, randomToken, session, sameToken, now, providerIdentity, signInIdentity, saveProfile } from './core.js';
 
@@ -15,8 +15,19 @@ export const WECHAT_START = '/api/auth/wechat/start';
 export const WECHAT_EVENTS = '/api/auth/wechat/events';
 export const WECHAT_STATUS = '/api/auth/wechat/status';
 export const WECHAT_POOL = '/api/auth/wechat/pool';
-export const WECHAT_ROUTES = { [WECHAT_START]: 'POST', [WECHAT_EVENTS]: 'GET,POST', [WECHAT_STATUS]: 'GET', [WECHAT_POOL]: 'GET,POST' };
+// 网页授权 (snsapi_userinfo), opened from a link in the account's reply: the only way to learn the reader's nickname
+// and avatar, since message push carries just the openid and cgi-bin/user/info no longer returns them.
+export const WECHAT_PROFILE = '/api/auth/wechat/profile';
+export const WECHAT_PROFILE_START = '/api/auth/wechat/profile/start';
+export const WECHAT_PROFILE_CALLBACK = '/api/auth/wechat/profile/callback';
+export const WECHAT_PROFILE_PATHS = new Set([WECHAT_PROFILE, WECHAT_PROFILE_START, WECHAT_PROFILE_CALLBACK]);
+export const WECHAT_ROUTES = { [WECHAT_START]: 'POST', [WECHAT_EVENTS]: 'GET,POST', [WECHAT_STATUS]: 'GET', [WECHAT_POOL]: 'GET,POST',
+  [WECHAT_PROFILE]: 'GET', [WECHAT_PROFILE_START]: 'GET', [WECHAT_PROFILE_CALLBACK]: 'GET' };
 const WX_COOKIE = '__Host-cnr_wx';
+const WXP_COOKIE = '__Host-cnr_wxp';
+const PROFILE_SECONDS = 600;
+const PARKED_SECONDS = 60;    // a ticket detached from a browser's previous login waits this long for the new one
+const AVATAR_URL = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:qlogo\.cn|qpic\.cn)\/[\x21-\x7e]*$/i;
 const LOGIN_SECONDS = 600;
 const MAX_SKEW = 300;
 const MAX_PENDING = 20000;
@@ -164,6 +175,14 @@ const welcome = env => text(env,
   `Welcome to ${siteName(env)}! You can sign in on ${siteOrigin(env)} with WeChat: choose WeChat in the sign-in window.`,
   `欢迎关注${siteName(env)}！在 ${siteOrigin(env)} 登录时选择「微信登录」即可用微信登录。`);
 const expiredQR = env => text(env, 'This QR code has expired. Please refresh the web page to get a new one.', '二维码已过期，请刷新网页后重新扫码。');
+// Text replies may carry <a href> links; this one opens the 网页授权 page inside WeChat.
+export const wechatProfileConfigured = env => typeof env.WECHAT_APP_SECRET === 'string' && !!env.WECHAT_APP_SECRET.trim() &&
+  typeof env.WECHAT_APP_ID === 'string' && /^wx[0-9a-z]{10,}$/i.test(env.WECHAT_APP_ID);
+const profileLink = env => wechatProfileConfigured(env)
+  ? '\n' + text(env, `<a href="${siteOrigin(env) + WECHAT_PROFILE}">Show my WeChat name and photo on the site</a>`,
+    `<a href="${siteOrigin(env) + WECHAT_PROFILE}">点此同步微信昵称和头像到网站</a>`)
+  : '';
+const signedIn = env => text(env, 'Signed in! Go back to the web page to continue.', '登录成功！回到网页即可继续。') + profileLink(env);
 
 async function answerScan(env, message, scene, subscribed) {
   let outcome = 'invalid';
@@ -174,8 +193,8 @@ async function answerScan(env, message, scene, subscribed) {
   }
   if (outcome === 'confirmed') return subscribed
     ? text(env, `Thanks for following ${siteName(env)}! You are now signed in on the web page.\nWe publish programming tutorials at ${siteOrigin(env)}.`,
-      `关注成功，网页已登录。\n欢迎来到${siteName(env)}，更多编程教程请访问 ${siteOrigin(env)}`)
-    : text(env, 'Signed in! Go back to the web page to continue.', '登录成功！回到网页即可继续。');
+      `关注成功，网页已登录。\n欢迎来到${siteName(env)}，更多编程教程请访问 ${siteOrigin(env)}`) + profileLink(env)
+    : signedIn(env);
   return subscribed ? welcome(env) + '\n' + expiredQR(env) : expiredQR(env);
 }
 
@@ -193,14 +212,14 @@ async function answer(env, message) {
   if (type !== 'text') return null;
   const content = message.Content.trim();
   if (!CODE.test(content)) return text(env,
-    `To sign in, send the 6-digit code shown on ${siteOrigin(env)}.`,
-    `登录请发送网页上显示的 6 位验证码。网站：${siteOrigin(env)}`);
+    `To sign in, scan the QR code shown on ${siteOrigin(env)} (or send its 6-digit code here).`,
+    `登录请扫描 ${siteOrigin(env)} 登录窗口中的二维码（或在此发送网页显示的 6 位验证码）。`) + profileLink(env);
   if (!OPENID.test(message.FromUserName)) return null;
   let outcome;
   try { outcome = await confirmCode(env, message.FromUserName, content); } catch (_) {
     return text(env, 'Sign-in is temporarily unavailable. Please try again shortly.', '登录服务暂时不可用，请稍后再试。');
   }
-  if (outcome === 'confirmed') return text(env, 'Signed in! Go back to the web page to continue.', '登录成功！回到网页即可继续。');
+  if (outcome === 'confirmed') return signedIn(env);
   if (outcome === 'throttled') return text(env, 'Too many wrong codes. Please try again in an hour.', '错误次数过多，请一小时后再试。');
   return text(env, 'This code is invalid or has expired. Please get a new one on the web page.', '验证码无效或已过期，请在网页上重新获取。');
 }
@@ -256,12 +275,33 @@ async function assignTicket(env, code, time) {
   } catch (_) { /* fall back to the code flow */ }
   return null;
 }
-// Removes expired tickets and assigned ones whose login is gone. The foreign key cascade already does the latter when
-// a login row is deleted; this also covers rows left by a database without foreign key enforcement.
+// A browser that starts again (another tab, or the page renewing an expired QR) keeps the ticket of its previous
+// unscanned login: a QR still visible in an older tab then stays valid for this same browser, and the pool is not
+// charged twice. The row is parked (assigned_at set, login_code NULL) so no concurrent start can take it before
+// the new login re-attaches it; the deletion of the old login then cascades nowhere.
+async function detachTicket(env, previousHash, time) {
+  if (!previousHash) return null;
+  try {
+    return await env.DB.prepare(`UPDATE cnr_account_wechat_qr SET login_code = NULL, assigned_at = ?1
+      WHERE login_code IN (SELECT code FROM cnr_account_wechat_logins WHERE binding_hash = ?2 AND confirmed_at IS NULL)
+      AND expires_at > ?3 RETURNING scene`).bind(time, previousHash, time + ASSIGN_MARGIN).first();
+  } catch (_) { return null; }
+}
+async function reattachTicket(env, scene, code, time) {
+  try {
+    const row = await env.DB.prepare(`UPDATE cnr_account_wechat_qr SET login_code = ?1, assigned_at = ?2
+      WHERE scene = ?3 AND login_code IS NULL RETURNING ticket`).bind(code, time, scene).first();
+    return row ? row.ticket : null;
+  } catch (_) { return null; }
+}
+// Removes expired tickets, assigned ones whose login is gone, and parked ones that were never re-attached. The
+// foreign key cascade already covers the second case when a login row is deleted; this also covers rows left by a
+// database without foreign key enforcement.
 async function sweepTickets(env, time) {
   try {
     await env.DB.prepare(`DELETE FROM cnr_account_wechat_qr WHERE expires_at <= ?1 OR (login_code IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM cnr_account_wechat_logins WHERE code = cnr_account_wechat_qr.login_code))`).bind(time).run();
+      AND NOT EXISTS (SELECT 1 FROM cnr_account_wechat_logins WHERE code = cnr_account_wechat_qr.login_code))
+      OR (login_code IS NULL AND assigned_at IS NOT NULL AND assigned_at <= ?2)`).bind(time, time - PARKED_SECONDS).run();
   } catch (_) { /* table not migrated yet */ }
 }
 
@@ -269,10 +309,12 @@ export async function startWechatLogin(request, env) {
   const time = now(), binding = randomToken(), bindingHash = await hash(binding);
   const login = await session(request, env.DB);
   const previous = readCookie(request, WX_COOKIE);
+  const previousHash = previous ? await hash(previous) : '';
+  const kept = await detachTicket(env, previousHash, time);
   await env.DB.batch([
     env.DB.prepare('DELETE FROM cnr_account_wechat_logins WHERE expires_at <= ?1').bind(time),
     // A browser has one pending login at a time: starting again drops its previous code.
-    env.DB.prepare('DELETE FROM cnr_account_wechat_logins WHERE binding_hash = ?1').bind(previous ? await hash(previous) : ''),
+    env.DB.prepare('DELETE FROM cnr_account_wechat_logins WHERE binding_hash = ?1').bind(previousHash),
   ]);
   await sweepTickets(env, time);
   const pending = await env.DB.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_logins WHERE expires_at > ?1').bind(time).first();
@@ -284,7 +326,7 @@ export async function startWechatLogin(request, env) {
       VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(code) DO NOTHING RETURNING code`)
       .bind(code, bindingHash, login ? login.user.id : null, login ? login.tokenHash : null, time, time + LOGIN_SECONDS).first();
     if (!inserted) continue;
-    const ticket = await assignTicket(env, code, time);
+    const ticket = (kept && await reattachTicket(env, kept.scene, code, time)) || await assignTicket(env, code, time);
     return response(200, { code, expiresAt: (time + LOGIN_SECONDS) * 1000, ...(ticket ? { mode: 'scan', qr: QR_IMAGE + encodeURIComponent(ticket) } : { mode: 'code' }) },
       [cookie(WX_COOKIE, binding, LOGIN_SECONDS)]);
   }
@@ -372,4 +414,95 @@ export async function handleWechatPool(request, env) {
   const inserted = results.slice(0, tickets.length).reduce((n, r) => n + (r.meta?.changes || 0), 0);
   const { available } = await poolCounts(env, time);
   return response(200, { ok: true, inserted, available });
+}
+
+
+// ---- 网页授权: nickname and avatar ----
+// The reader taps the link in the account's reply; WeChat's in-app browser opens the landing page, the button leads
+// to /profile/start, which sends them through open.weixin.qq.com (scope snsapi_userinfo) and back to the callback.
+// The callback trades the code for the reader's openid and a 网页授权 access_token (api.weixin.qq.com/sns/*, which
+// unlike cgi-bin/token has no IP whitelist), reads sns/userinfo, and stores nickname/avatar for the openid's account.
+// Nothing here signs anyone in: the openid must already be linked by a scan or code login.
+const escapeHTML = value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+function page(env, status, title, body, cookies = []) {
+  const headers = new Headers({ 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store, private', 'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer', 'x-robots-tag': 'noindex',
+    'content-security-policy': "default-src 'none'; img-src https://*.qlogo.cn https://*.qpic.cn; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" });
+  for (const value of cookies) headers.append('set-cookie', value);
+  const html = `<!doctype html><html lang="${siteIsChinese(env) ? 'zh-CN' : 'en'}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<meta name="robots" content="noindex"><title>${escapeHTML(title)} · ${escapeHTML(siteName(env))}</title><style>body{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;color:#1f2937;background:#f6f8fa}` +
+    `main{max-width:28rem;margin:0 auto;padding:3rem 1.25rem;text-align:center}img{display:block;width:96px;height:96px;margin:0 auto 1rem;border-radius:50%;background:#e5e7eb}` +
+    `h1{font-size:1.4rem;margin:0 0 .75rem;word-break:break-word}p{margin:0 0 1.5rem;color:#4b5563}.btn{display:inline-block;padding:.8rem 2rem;border-radius:999px;background:#07c160;color:#fff;text-decoration:none;font-weight:600}` +
+    `.site{font-size:.85rem;color:#6b7280}</style></head><body><main>${body}<p class="site">${escapeHTML(siteName(env))} · ${escapeHTML(siteOrigin(env).replace(/^https?:\/\//, ''))}</p></main></body></html>`;
+  return new Response(html, { status, headers });
+}
+const profileTitle = env => text(env, 'WeChat name and photo', '同步微信昵称和头像');
+function profileLanding(env) {
+  return page(env, 200, profileTitle(env), `<h1>${escapeHTML(profileTitle(env))}</h1><p>${escapeHTML(text(env,
+    `Allow WeChat to share your nickname and profile photo, and ${siteName(env)} will show them instead of "WeChat reader".`,
+    `授权后，${siteName(env)}将显示你的微信昵称和头像，代替「微信用户」。`))}</p><a class="btn" href="${WECHAT_PROFILE_START}">${escapeHTML(text(env, 'Continue with WeChat', '微信授权'))}</a>`);
+}
+function profileStart(env) {
+  const state = randomToken();
+  // WeChat documents this parameter order and the #wechat_redirect fragment.
+  const params = new URLSearchParams({ appid: env.WECHAT_APP_ID, redirect_uri: siteOrigin(env) + WECHAT_PROFILE_CALLBACK, response_type: 'code', scope: 'snsapi_userinfo', state });
+  const headers = new Headers({ location: 'https://open.weixin.qq.com/connect/oauth2/authorize?' + params + '#wechat_redirect', 'cache-control': 'no-store, private', 'referrer-policy': 'no-referrer' });
+  headers.append('set-cookie', cookie(WXP_COOKIE, state, PROFILE_SECONDS));
+  return new Response(null, { status: 302, headers });
+}
+async function wechatJSON(url) {
+  const res = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(10000), headers: { accept: 'application/json' } });
+  if (!res.ok) throw new Error('wechat_http_' + res.status);
+  let body;
+  try { body = JSON.parse(await readText(res, 65536)); } catch (_) { throw new Error('wechat_response'); }   // WeChat answers as text/plain
+  if (!body || typeof body !== 'object') throw new Error('wechat_response');
+  if (body.errcode) throw Object.assign(new Error('wechat_' + body.errcode), { wechat: { code: Number(body.errcode), message: String(body.errmsg || '') } });
+  return body;
+}
+const cleanName = value => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 100).replace(/[\ud800-\udbff]$/, '') : '';
+const cleanAvatar = value => typeof value === 'string' && value.length <= 512 && AVATAR_URL.test(value) ? value.replace(/^http:/i, 'https:') : null;
+function profileFailure(env, error, cookies) {
+  const detail = error?.wechat ? ` (WeChat ${error.wechat.code}: ${error.wechat.message})` : '';
+  return page(env, 502, profileTitle(env), `<h1>${escapeHTML(text(env, 'Could not reach WeChat', '微信接口暂时不可用'))}</h1><p>${escapeHTML(text(env,
+    'Please open the link in the chat again later.' + detail, '请稍后在公众号对话中重新点击链接。' + detail))}</p>`, cookies);
+}
+async function profileCallback(request, env) {
+  const url = new URL(request.url);
+  const state = url.searchParams.get('state') || '', code = url.searchParams.get('code') || '';
+  const expected = readCookie(request, WXP_COOKIE), clear = [cookie(WXP_COOKIE, '', 0)];
+  if (!expected || !sameToken(expected, state) || !/^[A-Za-z0-9_-]{1,512}$/.test(code) || url.searchParams.getAll('code').length !== 1) {
+    return page(env, 400, profileTitle(env), `<h1>${escapeHTML(text(env, 'This link has expired', '链接已失效'))}</h1><p>${escapeHTML(text(env,
+      'Open the link in the chat again and allow access within 10 minutes.', '请在公众号对话中重新点击链接，并在 10 分钟内完成授权。'))}</p>`, clear);
+  }
+  let token;
+  try {
+    token = await wechatJSON('https://api.weixin.qq.com/sns/oauth2/access_token?' + new URLSearchParams({ appid: env.WECHAT_APP_ID, secret: env.WECHAT_APP_SECRET.trim(), code, grant_type: 'authorization_code' }));
+  } catch (error) { return profileFailure(env, error, clear); }
+  const openid = typeof token.openid === 'string' ? token.openid : '';
+  if (!OPENID.test(openid) || typeof token.access_token !== 'string' || !token.access_token) return profileFailure(env, new Error('wechat_token'), clear);
+  const linked = await env.DB.prepare('SELECT user_id FROM cnr_account_wechat_identities WHERE wechat_openid = ?1').bind(openid).first();
+  if (!linked) {
+    return page(env, 200, profileTitle(env), `<h1>${escapeHTML(text(env, 'Sign in first', '请先登录网站'))}</h1><p>${escapeHTML(text(env,
+      `Sign in on ${siteOrigin(env)} with WeChat first, then open this link again.`, `请先在 ${siteOrigin(env)} 用微信扫码登录，再回到公众号点击此链接。`))}</p>`, clear);
+  }
+  let info;
+  try { info = await wechatJSON('https://api.weixin.qq.com/sns/userinfo?' + new URLSearchParams({ access_token: token.access_token, openid, lang: 'zh_CN' })); } catch (error) { return profileFailure(env, error, clear); }
+  const nickname = cleanName(info.nickname), avatar = cleanAvatar(info.headimgurl);
+  const unionid = typeof info.unionid === 'string' && OPENID.test(info.unionid) ? info.unionid : null;
+  const time = now();
+  const statements = [env.DB.prepare(`INSERT INTO cnr_account_wechat_userinfo (wechat_openid, nickname, avatar_url, unionid, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+    ON CONFLICT(wechat_openid) DO UPDATE SET nickname = excluded.nickname, avatar_url = excluded.avatar_url, unionid = excluded.unionid, updated_at = excluded.updated_at`)
+    .bind(openid, nickname || null, avatar, unionid, time)];
+  // The reader asked for this explicitly, so the nickname replaces whatever the account was called.
+  if (nickname) statements.push(env.DB.prepare('UPDATE cnr_account_users SET display_name = ?1, updated_at = ?2 WHERE id = ?3').bind(nickname, time, linked.user_id));
+  await env.DB.batch(statements);
+  return page(env, 200, profileTitle(env), `${avatar ? `<img src="${escapeHTML(avatar)}" alt="" width="96" height="96">` : ''}<h1>${escapeHTML(nickname || text(env, 'WeChat reader', '微信用户'))}</h1><p>${escapeHTML(text(env,
+    `Your WeChat name and photo now show on ${siteName(env)}. Reload the page on your other device to see them.`,
+    `已同步到${siteName(env)}账户。回到网页刷新即可看到你的昵称和头像。`))}</p>`, clear);
+}
+export async function handleWechatProfile(request, env) {
+  const { pathname } = new URL(request.url);
+  if (pathname === WECHAT_PROFILE) return profileLanding(env);
+  if (pathname === WECHAT_PROFILE_START) return profileStart(env);
+  return profileCallback(request, env);
 }

@@ -17,6 +17,7 @@ class D1 {
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-learning-records-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-qr-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-userinfo-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -1062,19 +1063,38 @@ test('subscribe with qrscene_ signs a new follower in with a welcome; expired lo
   assert.match(field(await (await wxPush(wxScan(OPENID_B, secondScene))).text(), 'Content'), /二维码已过期/);
   assert.deepEqual(await (await wxStatus(secondBody.code, cookiePair(second, '__Host-cnr_wx'))).json(), { status: 'expired' });
   assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr').get().n, 0, 'both used tickets are gone');
-  // Restarting in the same browser drops the previous login and its ticket; an expired ticket is never assigned.
+  // Restarting in the same browser drops the previous login but keeps its unscanned ticket (a QR still shown in an
+  // older tab stays valid for this browser, and the pool is not charged twice).
   await wxPool('POST', { tickets: [poolTicket(3), poolTicket(4)] });
   const third = await wxStart();
-  const thirdScene = sceneOf((await third.json()).code);
+  const thirdCode = (await third.json()).code, thirdScene = sceneOf(thirdCode);
   const fourth = await wxStart(cookiePair(third, '__Host-cnr_wx'));
   const fourthBody = await fourth.json();
-  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(thirdScene).n, 0);
   assert.equal(fourthBody.mode, 'scan');
-  db.sqlite.prepare('UPDATE cnr_account_wechat_qr SET expires_at = ? WHERE login_code IS NULL').run(Math.floor(Date.now() / 1000) - 1);
-  db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at) VALUES (?, 't', 1, ?)").run(scene(5), Math.floor(Date.now() / 1000) + 899);
+  assert.equal(sceneOf(fourthBody.code), thirdScene, 'the same browser keeps its ticket');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_logins WHERE code = ?').get(thirdCode).n, 0, 'the previous login is gone');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE assigned_at IS NULL').get().n, 1, 'the other ticket is still free');
+  assert.match(field(await (await wxPush(wxScan(OPENID_B, thirdScene))).text(), 'Content'), /^登录成功/, 'scanning the older tab confirms the new login');
+  assert.deepEqual(await (await wxStatus(fourthBody.code, cookiePair(fourth, '__Host-cnr_wx'))).json(), { status: 'done' });
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(thirdScene).n, 0, 'consumed once');
+  // A confirmed (scanned) login is never carried over: the ticket stays single-use.
+  const scanned = await wxStart();
+  const scannedCode = (await scanned.json()).code, scannedScene = sceneOf(scannedCode);
+  await wxPush(wxScan(OPENID_B, scannedScene));
+  const after = await wxStart(cookiePair(scanned, '__Host-cnr_wx'));
+  assert.equal((await after.json()).mode, 'code', 'the scanned ticket was deleted with its login, and the pool is empty');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scannedScene).n, 0);
+  // Expired and nearly expired tickets are never assigned; parked rows that never got a login are swept.
+  const time = Math.floor(Date.now() / 1000);
+  db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at) VALUES (?, 't', 1, ?)").run(scene(5), time + 899);
+  db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at) VALUES (?, 't', 1, ?)").run(scene(6), time - 1);
+  db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at, assigned_at) VALUES (?, 't', 1, ?, ?)").run(scene(7), time + 86400, time - 61);
+  db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at, assigned_at) VALUES (?, 't', 1, ?, ?)").run(scene(8), time + 86400, time - 5);
   const fifth = await wxStart();
   assert.equal((await fifth.json()).mode, 'code', 'expired and nearly expired tickets are skipped');
-  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE expires_at <= ?').get(Math.floor(Date.now() / 1000)).n, 0, 'start sweeps expired tickets');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE expires_at <= ?').get(time).n, 0, 'start sweeps expired tickets');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scene(7)).n, 0, 'a stale parked ticket is swept');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scene(8)).n, 1, 'a freshly parked ticket is left for its login');
 });
 
 test('an empty pool keeps the chat-code flow (mode code), and a missing qr table does not break start', async () => {
@@ -1105,4 +1125,104 @@ test('WeChat link mode by scan attaches the openid to the signed-in account', as
   assert.deepEqual([both.user.googleLinked, both.user.wechatLinked], [true, true]);
   assert.equal(db.sqlite.prepare('SELECT user_id FROM cnr_account_wechat_identities WHERE wechat_openid = ?').get(OPENID_A).user_id, google.user.id);
   assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr').get().n, 0);
+});
+
+// ---- WeChat 网页授权: nickname and avatar ----
+test('the reply links to 网页授权 once WECHAT_APP_SECRET is set; the callback checks state, stores nickname/avatar and the session shows them', async () => {
+  enableWechat();
+  const profilePage = () => handleAccounts(request('/api/auth/wechat/profile'), env);
+  assert.equal((await profilePage()).status, 404, 'off without the AppSecret');
+  const reader = await wxLogin(OPENID_A);
+  assert.deepEqual([reader.user.name, reader.user.avatar], ['微信用户', null]);
+  assert.doesNotMatch(field(await (await wxPush(wxText(OPENID_A, 'hi'))).text(), 'Content'), /<a /);
+  enableWechat({ WECHAT_APP_SECRET: 'app-secret-for-tests-only' });
+  const link = '<a href="https://www.compilenrun.com/api/auth/wechat/profile">点此同步微信昵称和头像到网站</a>';
+  assert.match(field(await (await wxPush(wxText(OPENID_A, 'hi'))).text(), 'Content'), new RegExp('登录请扫描.*\\n' + link.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&') + '$'));
+  const started = await wxStart();
+  const { code } = await started.json();
+  const confirmed = field(await (await wxPush(wxText(OPENID_B, code))).text(), 'Content');
+  assert.equal(confirmed, '登录成功！回到网页即可继续。\n' + link);
+
+  const landing = await profilePage();
+  assert.equal(landing.status, 200);
+  assert.match(landing.headers.get('content-type'), /^text\/html/);
+  assert.match(landing.headers.get('content-security-policy'), /default-src 'none'/);
+  const landingHTML = await landing.text();
+  assert.match(landingHTML, /<html lang="zh-CN">/); assert.match(landingHTML, /href="\/api\/auth\/wechat\/profile\/start"/); assert.match(landingHTML, /代码酷将显示你的微信昵称和头像/);
+
+  const start = await handleAccounts(request('/api/auth/wechat/profile/start'), env);
+  assert.equal(start.status, 302);
+  const authorize = new URL(start.headers.get('location'));
+  assert.equal(authorize.origin + authorize.pathname, 'https://open.weixin.qq.com/connect/oauth2/authorize');
+  assert.equal(authorize.hash, '#wechat_redirect');
+  assert.deepEqual([...authorize.searchParams.keys()], ['appid', 'redirect_uri', 'response_type', 'scope', 'state'], 'WeChat requires this parameter order');
+  assert.deepEqual([authorize.searchParams.get('appid'), authorize.searchParams.get('redirect_uri'), authorize.searchParams.get('response_type'), authorize.searchParams.get('scope')],
+    [WX_APPID, SITE + '/api/auth/wechat/profile/callback', 'code', 'snsapi_userinfo']);
+  const state = authorize.searchParams.get('state');
+  assert.match(state, /^[A-Za-z0-9_-]{43}$/);
+  const stateCookie = cookiePair(start, '__Host-cnr_wxp');
+  assert.equal(stateCookie, '__Host-cnr_wxp=' + state);
+  assert.match(start.headers.getSetCookie()[0], /HttpOnly; Secure; SameSite=Lax/);
+
+  const callback = (query, cookie = stateCookie) => handleAccounts(request('/api/auth/wechat/profile/callback?' + new URLSearchParams(query), { cookie }), env);
+  const bad = await callback({ code: 'c0de', state: 'x'.repeat(43) });
+  assert.equal(bad.status, 400); assert.match(await bad.text(), /链接已失效/); assert.match(cookiePair(bad, '__Host-cnr_wxp'), /=$/);
+  assert.equal((await callback({ code: 'c0de', state }, '')).status, 400, 'no state cookie');
+  assert.equal(upstream.filter(u => u.url.includes('api.weixin.qq.com')).length, 0, 'WeChat is not called for a bad state');
+
+  // WeChat's two 网页授权 calls (answered as text/plain, as WeChat does).
+  const previous = globalThis.fetch;
+  let tokenReply = { access_token: 'wx-oauth-token', expires_in: 7200, refresh_token: 'r', openid: OPENID_B, scope: 'snsapi_userinfo' };
+  let infoReply = { openid: OPENID_B, nickname: '小明 😀', sex: 0, province: '', city: '', country: '', headimgurl: 'http://thirdwx.qlogo.cn/mmopen/vi_32/abc/132', privilege: [], unionid: 'oUnion0123456789' };
+  globalThis.fetch = async (url, options) => {
+    const target = new URL(String(url));
+    if (target.host !== 'api.weixin.qq.com') return previous(url, options);
+    upstream.push({ url: String(url), options });
+    assert.equal(options.redirect, 'manual');
+    if (target.pathname === '/sns/oauth2/access_token') {
+      assert.deepEqual(Object.fromEntries(target.searchParams), { appid: WX_APPID, secret: 'app-secret-for-tests-only', code: 'c0de', grant_type: 'authorization_code' });
+      return new Response(JSON.stringify(tokenReply), { headers: { 'content-type': 'text/plain' } });
+    }
+    assert.equal(target.pathname, '/sns/userinfo');
+    assert.deepEqual(Object.fromEntries(target.searchParams), { access_token: 'wx-oauth-token', openid: OPENID_B, lang: 'zh_CN' });
+    return new Response(JSON.stringify(infoReply), { headers: { 'content-type': 'text/plain' } });
+  };
+  try {
+    // OPENID_B has not signed in on the site: nothing is stored.
+    const unknown = await callback({ code: 'c0de', state });
+    assert.equal(unknown.status, 200); assert.match(await unknown.text(), /请先在 https:\/\/www\.compilenrun\.com 用微信扫码登录/);
+    assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_userinfo').get().n, 0);
+    assert.equal(upstream.filter(u => u.url.includes('/sns/userinfo')).length, 0, 'userinfo is not fetched for an unknown openid');
+    // The state cookie was cleared by that attempt; a fresh start is needed.
+    const again = cookiePair(await handleAccounts(request('/api/auth/wechat/profile/start'), env), '__Host-cnr_wxp');
+    const againState = again.split('=')[1];
+    const done = await wxStatus(code, cookiePair(started, '__Host-cnr_wx'));
+    assert.deepEqual(await done.json(), { status: 'done' });
+    const sessionCookie = cookiePair(done, '__Host-cnr_session');
+    assert.equal((await sessionOf(sessionCookie)).user.name, '微信用户');
+    const ok = await callback({ code: 'c0de', state: againState }, again);
+    assert.equal(ok.status, 200);
+    const okHTML = await ok.text();
+    assert.match(okHTML, /<img src="https:\/\/thirdwx\.qlogo\.cn\/mmopen\/vi_32\/abc\/132"/, 'the avatar is served over https');
+    assert.match(okHTML, /<h1>小明 😀<\/h1>/); assert.match(okHTML, /已同步到代码酷账户/);
+    const row = db.sqlite.prepare('SELECT * FROM cnr_account_wechat_userinfo WHERE wechat_openid = ?').get(OPENID_B);
+    assert.deepEqual([row.nickname, row.avatar_url, row.unionid], ['小明 😀', 'https://thirdwx.qlogo.cn/mmopen/vi_32/abc/132', 'oUnion0123456789']);
+    const current = await sessionOf(sessionCookie);
+    assert.deepEqual([current.user.name, current.user.avatar], ['小明 😀', 'https://thirdwx.qlogo.cn/mmopen/vi_32/abc/132']);
+    // A second authorization refreshes the row; a foreign avatar host or an odd nickname is sanitized.
+    infoReply = { ...infoReply, nickname: '  <b>Bob</b>\u0007 ', headimgurl: 'https://evil.example/x.png' };
+    const refreshed = cookiePair(await handleAccounts(request('/api/auth/wechat/profile/start'), env), '__Host-cnr_wxp');
+    assert.equal((await callback({ code: 'c0de', state: refreshed.split('=')[1] }, refreshed)).status, 200);
+    const again2 = await sessionOf(sessionCookie);
+    assert.deepEqual([again2.user.name, again2.user.avatar], ['<b>Bob</b>', null]);
+    // WeChat errors surface with their code, and nothing changes.
+    tokenReply = { errcode: 40029, errmsg: 'invalid code' };
+    const failedState = cookiePair(await handleAccounts(request('/api/auth/wechat/profile/start'), env), '__Host-cnr_wxp');
+    const failed = await callback({ code: 'c0de', state: failedState.split('=')[1] }, failedState);
+    assert.equal(failed.status, 502); assert.match(await failed.text(), /WeChat 40029: invalid code/);
+    assert.equal((await sessionOf(sessionCookie)).user.name, '<b>Bob</b>');
+    // Deleting the account cascades to the stored userinfo.
+    assert.equal((await handleAccounts(request('/api/auth/account', { method: 'DELETE', cookie: sessionCookie, headers: authHeaders(await sessionOf(sessionCookie)) }), env)).status, 200);
+    assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_userinfo').get().n, 0);
+  } finally { globalThis.fetch = previous; }
 });

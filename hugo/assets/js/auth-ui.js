@@ -130,18 +130,28 @@
     if (!value.configured || !plain(user.id,200) || !plain(user.name,100,true) ||
         !(user.email === undefined || user.email === null || plain(user.email,254)) ||
         typeof user.emailVerified !== 'boolean' || typeof user.hasPassword !== 'boolean' || typeof user.googleLinked !== 'boolean' || !(user.googleEmail === undefined || user.googleEmail === null || plain(user.googleEmail,254)) ||
-        !(user.githubLinked === undefined || typeof user.githubLinked === 'boolean') || !(user.githubLogin === undefined || user.githubLogin === null || plain(user.githubLogin,39)) || !(user.wechatLinked === undefined || typeof user.wechatLinked === 'boolean') || !plain(value.csrfToken,500)) {
+        !(user.githubLinked === undefined || typeof user.githubLinked === 'boolean') || !(user.githubLogin === undefined || user.githubLogin === null || plain(user.githubLogin,39)) || !(user.wechatLinked === undefined || typeof user.wechatLinked === 'boolean') ||
+        !(user.avatar === undefined || user.avatar === null || (plain(user.avatar,512) && /^https:\/\/[^\s"'<>]+$/.test(user.avatar))) || !plain(value.csrfToken,500)) {
       throw fault('invalid_response',t('Sign-in details could not be verified. Please try again.'));
     }
     return { configured: value.configured, providers, user: { id: user.id, name: user.name, email: user.email || null,
       emailVerified: user.emailVerified, hasPassword: user.hasPassword, googleLinked: user.googleLinked, googleEmail: user.googleLinked && user.googleEmail || null,
-      githubLinked: user.githubLinked === true, githubLogin: user.githubLinked === true && user.githubLogin || null, wechatLinked: user.wechatLinked === true }, csrfToken: value.csrfToken };
+      githubLinked: user.githubLinked === true, githubLogin: user.githubLinked === true && user.githubLogin || null, wechatLinked: user.wechatLinked === true, avatar: user.avatar || null }, csrfToken: value.csrfToken };
   }
   function clearPasswords() { dialog?.querySelectorAll('input[type="password"]').forEach(input=>{input.value='';}); }
   function say(text, error = false) { if(message){message.textContent=text;message.dataset.error=String(error);} }
   function initials(name) {
     const parts=name.trim().split(/\s+/).filter(Boolean);
     return parts.length ? (Array.from(parts[0])[0] + (parts.length>1?Array.from(parts[parts.length-1])[0]:'')).toLocaleUpperCase() : '?';
+  }
+  // The profile picture (WeChat avatar) covers the initials while it loads fine; a failed image falls back to them.
+  let pictureFailed='';
+  function renderPicture(url) {
+    const picture=widget?.querySelector('[data-auth-picture]');
+    if(!picture)return;
+    if(!url||url===pictureFailed){picture.hidden=true;if(picture.getAttribute('src'))picture.removeAttribute('src');return;}
+    if(picture.getAttribute('src')!==url){picture.onerror=()=>{pictureFailed=url;picture.hidden=true;};picture.src=url;}
+    picture.hidden=false;
   }
   function closeMenu(focus = false) {
     if(!menu)return;menu.hidden=true;avatar.setAttribute('aria-expanded','false');
@@ -164,7 +174,7 @@
     if(widget){
       widget.setAttribute('aria-busy',String(busy||transitioning));
       openButton.hidden=Boolean(user);openButton.textContent=published&&current===null?t('Reconnect'):t('Sign in');avatar.hidden=!user;avatar.disabled=busy||transitioning;
-      if(user){widget.querySelector('[data-auth-initials]').textContent=initials(user.name);widget.querySelector('[data-auth-name]').textContent=user.name||t('Learner');avatar.setAttribute('aria-label',t('Open account menu for {name}',{name:user.name||t('Learner')}));}
+      if(user){widget.querySelector('[data-auth-initials]').textContent=initials(user.name);widget.querySelector('[data-auth-name]').textContent=user.name||t('Learner');avatar.setAttribute('aria-label',t('Open account menu for {name}',{name:user.name||t('Learner')}));renderPicture(user.avatar);}
       else closeMenu();
       widget.querySelector('[data-auth-signout]').disabled=!user||busy||transitioning;
       widget.querySelector('[data-auth-refresh]').hidden=!transitionFailed;widget.querySelector('[data-auth-refresh]').disabled=busy||transitioning;

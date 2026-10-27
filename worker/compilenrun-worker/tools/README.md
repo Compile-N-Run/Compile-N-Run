@@ -28,7 +28,7 @@ WECHAT_APP_ID=wx1158ec5a67d0cedc
 WECHAT_APP_SECRET=<AppSecret from 公众平台 → 设置与开发 → 基本配置>
 WECHAT_POOL_SECRET=<same value as the Worker secret WECHAT_POOL_SECRET>
 WORKER_ORIGIN=https://www.echo.cool
-POOL_TARGET=300
+POOL_TARGET=2000
 ```
 
 Resetting the AppSecret in the console invalidates the old one: update this file at the same time.
@@ -60,11 +60,11 @@ PrivateTmp=yes
 
 ```ini
 [Unit]
-Description=Top up the echo.cool WeChat QR ticket pool every 6 hours
+Description=Top up the echo.cool WeChat QR ticket pool every 20 minutes
 
 [Timer]
-OnCalendar=*-*-* 00/6:00:00
-RandomizedDelaySec=10min
+OnCalendar=*-*-* *:00/20:00
+RandomizedDelaySec=2min
 # Runs a missed slot at boot if the server was off.
 Persistent=true
 
