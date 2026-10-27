@@ -294,14 +294,18 @@ async function reattachTicket(env, scene, code, time) {
     return row ? row.ticket : null;
   } catch (_) { return null; }
 }
-// Removes expired tickets, assigned ones whose login is gone, and parked ones that were never re-attached. The
-// foreign key cascade already covers the second case when a login row is deleted; this also covers rows left by a
-// database without foreign key enforcement.
+// Removes expired tickets, parked ones that were never re-attached, and assigned ones whose login is gone (the
+// foreign key cascade already covers that when a login row is deleted; this also covers rows left by a database
+// without foreign key enforcement). Runs from /api/auth/wechat/pool (the generator's 20-minute visit), not from
+// `start`: a single OR-ed DELETE scanned the whole 2000-row pool on every login dialog open, which alone cost
+// >4M D1 row reads a day. Each statement here walks an index (v8 schema) and touches only the rows it removes.
 async function sweepTickets(env, time) {
   try {
-    await env.DB.prepare(`DELETE FROM cnr_account_wechat_qr WHERE expires_at <= ?1 OR (login_code IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM cnr_account_wechat_logins WHERE code = cnr_account_wechat_qr.login_code))
-      OR (login_code IS NULL AND assigned_at IS NOT NULL AND assigned_at <= ?2)`).bind(time, time - PARKED_SECONDS).run();
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM cnr_account_wechat_qr WHERE expires_at <= ?1').bind(time),
+      env.DB.prepare(`DELETE FROM cnr_account_wechat_qr WHERE assigned_at IS NOT NULL AND assigned_at <= ?1 AND (login_code IS NULL
+        OR NOT EXISTS (SELECT 1 FROM cnr_account_wechat_logins WHERE code = cnr_account_wechat_qr.login_code))`).bind(time - PARKED_SECONDS),
+    ]);
   } catch (_) { /* table not migrated yet */ }
 }
 
@@ -316,7 +320,6 @@ export async function startWechatLogin(request, env) {
     // A browser has one pending login at a time: starting again drops its previous code.
     env.DB.prepare('DELETE FROM cnr_account_wechat_logins WHERE binding_hash = ?1').bind(previousHash),
   ]);
-  await sweepTickets(env, time);
   const pending = await env.DB.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_logins WHERE expires_at > ?1').bind(time).first();
   if (pending && pending.n >= MAX_PENDING) return response(503, { error: 'wechat_busy' });
   for (let attempt = 0; attempt < 8; attempt++) {
@@ -393,6 +396,8 @@ export const wechatPoolConfigured = env => typeof env.WECHAT_POOL_SECRET === 'st
 export async function handleWechatPool(request, env) {
   if (!(await poolAuthorized(request, env))) return response(401, { error: 'unauthorized' });
   const time = now();
+  // Housekeeping happens here, on the generator's visits, so that `start` stays a few indexed row reads.
+  await sweepTickets(env, time);
   if (request.method === 'GET') return response(200, await poolCounts(env, time));
   let body;
   try { body = await limitedJSON(request, POOL_BODY); } catch (error) {
@@ -408,10 +413,8 @@ export async function handleWechatPool(request, env) {
   }
   const statements = tickets.map(t => env.DB.prepare(`INSERT OR IGNORE INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at)
     VALUES (?1, ?2, ?3, ?4)`).bind(t.scene, t.ticket, time, t.expiresAt));
-  // Expired rows are useless whether or not they were ever assigned (an assigned ticket always outlives its login).
-  statements.push(env.DB.prepare('DELETE FROM cnr_account_wechat_qr WHERE expires_at <= ?1').bind(time));
-  const results = await env.DB.batch(statements);
-  const inserted = results.slice(0, tickets.length).reduce((n, r) => n + (r.meta?.changes || 0), 0);
+  const results = statements.length ? await env.DB.batch(statements) : [];
+  const inserted = results.reduce((n, r) => n + (r.meta?.changes || 0), 0);
   const { available } = await poolCounts(env, time);
   return response(200, { ok: true, inserted, available });
 }

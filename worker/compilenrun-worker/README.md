@@ -96,6 +96,7 @@ npx wrangler@4 d1 execute echocool-data --remote --file accounts-learning-record
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-schema.sql
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-qr-schema.sql
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-userinfo-schema.sql
+npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-indexes-schema.sql
 ```
 
 Secrets, set per Worker with `npx wrangler@4 secret put NAME` (add `--config wrangler.echocool.jsonc` for echo.cool):
@@ -350,6 +351,14 @@ ticket pool) goes to both databases too. Without it `start` still works in code 
 npx wrangler@4 d1 execute echocool-data --remote --file accounts-wechat-qr-schema.sql
 npx wrangler@4 d1 execute compilenrun-data --remote --file accounts-wechat-qr-schema.sql
 ```
+
+`accounts-wechat-indexes-schema.sql` (version 8, both databases) adds the indexes the login path relies on. **Row-read
+budget:** D1's free tier allows 5M row reads a day, and the pool table holds 2000 rows, so nothing on the `start`
+path may scan it. `start` does only indexed lookups (its own login row, the browser's previous login by
+`binding_hash`, one free ticket by `(assigned_at, expires_at)`, the pending count by `expires_at`); the sweep of
+expired, parked and orphaned tickets runs on `/api/auth/wechat/pool` visits (every 20 minutes) with per-condition
+indexed `DELETE`s. Check with `npx wrangler@4 d1 insights echocool-data --config wrangler.echocool.jsonc --timePeriod 1d
+--sort-by reads --sort-type sum` (on 2026-10-27 the old per-start sweep was 4.2M of 4.7M daily reads).
 
 **Configuration** (echocool-worker only; compilenrun-worker has no WeChat settings, so `providers.wechat` is false
 there):

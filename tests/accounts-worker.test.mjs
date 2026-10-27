@@ -18,6 +18,7 @@ class D1 {
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-qr-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-userinfo-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-indexes-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -1084,17 +1085,26 @@ test('subscribe with qrscene_ signs a new follower in with a welcome; expired lo
   const after = await wxStart(cookiePair(scanned, '__Host-cnr_wx'));
   assert.equal((await after.json()).mode, 'code', 'the scanned ticket was deleted with its login, and the pool is empty');
   assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scannedScene).n, 0);
-  // Expired and nearly expired tickets are never assigned; parked rows that never got a login are swept.
+  // Expired and nearly expired tickets are never assigned. Housekeeping (expired rows, parked rows that never got
+  // a login, assigned rows whose login is gone) happens on the generator's /pool visits, not in `start`: with a
+  // 2000-ticket pool a sweep per dialog open scanned the whole table and burnt the D1 row-read quota.
   const time = Math.floor(Date.now() / 1000);
   db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at) VALUES (?, 't', 1, ?)").run(scene(5), time + 899);
   db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at) VALUES (?, 't', 1, ?)").run(scene(6), time - 1);
   db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at, assigned_at) VALUES (?, 't', 1, ?, ?)").run(scene(7), time + 86400, time - 61);
   db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at, assigned_at) VALUES (?, 't', 1, ?, ?)").run(scene(8), time + 86400, time - 5);
+  db.sqlite.exec('PRAGMA foreign_keys = OFF'); // a row left behind by a database without foreign key enforcement
+  db.sqlite.prepare("INSERT INTO cnr_account_wechat_qr (scene, ticket, created_at, expires_at, login_code, assigned_at) VALUES (?, 't', 1, ?, 'gone42', ?)").run(scene(9), time + 86400, time - 61);
+  db.sqlite.exec('PRAGMA foreign_keys = ON');
   const fifth = await wxStart();
   assert.equal((await fifth.json()).mode, 'code', 'expired and nearly expired tickets are skipped');
-  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE expires_at <= ?').get(time).n, 0, 'start sweeps expired tickets');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene IN (?, ?, ?)').get(scene(6), scene(7), scene(9)).n, 3, 'start itself sweeps nothing');
+  assert.equal((await wxPool('GET')).status, 200);
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE expires_at <= ?').get(time).n, 0, 'the pool visit sweeps expired tickets');
   assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scene(7)).n, 0, 'a stale parked ticket is swept');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scene(9)).n, 0, 'an assigned ticket whose login is gone is swept');
   assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scene(8)).n, 1, 'a freshly parked ticket is left for its login');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_qr WHERE scene = ?').get(scene(5)).n, 1, 'an unexpired unassigned ticket stays');
 });
 
 test('an empty pool keeps the chat-code flow (mode code), and a missing qr table does not break start', async () => {
