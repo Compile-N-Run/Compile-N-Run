@@ -543,6 +543,10 @@ const config = {
                                     to: "/docs/library/tensorflow"
                                 },
                                 {
+                                    label: 'Large Language Models',
+                                    to: "/docs/ai/llm"
+                                },
+                                {
                                     label: 'AI Agents',
                                     to: "/docs/ai/agents"
                                 }

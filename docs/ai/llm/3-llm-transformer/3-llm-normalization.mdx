@@ -1,0 +1,346 @@
+---
+title: "LayerNorm, RMSNorm, Pre-Norm and Post-Norm"
+description: "Derive LayerNorm and RMSNorm, see why pre-norm replaced post-norm with a CPU experiment, and learn how QK-norm and extra norms keep large LLM training stable."
+---
+
+# LayerNorm, RMSNorm, Pre-Norm and Post-Norm
+
+## Introduction
+
+Normalization layers hold almost no parameters (two vectors of length $d$ per block, out of hundreds of millions), yet they decide whether a deep Transformer trains at all. The original 2017 Transformer needed a carefully tuned warmup to avoid diverging; GPT-2 moved one line of code and made deep stacks much easier to train; Llama swapped LayerNorm for the cheaper RMSNorm; and in 2024-2025 Qwen3, Gemma 3 and OLMo 2 added normalization inside attention itself to stop a failure mode that only appears at scale.
+
+This page covers four questions: what each norm computes, where it sits in the block, why that placement matters for gradients, and which extra norms modern models add. You will be able to:
+
+- compute LayerNorm and RMSNorm by hand and match PyTorch's output;
+- state which invariances each norm has and why RMSNorm drops mean-centering;
+- explain the post-norm vs pre-norm difference through the gradient argument of Xiong et al. (2020), and reproduce it in a small CPU experiment;
+- explain attention logit growth and how QK-norm prevents it;
+- read the norm-related fields of a config.json (`rms_norm_eps`, layer names such as `q_norm`) and know what they imply.
+
+## Why Transformers Normalize
+
+Each sublayer reads the residual stream, a sum of contributions that grows as training progresses and as depth increases. Without normalization, a sublayer's input could have a norm of 1 at one step and 50 a thousand steps later. Its weights would then need to adapt to a moving input scale, and the softmax inside attention, which is sensitive to the scale of its logits, would swing between nearly uniform and nearly one-hot.
+
+A normalization layer rescales each token's vector to a standard size before a sublayer reads it. The sublayer then always sees inputs of a predictable magnitude, which keeps activations and gradients in a range where a single learning rate works for all layers.
+
+Transformers normalize **per token, across features**. That differs from BatchNorm, which normalizes each feature across the batch. BatchNorm is a poor fit for language models: sequences have different lengths and padding, statistics depend on what else is in the batch, and at generation time the "batch" for a position is a single token. LayerNorm (Ba, Kiros and Hinton, 2016) needs only the token itself.
+
+## LayerNorm
+
+For one token's vector $x \in \mathbb{R}^d$, LayerNorm computes the mean and variance over its $d$ features, standardizes, then applies a learned per-feature gain $\gamma$ and bias $\beta$:
+
+$$
+\mu = \frac{1}{d} \sum_{i=1}^{d} x_i, \qquad
+\sigma^2 = \frac{1}{d} \sum_{i=1}^{d} (x_i - \mu)^2, \qquad
+\mathrm{LayerNorm}(x)_i = \gamma_i \, \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta_i
+$$
+
+The small $\epsilon$ (typically $10^{-5}$) prevents division by zero. Note that the variance uses $1/d$, not $1/(d-1)$; PyTorch's `nn.LayerNorm` uses this population variance.
+
+Take $x = (1, 2, 3, 4)$ with $\gamma = 1$, $\beta = 0$. The mean is $2.5$. The deviations are $(-1.5, -0.5, 0.5, 1.5)$, their squares average to $(2.25 + 0.25 + 0.25 + 2.25)/4 = 1.25$, so $\sigma = \sqrt{1.25} \approx 1.118$. The output is $(-1.342, -0.447, 0.447, 1.342)$: mean 0, variance 1.
+
+After LayerNorm, the vector always lies on a sphere of radius $\sqrt{d}$ within the hyperplane of zero-mean vectors (before $\gamma$ and $\beta$). Two invariances follow: adding a constant to every feature (re-centering) and multiplying the vector by a positive constant (re-scaling) leave the output unchanged.
+
+## RMSNorm
+
+Zhang and Sennrich ("Root Mean Square Layer Normalization", 2019) asked whether both invariances are needed. Their hypothesis was that re-scaling invariance does the useful work and re-centering is dispensable. RMSNorm drops the mean and the bias:
+
+$$
+\mathrm{RMS}(x) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \epsilon}, \qquad
+\mathrm{RMSNorm}(x)_i = \gamma_i \, \frac{x_i}{\mathrm{RMS}(x)}
+$$
+
+For $x = (1, 2, 3, 4)$: the mean of squares is $(1 + 4 + 9 + 16)/4 = 7.5$, so $\mathrm{RMS} = \sqrt{7.5} \approx 2.739$ and the output is $(0.365, 0.730, 1.095, 1.461)$. The direction of the vector is kept, including its offset from zero; only the length is normalized.
+
+The paper reports quality comparable to LayerNorm with running time reduced by 7% to 64%, depending on the model and implementation. The savings come from skipping the mean reduction and the subtraction; in a fused GPU kernel the difference is small, but there is no evidence that the removed computation was helping. Llama adopted RMSNorm in 2023, and almost every open model followed: Llama 2 and 3, Mistral, Qwen2.5 and Qwen3, Gemma, DeepSeek-V3, OLMo 2, gpt-oss.
+
+Here is a check of both formulas against PyTorch (`nn.RMSNorm` exists since PyTorch 2.4):
+
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])                   # one token, d = 4
+
+def layer_norm(x, gamma, beta, eps=1e-5):
+    mu = x.mean(-1, keepdim=True)
+    var = x.var(-1, keepdim=True, unbiased=False)           # population variance
+    return gamma * (x - mu) / torch.sqrt(var + eps) + beta
+
+def rms_norm(x, gamma, eps=1e-6):
+    rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return gamma * x / rms
+
+g, b = torch.ones(4), torch.zeros(4)
+print("LayerNorm (ours): ", layer_norm(x, g, b))
+print("LayerNorm (torch):", nn.LayerNorm(4)(x).detach())
+print("RMSNorm   (ours): ", rms_norm(x, g))
+print("RMSNorm   (torch):", nn.RMSNorm(4, eps=1e-6)(x).detach())
+
+# Invariances: LayerNorm ignores a shift, both ignore a positive scale.
+print("LN shift-invariant: ", torch.allclose(layer_norm(x + 10, g, b), layer_norm(x, g, b), atol=1e-4))
+print("RMS shift-invariant:", torch.allclose(rms_norm(x + 10, g), rms_norm(x, g), atol=1e-4))
+print("RMS scale-invariant:", torch.allclose(rms_norm(3 * x, g), rms_norm(x, g), atol=1e-5))
+```
+
+```text
+LayerNorm (ours):  tensor([[-1.3416, -0.4472,  0.4472,  1.3416]])
+LayerNorm (torch): tensor([[-1.3416, -0.4472,  0.4472,  1.3416]])
+RMSNorm   (ours):  tensor([[0.3651, 0.7303, 1.0954, 1.4606]])
+RMSNorm   (torch): tensor([[0.3651, 0.7303, 1.0954, 1.4606]])
+LN shift-invariant:  True
+RMS shift-invariant: False
+RMS scale-invariant: True
+```
+
+Two implementation details matter when you load real checkpoints:
+
+- **Precision.** Hugging Face's `LlamaRMSNorm` casts the input to float32, normalizes, then casts back before multiplying by the gain. In bfloat16, squaring and averaging thousands of values loses enough precision to change outputs.
+- **Gain parameterization.** Gemma's RMSNorm stores the gain as an offset: its weight is initialized to zeros and the layer multiplies by $1 + w$. Loading Gemma weights into a Llama-style RMSNorm (which multiplies by $w$) silently zeroes most of the signal.
+
+The $\epsilon$ value is in config.json as `rms_norm_eps`: $10^{-5}$ in Llama 2, Llama 3.1 and Mistral 7B, $10^{-6}$ in Qwen2.5, Qwen3, Gemma 3, DeepSeek-V3 and OLMo 2. Using the wrong one rarely breaks a model but produces small numerical mismatches when you compare with a reference.
+
+## Post-Norm and Pre-Norm
+
+Where the norm goes matters more than which norm it is. The 2017 Transformer used **post-norm**, normalizing after the residual addition:
+
+$$
+x_{\ell+1} = \mathrm{Norm}\big(x_\ell + F_\ell(x_\ell)\big)
+$$
+
+GPT-2 (2019) moved the norm to the input of each sublayer, **pre-norm**, and added one final norm after the last block:
+
+$$
+x_{\ell+1} = x_\ell + F_\ell\big(\mathrm{Norm}(x_\ell)\big), \qquad \mathrm{output} = \mathrm{Norm}_f(x_L)
+$$
+
+The difference looks cosmetic, but look at the residual path. In pre-norm, $x_L = x_0 + \sum_\ell F_\ell(\cdot)$: the identity path from input to output is clean, so the gradient of the loss reaches every layer at least through an identity term (the argument from [Inside a Decoder Block](./2-llm-transformer-block.mdx)). In post-norm, every layer passes the stream through a norm, and the gradient must flow back through $L$ normalization Jacobians, each of which rescales it depending on the current activation statistics.
+
+Xiong et al. ("On Layer Normalization in the Transformer Architecture", ICML 2020) made this precise with a mean-field analysis at initialization. For post-norm, the expected gradient of the parameters near the output is large, and does not shrink with depth; a large learning rate applied to those layers early in training makes the optimization unstable. That is why the original Transformer needed a warmup: small steps while Adam's statistics settle and the gradients shrink. For pre-norm, the gradient scale decreases with depth roughly like $1/\sqrt{L}$, and training is well-behaved at initialization. They showed pre-norm Transformers could train without warmup and reach comparable results faster.
+
+Pre-norm has its own known weakness. Because the stream keeps growing and each sublayer only adds to it, deep layers in a pre-norm model tend to contribute relatively less: later additions are small compared with the accumulated stream. Liu et al. ("Understanding the Difficulty of Training Transformers", 2020) ran a grid of 15 translation settings: pre-norm converged in all 15, post-norm diverged in 7, but where post-norm converged it beat pre-norm in 7 of 8. DeepNet (Wang et al., 2022) introduced DeepNorm, a post-norm variant that up-weights the residual and down-scales initialization, and trained 1,000-layer models. In practice, essentially every large decoder-only LLM uses pre-norm, because a run that diverges costs far more than a small quality gap.
+
+## Worked Experiment: Post-Norm vs Pre-Norm on a CPU
+
+The script below trains a 12-layer character-level model on Tiny Shakespeare twice per layout: once with Adam at a learning rate of $10^{-3}$ and once at $3 \times 10^{-3}$, both with no warmup. It also prints the gradient norm of the first and last block's MLP output weights at initialization, the quantity Xiong et al. analyze. It uses PyTorch's `nn.MultiheadAttention` to keep the code short; the model has about 600K parameters and the whole script takes a few minutes on an idle laptop CPU (about 10 CPU-minutes in total).
+
+```python
+import math, os, urllib.request
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.set_num_threads(4)
+URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+if not os.path.exists("input.txt"):
+    urllib.request.urlretrieve(URL, "input.txt")
+text = open("input.txt").read()
+chars = sorted(set(text)); stoi = {c: i for i, c in enumerate(chars)}
+data = torch.tensor([stoi[c] for c in text])
+T, B, d, n_head, n_layer = 64, 16, 64, 4, 12
+
+class Block(nn.Module):
+    def __init__(self, pre_norm):
+        super().__init__()
+        self.pre = pre_norm
+        self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, n_head, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+        self.register_buffer("mask", torch.triu(torch.ones(T, T, dtype=torch.bool), 1))
+
+    def sa(self, h):
+        return self.attn(h, h, h, attn_mask=self.mask, need_weights=False)[0]
+
+    def forward(self, x):
+        if self.pre:                                  # x + F(LN(x))
+            x = x + self.sa(self.ln1(x))
+            return x + self.mlp(self.ln2(x))
+        x = self.ln1(x + self.sa(x))                  # LN(x + F(x)), the 2017 layout
+        return self.ln2(x + self.mlp(x))
+
+class LM(nn.Module):
+    def __init__(self, pre_norm):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(len(chars), d), nn.Embedding(T, d)
+        self.blocks = nn.Sequential(*[Block(pre_norm) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(d) if pre_norm else nn.Identity()
+        self.head = nn.Linear(d, len(chars))
+
+    def forward(self, idx, tgt):
+        x = self.tok(idx) + self.pos(torch.arange(idx.size(1)))
+        logits = self.head(self.ln_f(self.blocks(x)))
+        return F.cross_entropy(logits.flatten(0, 1), tgt.flatten())
+
+def batch(g):
+    ix = torch.randint(len(data) - T - 1, (B,), generator=g)
+    return (torch.stack([data[i:i + T] for i in ix]),
+            torch.stack([data[i + 1:i + 1 + T] for i in ix]))
+
+for pre in (False, True):
+    name = "pre-norm " if pre else "post-norm"
+    torch.manual_seed(0)
+    model = LM(pre)
+    g = torch.Generator().manual_seed(0)
+    # gradient norm of each block's MLP output weight at initialization
+    model(*batch(g)).backward()
+    gn = [blk.mlp[2].weight.grad.norm().item() for blk in model.blocks]
+    print(f"{name} | init grad norm, block 1: {gn[0]:.4f}  block 12: {gn[-1]:.4f}")
+    for lr in (1e-3, 3e-3):
+        torch.manual_seed(0)
+        model = LM(pre)
+        opt = torch.optim.Adam(model.parameters(), lr=lr)   # constant LR, no warmup
+        g = torch.Generator().manual_seed(0)
+        losses = []
+        for step in range(200):
+            loss = model(*batch(g))
+            opt.zero_grad(); loss.backward(); opt.step()
+            losses.append(loss.item())
+        print(f"{name} | lr {lr:.0e} | loss at step 100: {sum(losses[90:100])/10:.3f}"
+              f"  step 200: {sum(losses[-10:])/10:.3f}")
+```
+
+```text
+post-norm | init grad norm, block 1: 0.4053  block 12: 0.3933
+post-norm | lr 1e-03 | loss at step 100: 2.625  step 200: 2.484
+post-norm | lr 3e-03 | loss at step 100: 3.322  step 200: 3.325
+pre-norm  | init grad norm, block 1: 0.2420  block 12: 0.1989
+pre-norm  | lr 1e-03 | loss at step 100: 2.620  step 200: 2.496
+pre-norm  | lr 3e-03 | loss at step 100: 2.558  step 200: 2.422
+```
+
+Each "loss" is the average training loss over 10 steps, so the numbers are a little noisy. Three things stand out.
+
+**At a moderate learning rate both layouts train.** With $10^{-3}$, post-norm (2.484) and pre-norm (2.496) end up in the same place after 200 steps. At this depth and scale, post-norm is not broken; it is fragile.
+
+**At a higher learning rate post-norm fails.** With $3 \times 10^{-3}$ and no warmup, the post-norm model is stuck at 3.32 from step 100 to step 200. That is the loss of predicting characters by their overall frequency alone (the unigram entropy of Tiny Shakespeare is 3.31 nats): the model has collapsed to ignoring its input. The pre-norm model at the same learning rate trains faster than either run at $10^{-3}$ and reaches the best loss in the table, 2.422. The extra learning-rate headroom is what pre-norm buys in practice, and why warmup became less critical.
+
+**Gradients at initialization match the theory.** The post-norm model's last block receives a gradient about as large as its first block (0.393 vs 0.405), while the pre-norm model's last block receives about half the post-norm value (0.199). Xiong et al. predict exactly this: large gradients near the output for post-norm, gradients that shrink with depth for pre-norm. A large gradient multiplied by a large learning rate on step one is how the post-norm run gets knocked into a bad region it never leaves. Warmup would have kept those first steps small.
+
+These are single runs of a 600K-parameter model for 200 steps, so treat them as an illustration of the mechanism, not a benchmark. The effect grows with depth: the 2017 Transformer had 6 layers per stack; LLMs have 32 to 100 or more.
+
+## Beyond Pre-Norm: Sandwich and Output Norms
+
+Pre-norm controls the input of each sublayer but not the size of what it writes. Two refinements address that.
+
+**Sandwich norm** (pre and post). CogView (Ding et al., 2021) normalized both the input and the output of each sublayer. Gemma 2 and Gemma 3 do the same: the Hugging Face Gemma 3 block has `input_layernorm`, `post_attention_layernorm`, `pre_feedforward_layernorm` and `post_feedforward_layernorm`, four RMSNorms per block:
+
+$$
+h = x + \mathrm{Norm}_b\Big(\mathrm{Attn}\big(\mathrm{Norm}_a(x)\big)\Big), \qquad
+y = h + \mathrm{Norm}_d\Big(\mathrm{MLP}\big(\mathrm{Norm}_c(h)\big)\Big)
+$$
+
+**Output norm only** ("reordered norm"). OLMo 2 (Team OLMo, "2 OLMo 2 Furious", 2024) removes the input norm and normalizes only the sublayer output before adding it:
+
+$$
+h = x + \mathrm{RMSNorm}\big(\mathrm{Attn}(x)\big), \qquad y = h + \mathrm{RMSNorm}\big(\mathrm{MLP}(h)\big)
+$$
+
+The OLMo 2 paper credits the idea to Swin Transformer V2 (Liu et al., 2021) and reports that this layout together with QK-norm made training noticeably more stable, with fewer loss and gradient-norm spikes. Note that this is still not post-norm: the residual stream itself is never normalized; only each write to it is bounded.
+
+## QK-Norm: Normalizing Inside Attention
+
+Large-scale training revealed a failure the block-level norms do not catch. Dehghani et al. ("Scaling Vision Transformers to 22 Billion Parameters", 2023) observed that during training of a 22B model, attention logits grew without bound in some layers. The softmax then saturated to nearly one-hot distributions with nearly zero entropy, gradients through it vanished, and the loss diverged. Wortsman et al. ("Small-scale proxies for large-scale Transformer training instabilities", 2023) reproduced the same instability in small models trained at high learning rates.
+
+The cause is simple. The attention logit is $q \cdot k / \sqrt{d_h}$ where $q = \bar{x} W^Q$ and $k = \bar{x} W^K$. The input $\bar{x}$ is normalized, but nothing bounds $W^Q$ and $W^K$. If their norms grow, the logits grow quadratically in them.
+
+**QK-norm** applies a normalization to the queries and keys right before the dot product. Henry et al. ("Query-Key Normalization for Transformers", 2020) proposed an L2-normalized version with a learned scale in place of $1/\sqrt{d_h}$. The form used in today's LLMs, following Dehghani et al., applies a LayerNorm or RMSNorm with a learned gain to each head's query and key vectors:
+
+$$
+\mathrm{logit}_{ij} = \frac{\mathrm{RMSNorm}_q(q_i) \cdot \mathrm{RMSNorm}_k(k_j)}{\sqrt{d_h}}
+$$
+
+With unit gains, each normalized vector has length $\sqrt{d_h}$, so by Cauchy-Schwarz the logit is bounded by $\sqrt{d_h}$ in absolute value: about 11.3 for $d_h = 128$. The model can still learn sharp attention by growing the gains, but it has to do so deliberately through two small vectors rather than accidentally through the full projection matrices.
+
+The demo below scales $W^Q$ and $W^K$ by a factor to imitate weight growth and measures the attention distribution with and without per-head RMSNorm:
+
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+T, d_h = 16, 64
+x = torch.randn(T, d_h)
+Wq, Wk = torch.randn(d_h, d_h) / d_h**0.5, torch.randn(d_h, d_h) / d_h**0.5
+q_norm, k_norm = nn.RMSNorm(d_h), nn.RMSNorm(d_h)          # per-head norms, gains start at 1
+
+def stats(q, k):
+    logits = q @ k.T / d_h**0.5                             # (T, T) attention logits
+    p = logits.softmax(-1)
+    entropy = -(p * p.clamp_min(1e-12).log()).sum(-1).mean()
+    return logits.abs().max().item(), p.max(-1).values.mean().item(), entropy.item()
+
+print("weight scale | no QK-norm: max logit, mean max prob, entropy | with QK-norm: same")
+for s in (1, 4, 16):                                        # pretend the weights grew during training
+    q, k = x @ (s * Wq), x @ (s * Wk)
+    a = stats(q, k)
+    b = stats(q_norm(q).detach(), k_norm(k).detach())
+    print(f"{s:>12} | {a[0]:8.1f} {a[1]:6.3f} {a[2]:6.3f}       | {b[0]:6.1f} {b[1]:6.3f} {b[2]:6.3f}")
+print(f"uniform attention entropy over {T} keys: {torch.log(torch.tensor(float(T))):.3f}")
+```
+
+```text
+weight scale | no QK-norm: max logit, mean max prob, entropy | with QK-norm: same
+           1 |      3.4  0.227  2.362       |    2.7  0.220  2.383
+           4 |     54.6  0.891  0.272       |    2.7  0.220  2.383
+          16 |    874.1  0.999  0.005       |    2.7  0.220  2.383
+uniform attention entropy over 16 keys: 2.773
+```
+
+Without QK-norm, a 16x growth in the projection weights pushes the largest logit from 3.4 to 874 and the attention entropy from 2.36 nats (close to uniform over 16 keys) to 0.005: every query attends to exactly one key, and the softmax gradient is essentially zero. With QK-norm the statistics do not move at all, because RMSNorm is invariant to the scale of its input.
+
+Who uses it, verified in the Hugging Face modeling code and the technical reports:
+
+- **Qwen3** applies `q_norm` and `k_norm` (RMSNorm over the 128-dim head) to each head before RoPE. The Qwen3 report says it removed the QKV bias used in Qwen2 and introduced QK-norm for stable training.
+- **Gemma 3** applies per-head `q_norm` and `k_norm`, replacing the attention logit soft-capping ($50 \tanh(\cdot / 50)$, `attn_logit_softcapping: 50.0` in Gemma 2's config) that Gemma 2 used for the same purpose.
+- **OLMo 2** applies RMSNorm to the full query and key projections (all heads together, width $n_\mathrm{heads} \cdot d_h$) rather than per head.
+
+Llama 3, Mistral 7B and DeepSeek-V3 do not use QK-norm. DeepSeek-V3's MLA has RMSNorms on its compressed latent vectors (`q_a_layernorm`, `kv_a_layernorm`), which play a related role; see [Multi-Head Latent Attention](../2-llm-attention/6-llm-mla.mdx). A related trick at the output layer is z-loss (used in PaLM and OLMo 2), which penalizes the log of the softmax normalizer so the output logits do not drift; [Optimizers and Training Stability](../6-llm-pretraining/3-llm-optimizers-and-schedules.mdx) covers it.
+
+| Model | Norm | Placement | eps | QK-norm |
+|---|---|---|---|---|
+| Transformer (2017) | LayerNorm | Post-norm | not stated | No |
+| BERT-Base | LayerNorm | Post-norm | 1e-12 | No |
+| GPT-2 | LayerNorm | Pre-norm + final | 1e-5 | No |
+| Llama 2 / Llama 3.1 | RMSNorm | Pre-norm + final | 1e-5 | No |
+| Mistral 7B v0.1 | RMSNorm | Pre-norm + final | 1e-5 | No |
+| Qwen2.5 | RMSNorm | Pre-norm + final | 1e-6 | No (QKV bias instead) |
+| Qwen3 | RMSNorm | Pre-norm + final | 1e-6 | Yes, per head |
+| Gemma 2 | RMSNorm, 1 + w gain | Pre and post (sandwich) | 1e-6 | No (logit soft-capping) |
+| Gemma 3 | RMSNorm, 1 + w gain | Pre and post (sandwich) | 1e-6 | Yes, per head |
+| OLMo 2 | RMSNorm | Output norm only + final | 1e-6 | Yes, full width |
+| DeepSeek-V3 | RMSNorm | Pre-norm + final, plus latent norms | 1e-6 | No |
+
+:::warning
+When you port weights between frameworks, check three things for every norm: the epsilon, whether the gain is $w$ or $1 + w$, and whether the norm runs in float32. A mismatch in any of them gives a model that loads without errors and produces subtly worse text.
+:::
+
+## Common Mistakes
+
+- **Using the unbiased variance in a hand-written LayerNorm.** `torch.var` defaults to $1/(d-1)$; LayerNorm uses $1/d$. For small $d$ the difference is visible.
+- **Normalizing over the wrong axis.** Normalize over the last dimension (features) of a `(B, T, d)` tensor, never over the sequence or batch dimension.
+- **Forgetting the final norm in a pre-norm model.** The residual stream is never normalized inside the blocks, so the unembedding sees an unbounded vector without `ln_f`.
+- **Calling Llama's second norm "post-norm".** `post_attention_layernorm` in Hugging Face code is the pre-norm of the MLP. Gemma's `post_attention_layernorm` really is an output norm. Read the forward pass, not the names.
+- **Applying RoPE before QK-norm.** Qwen3 and Gemma 3 normalize first and rotate second. Rotation preserves vector length, so the order affects only how the gain interacts with the rotated dimensions, but matching a checkpoint requires the original order.
+- **Treating a missing warmup as harmless.** Even pre-norm models are trained with a few hundred to a few thousand warmup steps; Adam's second-moment estimates need time to settle.
+
+## Summary
+
+- Transformers normalize each token's vector over its features; LayerNorm subtracts the mean and divides by the standard deviation, RMSNorm only divides by the root mean square.
+- RMSNorm (Zhang and Sennrich, 2019) matches LayerNorm's quality with less work and is used by nearly every open LLM; epsilon is in config.json as `rms_norm_eps`.
+- Post-norm normalizes the residual stream and needs warmup because of large gradients near the output at initialization (Xiong et al., 2020); pre-norm keeps an identity residual path and trains stably at depth, at a small cost in how much deep layers contribute.
+- Gemma 2 and 3 add output norms (sandwich), and OLMo 2 normalizes only sublayer outputs; both bound what each sublayer writes.
+- QK-norm normalizes queries and keys per head (Qwen3, Gemma 3) or over the full projection (OLMo 2), bounding attention logits and preventing the entropy collapse that destabilized large runs.
+
+## Further Reading
+
+- [Layer Normalization (Ba, Kiros and Hinton, 2016)](https://arxiv.org/abs/1607.06450): the original LayerNorm paper.
+- [Root Mean Square Layer Normalization (Zhang and Sennrich, 2019)](https://arxiv.org/abs/1910.07467): RMSNorm and its speed measurements.
+- [On Layer Normalization in the Transformer Architecture (Xiong et al., 2020)](https://arxiv.org/abs/2002.04745): the gradient analysis of post-norm vs pre-norm.
+- [Understanding the Difficulty of Training Transformers (Liu et al., 2020)](https://arxiv.org/abs/2004.08249): why post-norm is fragile and how to fix it without moving the norm.
+- [DeepNet: Scaling Transformers to 1,000 Layers (Wang et al., 2022)](https://arxiv.org/abs/2203.00555): DeepNorm, a stable post-norm variant.
+- [Query-Key Normalization for Transformers (Henry et al., 2020)](https://arxiv.org/abs/2010.04245): the first QK-norm proposal.
+- [Scaling Vision Transformers to 22 Billion Parameters (Dehghani et al., 2023)](https://arxiv.org/abs/2302.05442): attention logit growth and the QK-norm fix at scale.
+- [Small-scale proxies for large-scale Transformer training instabilities (Wortsman et al., 2023)](https://arxiv.org/abs/2309.14322): reproducing logit growth and output-logit divergence in small models.
+- [2 OLMo 2 Furious (Team OLMo, 2024)](https://arxiv.org/abs/2501.00656): reordered norm, QK-norm and z-loss in a fully open model.
+- [torch.nn.RMSNorm documentation](https://docs.pytorch.org/docs/stable/generated/torch.nn.RMSNorm.html): PyTorch's built-in RMSNorm.

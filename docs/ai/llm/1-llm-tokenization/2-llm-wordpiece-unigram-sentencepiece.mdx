@@ -1,0 +1,325 @@
+---
+title: "WordPiece, Unigram and SentencePiece"
+description: "Understand WordPiece's likelihood-based merges, the Unigram language model with Viterbi and EM pruning, and how SentencePiece trains both on raw text."
+---
+
+# WordPiece, Unigram and SentencePiece
+
+## Introduction
+
+BPE is not the only way to learn a subword vocabulary. Two other algorithms shaped the field: **WordPiece**, which Google used for voice search and then for BERT, and the **Unigram language model**, which Taku Kudo introduced in 2018 and which powers T5, ALBERT, XLNet and many multilingual models. Around them sits **SentencePiece**, a library (not an algorithm) that trains either BPE or Unigram directly on raw text, and that produced the tokenizers of Llama 1 and 2, Mistral 7B and Gemma.
+
+You will meet all three when you read model repositories. A `tokenizer.json` can say `"type": "WordPiece"` or `"type": "Unigram"`, and older checkpoints ship a binary `tokenizer.model` file from SentencePiece. If you only know BPE, the `##` prefixes, the `▁` characters and the `<0xEA>` tokens in those vocabularies look mysterious.
+
+On this page you will learn:
+
+- how WordPiece chooses merges by likelihood gain instead of raw frequency, and how its greedy longest-match encoder works (with an implementation that matches BERT exactly),
+- how the Unigram model treats tokenization as probabilistic inference: Viterbi decoding for the best split, EM for training, and pruning from a large seed vocabulary,
+- what SentencePiece adds: whitespace as a symbol, normalization, byte fallback and digit splitting,
+- how to choose between them, and which real models use which.
+
+This page assumes you have worked through [Byte-Pair Encoding from Scratch](./1-llm-bpe.mdx).
+
+## WordPiece: Merges Chosen by Likelihood
+
+WordPiece was described by Schuster and Nakajima in "Japanese and Korean Voice Search" (ICASSP 2012). Japanese has no spaces and Korean has a very large set of syllable combinations, so a word list did not work; they needed a data-driven inventory of pieces. Google later used WordPiece for its neural translation system (Wu et al., 2016) and for BERT (Devlin et al., 2018), whose English vocabulary has 30,522 entries.
+
+### The Training Score
+
+Like BPE, WordPiece starts from characters and repeatedly merges a pair. The difference is the choice of pair. Instead of the most frequent pair, WordPiece picks the merge that most increases the likelihood of the training data under a simple language model where each piece is independent.
+
+Here is the intuition. If $p(a)$ is the relative frequency of piece $a$, the training data's log-likelihood under a unigram model is the sum of $\log p$ over all pieces. Merging $a$ and $b$ into $ab$ replaces every adjacent occurrence of $a$ followed by $b$ with a single piece. Ignoring the small change in normalization, the log-likelihood gain is about
+
+$$
+\Delta \approx c(ab) \left( \log p(ab) - \log p(a) - \log p(b) \right)
+$$
+
+where $c(ab)$ is the number of adjacent occurrences. The bracket is the log of how much more often $a$ and $b$ occur together than they would if they were independent (pointwise mutual information). Hugging Face documents the score its WordPiece trainer uses as a simplified version of this idea:
+
+$$
+\mathrm{score}(a,b) = \frac{c(ab)}{c(a)\,c(b)}
+$$
+
+Dividing by the frequencies of the parts favors pairs whose parts are individually rare but almost always appear together. BPE would merge `e` and `s` because they are both extremely common; WordPiece would rather merge two rare characters that always co-occur.
+
+:::note
+Google never published its WordPiece training code. The open-source trainers (Hugging Face `tokenizers`, TensorFlow Text) implement their best reading of the papers, so "WordPiece training" means slightly different things in different libraries. The **encoding** algorithm, used by every BERT checkpoint, is well defined.
+:::
+
+### Encoding: Greedy Longest Match
+
+WordPiece vocabularies mark pieces that continue a word with a `##` prefix: `token` starts a word, `##ization` continues one. To encode a word, the tokenizer takes the longest prefix that is in the vocabulary, then the longest `##` piece for the remainder, and so on. If at any point no piece matches, the **whole word** becomes `[UNK]`, not just the unmatched part.
+
+Here is that algorithm in a few lines, checked against BERT's own tokenizer:
+
+```python
+from transformers import AutoTokenizer
+
+bert = AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")
+vocab = bert.get_vocab()                      # str -> id, 30,522 entries
+
+def wordpiece(word, vocab, unk="[UNK]", max_chars=100):
+    """Greedy longest-match-first, as in BERT. Returns a list of pieces."""
+    if len(word) > max_chars:
+        return [unk]
+    pieces, start = [], 0
+    while start < len(word):
+        end = len(word)
+        while end > start:                    # try the longest substring first
+            piece = word[start:end] if start == 0 else "##" + word[start:end]
+            if piece in vocab:
+                break
+            end -= 1
+        if end == start:                      # nothing matched: the whole word is unknown
+            return [unk]
+        pieces.append(piece)
+        start = end
+    return pieces
+
+for w in ["tokenization", "unbelievably", "hugging", "transformers", "ꙮx"]:
+    ours = wordpiece(w, vocab)
+    print(f"{w:<14} {ours}  matches BERT: {ours == bert.tokenize(w)}")
+```
+
+```text
+tokenization   ['token', '##ization']  matches BERT: True
+unbelievably   ['un', '##bel', '##ie', '##va', '##bly']  matches BERT: True
+hugging        ['hugging']  matches BERT: True
+transformers   ['transformers']  matches BERT: True
+ꙮx             ['[UNK]']  matches BERT: True
+```
+
+The last line shows WordPiece's weakness: one rare character (U+A66E, a Cyrillic letter not in BERT's vocabulary) turns the entire word into `[UNK]`. The naive inner loop is quadratic in word length; Song et al. ("Fast WordPiece Tokenization", 2021) showed how to do the same matching in linear time with an Aho-Corasick style automaton, which is what TensorFlow Text uses.
+
+## The Unigram Language Model
+
+Kudo's "Subword Regularization" paper (ACL 2018) took a different view. BPE and WordPiece build a vocabulary bottom-up and then segment deterministically. Unigram instead treats segmentation as **probabilistic inference**: every word has many possible splits, a probability model scores them, and the tokenizer picks the most likely one.
+
+### The Model
+
+Let the vocabulary be a set of pieces, each with a probability $p(v)$, with $\sum_v p(v) = 1$. A segmentation of a string $X$ is a sequence of pieces $x = (x_1, \dots, x_M)$ whose concatenation is $X$. Assuming pieces are independent, its probability is
+
+$$
+P(x) = \prod_{i=1}^{M} p(x_i)
+$$
+
+and the tokenizer outputs the most likely segmentation among all segmentations of $X$:
+
+$$
+x^\ast = \arg\max_x P(x)
+$$
+
+The number of possible segmentations grows exponentially with length, but the best one can be found with the **Viterbi algorithm** (dynamic programming): for each position $i$, store the best log-probability of any segmentation of the first $i$ characters, computed from earlier positions. That is $O(n L)$ for a string of length $n$ and maximum piece length $L$.
+
+### A Numeric Example
+
+Take a tiny vocabulary with these probabilities: `h u g s` are 0.05 each, `hu` is 0.04, `ug` is 0.08, `gs` is 0.03, `hug` is 0.10 and `hugs` is 0.002. Which segmentation of "hugs" wins? You can check by hand: `hug` + `s` scores 0.10 × 0.05 = 0.005, while the single piece `hugs` scores only 0.002. Here is Viterbi with a brute-force check:
+
+```python
+import math
+
+# A tiny unigram vocabulary: piece -> probability (they need not sum to 1 here)
+probs = {"h": 0.05, "u": 0.05, "g": 0.05, "s": 0.05,
+         "hu": 0.04, "ug": 0.08, "gs": 0.03, "hug": 0.10, "hugs": 0.002}
+logp = {p: math.log(q) for p, q in probs.items()}
+
+def viterbi(word):
+    n = len(word)
+    best = [-math.inf] * (n + 1)   # best[i] = best log-prob of word[:i]
+    back = [0] * (n + 1)           # back[i] = start of the last piece
+    best[0] = 0.0
+    for end in range(1, n + 1):
+        for start in range(max(0, end - 8), end):
+            piece = word[start:end]
+            if piece in logp and best[start] + logp[piece] > best[end]:
+                best[end] = best[start] + logp[piece]
+                back[end] = start
+    pieces, i = [], n
+    while i > 0:
+        pieces.append(word[back[i]:i]); i = back[i]
+    return pieces[::-1], best[n]
+
+for w in ["hug", "hugs"]:
+    pieces, lp = viterbi(w)
+    print(w, pieces, f"log p = {lp:.3f}, p = {math.exp(lp):.4f}")
+
+# All segmentations of "hugs", for comparison
+def all_segs(word):
+    if not word:
+        return [[]]
+    return [[word[:i]] + rest for i in range(1, len(word) + 1)
+            if word[:i] in probs for rest in all_segs(word[i:])]
+for seg in all_segs("hugs"):
+    print(seg, f"{math.prod(probs[p] for p in seg):.6f}")
+```
+
+```text
+hug ['hug'] log p = -2.303, p = 0.1000
+hugs ['hug', 's'] log p = -5.298, p = 0.0050
+['h', 'u', 'g', 's'] 0.000006
+['h', 'u', 'gs'] 0.000075
+['h', 'ug', 's'] 0.000200
+['hu', 'g', 's'] 0.000100
+['hu', 'gs'] 0.001200
+['hug', 's'] 0.005000
+['hugs'] 0.002000
+```
+
+Viterbi found the best of the seven segmentations without enumerating them. Notice a property BPE does not have: because every additional piece multiplies in another probability below 1, Unigram naturally prefers fewer, longer pieces, unless a long piece is rare.
+
+### Training: EM and Pruning
+
+BPE grows a vocabulary from small to large. Unigram goes the other way:
+
+1. **Seed.** Start with a large candidate vocabulary: all characters plus the most frequent substrings of the corpus. SentencePiece's default `seed_sentencepiece_size` is 1,000,000.
+2. **EM.** Estimate the piece probabilities with the Expectation-Maximization algorithm. In the E-step, compute for each piece its expected count over all segmentations of each word, weighted by their probability (forward-backward over the same lattice Viterbi uses). In the M-step, set each $p(v)$ proportional to its expected count. This maximizes the corpus log-likelihood $\mathcal{L} = \sum_s \log P(s)$, where $P(s)$ sums $P(x)$ over all segmentations of sentence $s$.
+3. **Prune.** For each piece $v$, estimate the loss $\mathcal{L} - \mathcal{L}_{-v}$, how much the likelihood would drop if $v$ were removed and its occurrences re-segmented with other pieces. Keep the pieces with the highest loss and drop the rest. Single characters are always kept so every string stays encodable. SentencePiece's `shrinking_factor` of 0.75 keeps 75 percent of the candidates per round.
+4. Repeat EM and pruning until the target vocabulary size is reached.
+
+The result is a vocabulary plus a log-probability per piece. Those scores are stored in the model file; you can see them as the second column of a Unigram `tokenizer.json` vocab.
+
+### Subword Regularization
+
+Because Unigram is a probability model, you can **sample** segmentations instead of always taking the best one. Kudo's paper samples from
+
+$$
+P(x \mid X) \propto P(x)^\alpha
+$$
+
+during training, where a smaller $\alpha$ makes the distribution flatter (more varied splits) and $\alpha \to \infty$ recovers Viterbi. The model then sees "unbelievably" split several ways, which made translation models more robust to rare words and noise. BPE-Dropout (Provilkov et al., 2020) later achieved a similar effect for BPE by randomly skipping merges. Large LLMs are usually pretrained with deterministic tokenization, so treat subword regularization as a technique for smaller models and noisy domains rather than standard LLM practice.
+
+## SentencePiece: A Toolkit for Raw Text
+
+SentencePiece (Kudo and Richardson, 2018) is Google's open-source library that trains and runs both Unigram (its default) and BPE models. Its main idea is to treat the input as a raw stream of Unicode characters, with **no language-specific pre-tokenization**. That makes it work equally for English, Japanese and Thai.
+
+The design choices you will see in its vocabularies:
+
+- **Whitespace is a symbol.** Spaces are replaced by the meta-symbol `▁` (U+2581, "lower one eighth block") and become part of the pieces, so `▁the` is "the" with a preceding space. Decoding is concatenation plus replacing `▁` with a space, so the round trip is lossless.
+- **Dummy prefix.** By default (`add_dummy_prefix=true`) a `▁` is prepended to the input so the first word looks the same as words in the middle of a sentence. This is why the Llama 2 tokenizer often produces a lone `▁` token before digits or at the start of text.
+- **Normalization.** The default rule `nmt_nfkc` applies Unicode NFKC normalization (for example, full-width letters become ASCII) plus a few cleanups. The model file stores the rules so encoding is reproducible.
+- **Character coverage.** `character_coverage` (default 0.9995) keeps only the characters that cover that fraction of the training text; the rest map to `<unk>` unless byte fallback is on.
+- **Byte fallback.** With `byte_fallback=true`, characters outside the vocabulary are encoded as their UTF-8 bytes using 256 reserved tokens named `<0x00>` to `<0xFF>`. This gives SentencePiece the "never unknown" property of byte-level BPE while keeping a character-based vocabulary.
+- **Digit splitting.** `split_digits=true` forces every digit to be its own piece.
+
+The Llama 2 paper describes exactly this configuration: SentencePiece BPE, numbers split into individual digits, unknown UTF-8 characters decomposed into bytes, 32k vocabulary. The Gemma paper (2024) describes a 256k SentencePiece vocabulary that splits digits, keeps extra whitespace and uses byte-level encodings for unknown tokens.
+
+### Comparing the Three on Real Checkpoints
+
+Let us run BERT (WordPiece), T5 (SentencePiece Unigram) and TinyLlama, which reuses the Llama 2 tokenizer (SentencePiece BPE with byte fallback):
+
+```python
+from transformers import AutoTokenizer
+
+bert = AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")   # WordPiece
+t5 = AutoTokenizer.from_pretrained("google-t5/t5-small")                # SentencePiece Unigram
+llama = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")  # SentencePiece BPE (Llama 2 vocab)
+
+text = "Tokenization is unbelievably useful in 2026."
+print("WordPiece :", bert.tokenize(text))
+print("Unigram   :", t5.tokenize(text))
+print("SP-BPE    :", llama.tokenize(text))
+
+rare = "ꙮ"   # U+A66E, a very rare Cyrillic letter
+print("BERT  rare:", bert.tokenize(rare))
+print("T5    rare:", t5.tokenize(rare), t5(rare)["input_ids"])
+print("Llama rare:", llama.tokenize(rare))
+```
+
+```text
+WordPiece : ['token', '##ization', 'is', 'un', '##bel', '##ie', '##va', '##bly', 'useful', 'in', '202', '##6', '.']
+Unigram   : ['▁To', 'ken', 'ization', '▁is', '▁unbe', 'lie', 'v', 'ably', '▁useful', '▁in', '▁20', '26', '.']
+SP-BPE    : ['▁Token', 'ization', '▁is', '▁un', 'bel', 'iev', 'ably', '▁useful', '▁in', '▁', '2', '0', '2', '6', '.']
+BERT  rare: ['[UNK]']
+T5    rare: ['▁', 'ꙮ'] [3, 2, 1]
+Llama rare: ['▁', '<0xEA>', '<0x99>', '<0xAE>']
+```
+
+Three conventions, three ways to fail:
+
+- WordPiece marks continuation with `##` and lowercases (this is the uncased model). The rare letter becomes `[UNK]`.
+- Unigram and SentencePiece BPE mark word starts with `▁`. T5's tokenizer shows the rare character as a piece, but its id is 2, which is `<unk>` in T5's vocabulary; the information is lost.
+- With byte fallback, Llama 2's tokenizer encodes the character as its three UTF-8 bytes `EA 99 AE`, so nothing is lost. Note also the digit splitting: `2`, `0`, `2`, `6`, preceded by a `▁` token.
+
+### Training Your Own SentencePiece Model
+
+Install with `pip install sentencepiece` (version 0.2.x at the time of writing). The Python trainer takes the same options as the `spm_train` command line tool. Here we train both model types on 500,000 characters of *Pride and Prejudice* with Llama 2 style options:
+
+```python
+import sentencepiece as spm
+
+for model_type in ["unigram", "bpe"]:
+    spm.SentencePieceTrainer.train(
+        input="corpus.txt", model_prefix=f"sp_{model_type}", vocab_size=2000,
+        model_type=model_type, character_coverage=1.0,
+        byte_fallback=True, split_digits=True, minloglevel=2)
+
+uni = spm.SentencePieceProcessor(model_file="sp_unigram.model")
+bpe = spm.SentencePieceProcessor(model_file="sp_bpe.model")
+text = "Mr. Darcy was unbelievably proud in 1813."
+print("unigram:", uni.encode(text, out_type=str))
+print("bpe    :", bpe.encode(text, out_type=str))
+print("decode :", uni.decode(uni.encode(text)))
+
+# Subword regularization: sample segmentations from the unigram model
+# (sampling is random, so your samples will differ from run to run)
+for _ in range(3):
+    print("sample :", uni.encode("unbelievably proud", out_type=str,
+                                 enable_sampling=True, alpha=0.1, nbest_size=-1))
+print("nbest  :", uni.nbest_encode_as_pieces("unbelievably", 3))
+```
+
+```text
+unigram: ['▁Mr', '.', '▁Darcy', '▁was', '▁un', 'b', 'e', 'li', 'e', 'v', 'ably', '▁proud', '▁in', '▁', '1', '8', '1', '3', '.']
+bpe    : ['▁Mr', '.', '▁Darcy', '▁was', '▁un', 'b', 'e', 'lie', 'v', 'ably', '▁pr', 'oud', '▁in', '▁', '1', '8', '1', '3', '.']
+decode : Mr. Darcy was unbelievably proud in 1813.
+sample : ['▁', 'un', 'b', 'e', 'li', 'e', 'v', 'a', 'b', 'ly', '▁pro', 'u', 'd']
+sample : ['▁un', 'b', 'e', 'l', 'i', 'e', 'v', 'ably', '▁p', 'r', 'o', 'u', 'd']
+sample : ['▁', 'un', 'b', 'e', 'l', 'i', 'e', 'v', 'ably', '▁pro', 'u', 'd']
+nbest  : [['▁un', 'b', 'e', 'li', 'e', 'v', 'ably'], ['▁un', 'b', 'e', 'l', 'i', 'e', 'v', 'ably'], ['▁', 'un', 'b', 'e', 'li', 'e', 'v', 'ably']]
+```
+
+With the same 2,000-piece budget the two algorithms agree on frequent words (`▁Darcy`, `▁was`) and differ on rarer ones: Unigram keeps `▁proud` whole, BPE splits it as `▁pr` + `oud`. Sampling with `alpha=0.1` is deliberately very flat, so the samples are often worse than the best split; that noise is the regularizer. `nbest_encode_as_pieces` returns the top segmentations in order of probability.
+
+## Choosing an Algorithm
+
+| Property | BPE (byte-level) | WordPiece | Unigram |
+| --- | --- | --- | --- |
+| Training direction | Bottom-up merges | Bottom-up merges | Top-down pruning |
+| Merge or keep criterion | Pair frequency | Likelihood gain | Likelihood loss on removal |
+| Encoding | Apply merges by rank | Greedy longest match | Viterbi (or sampling) |
+| Unknown input | Never, bytes cover all | Whole word becomes `[UNK]` | `<unk>` unless byte fallback |
+| Stores per-token score | No (only merge order) | No | Yes, log-probabilities |
+| Typical library | tiktoken, HF `tokenizers` | HF `tokenizers`, TF Text | SentencePiece, HF `tokenizers` |
+| Example models | GPT-2 to GPT-4o, Llama 3, Qwen, DeepSeek-V3 | BERT, DistilBERT, ELECTRA | T5, ALBERT, XLNet, XLM-R, mBART |
+
+Gemma, Llama 1 and 2 and Mistral 7B use **SentencePiece with BPE**, which sits between the first and third columns: BPE merges over characters, the `▁` whitespace convention, and byte fallback for rare characters.
+
+Which is better? Bostrom and Durrett (2020) found that Unigram segmentations align better with morphology than BPE and gave slightly better downstream results for BERT-style models of that size. Yet almost every large decoder-only LLM released since 2023 uses byte-level BPE. The practical reasons are speed (tiktoken-style BPE encoders are very fast), simplicity, and the guarantee of exact round trips on any byte sequence, including code and malformed text. For a new LLM the default choice today is byte-level BPE with a carefully designed pre-tokenization regex; the choice of training data and vocabulary size usually matters more than the algorithm.
+
+## Common Mistakes
+
+- **Calling SentencePiece an algorithm.** It is a library that trains Unigram (default) or BPE; check `model_type` before describing a model's tokenizer.
+- **Stripping `▁` or `##` by hand.** Use the tokenizer's `decode`; manual string surgery breaks on edge cases like leading spaces and byte-fallback tokens.
+- **Forgetting the dummy prefix.** SentencePiece adds a leading `▁` by default, so encoding "Hello" alone and in the middle of a sentence can give different first tokens.
+- **Training without byte fallback for open-domain text.** With `character_coverage` below 1.0 and no byte fallback, rare characters silently become `<unk>`.
+- **Assuming WordPiece fails gracefully.** One unknown character turns the whole word into `[UNK]`.
+- **Comparing algorithms on different data.** Differences in training corpus and vocabulary size usually dwarf differences between BPE and Unigram.
+
+## Summary
+
+- WordPiece merges the pair with the highest likelihood gain (approximately $c(ab) / (c(a)\,c(b))$), marks continuations with `##` and encodes by greedy longest match; it powers BERT.
+- The Unigram model scores segmentations as a product of piece probabilities, decodes with Viterbi, trains with EM and prunes from a large seed vocabulary.
+- Unigram can sample segmentations (subword regularization) as a data augmentation technique.
+- SentencePiece trains Unigram or BPE on raw text, represents spaces as `▁`, normalizes with NFKC by default and can fall back to bytes and split digits.
+- Llama 2 and Gemma use SentencePiece BPE with digit splitting and byte fallback; GPT, Llama 3, Qwen and DeepSeek use byte-level BPE.
+
+## Further Reading
+
+- [Japanese and Korean Voice Search (Schuster and Nakajima, 2012)](https://research.google/pubs/japanese-and-korean-voice-search/): the original WordPiece paper.
+- [Google's Neural Machine Translation System (Wu et al., 2016)](https://arxiv.org/abs/1609.08144): WordPiece in a large translation system.
+- [Fast WordPiece Tokenization (Song et al., 2021)](https://arxiv.org/abs/2012.15524): linear-time WordPiece encoding.
+- [Subword Regularization (Kudo, 2018)](https://arxiv.org/abs/1804.10959): the Unigram language model and sampling segmentations.
+- [SentencePiece (Kudo and Richardson, 2018)](https://arxiv.org/abs/1808.06226): the library and its language-independent design.
+- [google/sentencepiece options reference](https://github.com/google/sentencepiece/blob/master/doc/options.md): every training flag, including `byte_fallback`, `split_digits` and `shrinking_factor`.
+- [Hugging Face LLM Course: WordPiece](https://huggingface.co/learn/llm-course/chapter6/6) and [Unigram](https://huggingface.co/learn/llm-course/chapter6/7): step-by-step training walkthroughs.
+- [Byte Pair Encoding is Suboptimal for Language Model Pretraining (Bostrom and Durrett, 2020)](https://arxiv.org/abs/2004.03720): comparing BPE and Unigram segmentations.

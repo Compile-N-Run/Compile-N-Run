@@ -1,0 +1,344 @@
+---
+title: "Evaluating a Fine-Tuned Model and Avoiding Catastrophic Forgetting"
+description: "Evaluate a fine-tune honestly: task metrics with confidence intervals, distribution shift, measuring forgetting with perplexity and lm-eval, and replay to prevent it."
+---
+
+# Evaluating a Fine-Tuned Model and Avoiding Catastrophic Forgetting
+
+## Introduction
+
+A falling training loss proves only that the model fits its training data. It does not prove that the model is better at the job, and it says nothing about what the model got worse at. Every fine-tune trades something for something, and evaluation is how you find out whether the trade was worth it.
+
+This page builds an evaluation for the ticket-extraction adapter trained on [the Hugging Face page](./3-llm-fine-tuning-with-hf.mdx) and uses it to answer three questions:
+
+1. **Did the target task improve?** Task metrics on held-out and shifted data, with error bars.
+2. **What did the model forget?** Perplexity on general text, general benchmarks with `lm-eval`, and behavioral probes.
+3. **How do you keep the gains and limit the losses?** Learning rate, LoRA, replay of general data, and adapter scaling.
+
+Everything runs on CPU with the 135M-parameter SmolLM2 model, and every number below comes from a real run. For evaluation methodology in general (benchmarks, LLM-as-a-judge, contamination) see the [Evaluation and Interpretability](../12-llm-evaluation/0-llm-evaluation-overview.mdx) section.
+
+## Measuring the Target Task
+
+Start with metrics that match how the output is used. For the ticket task the output is JSON consumed by a program, so the metrics are:
+
+- **valid JSON rate**: can the output be parsed at all,
+- **exact match**: is the whole object equal to the gold answer,
+- **field accuracy**: per key, because some errors (a wrong order number) are worse than others.
+
+Evaluate on two sets. The **in-distribution** set comes from the same process as the training data (here, the 40 held-out generated rows). The **shifted** set is written by hand with products and phrasings the training data never contained. The second set is the honest one: real users never write exactly like your training data.
+
+```python
+import json, random
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
+tok = AutoTokenizer.from_pretrained(MODEL_ID)
+base = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float32)
+
+# Held-out in-distribution rows: regenerate rows[200:240] exactly as in the training script.
+random.seed(0)
+products = ["router", "laptop", "headphones", "printer", "phone", "monitor"]
+problems = {"negative": ["stopped working after two days", "keeps disconnecting", "arrived with a cracked screen",
+                         "is far too loud and buzzes"],
+            "positive": ["works perfectly, thank you", "was easy to set up", "exceeded my expectations",
+                         "is the best purchase I made this year"]}
+def make_example():
+    product = random.choice(products); sentiment = random.choice(["negative", "positive"])
+    order = random.randint(10000, 99999)
+    text = f"Order {order}: my {product} {random.choice(problems[sentiment])}."
+    return text, {"order_id": order, "product": product, "sentiment": sentiment}
+rows = [make_example() for _ in range(240)]
+in_dist = rows[200:]
+
+# Shifted rows: unseen products and phrasings written by hand.
+shifted = [
+    ("Hi, order 55120 here. The tablet I bought refuses to charge.", {"order_id": 55120, "product": "tablet", "sentiment": "negative"}),
+    ("Order 70311 - love the new keyboard, typing feels great!", {"order_id": 70311, "product": "keyboard", "sentiment": "positive"}),
+    ("My camera (order 12988) shows a black screen since yesterday.", {"order_id": 12988, "product": "camera", "sentiment": "negative"}),
+    ("Order 43007: the speaker sounds amazing, thanks a lot.", {"order_id": 43007, "product": "speaker", "sentiment": "positive"}),
+    ("Order 88452. Mouse double-clicks on its own, very annoying.", {"order_id": 88452, "product": "mouse", "sentiment": "negative"}),
+    ("Just wanted to say order 19876, the webcam, works like a charm.", {"order_id": 19876, "product": "webcam", "sentiment": "positive"}),
+    ("Order 64230: smartwatch battery dies within an hour.", {"order_id": 64230, "product": "smartwatch", "sentiment": "negative"}),
+    ("Order 30519 - my laptop charger melted. Unacceptable.", {"order_id": 30519, "product": "laptop charger", "sentiment": "negative"}),
+]
+
+@torch.no_grad()
+def predict(model, text):
+    msgs = [{"role": "user", "content": f"Extract the ticket fields as JSON.\n{text}"}]
+    enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    out = model.generate(**enc, max_new_tokens=40, do_sample=False)
+    return tok.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+
+def score(model, data):
+    valid = exact = 0
+    field_hits = {"order_id": 0, "product": 0, "sentiment": 0}
+    for text, gold in data:
+        try:
+            pred = json.loads(predict(model, text))
+            valid += 1
+        except json.JSONDecodeError:
+            continue
+        exact += pred == gold
+        for k in field_hits:
+            field_hits[k] += pred.get(k) == gold[k] if isinstance(pred, dict) else 0
+    n = len(data)
+    fields = " ".join(f"{k}={v / n:.2f}" for k, v in field_hits.items())
+    return f"valid JSON {valid / n:.2f}  exact match {exact / n:.2f}  {fields}"
+
+tuned = PeftModel.from_pretrained(base, "smol-ticket-lora")
+for name, data in [("in-distribution (40)", in_dist), ("shifted (8)", shifted)]:
+    with tuned.disable_adapter():
+        print(f"base    {name:<22} {score(tuned, data)}")
+    print(f"adapter {name:<22} {score(tuned, data)}")
+```
+
+```text
+base    in-distribution (40)   valid JSON 0.00  exact match 0.00  order_id=0.00 product=0.00 sentiment=0.00
+adapter in-distribution (40)   valid JSON 1.00  exact match 1.00  order_id=1.00 product=1.00 sentiment=1.00
+base    shifted (8)            valid JSON 0.00  exact match 0.00  order_id=0.00 product=0.00 sentiment=0.00
+adapter shifted (8)            valid JSON 1.00  exact match 0.62  order_id=0.88 product=0.75 sentiment=0.88
+```
+
+`with tuned.disable_adapter():` runs the same object as the base model, so both rows use identical code. The base model scores zero because it invents a long schema of its own (as seen on the previous page) and runs past the 40-token limit, so its JSON never closes. That is a fair result for this task, but notice that the metric punishes a format problem and a knowledge problem identically; field-level scores and reading outputs tell you which one you have.
+
+The adapter is perfect in distribution and much weaker on the shifted set. Printing its eight shifted predictions shows the three failures:
+
+```text
+BAD {"sentiment": "negative", "text": "The tablet I bought refuses to charge.", "sentiment_impact": 0}
+OK  {"order_id": 70311, "product": "keyboard", "sentiment": "positive"}
+OK  {"order_id": 12988, "product": "camera", "sentiment": "negative"}
+BAD {"order_id": 43007, "product": "sounds amazing", "sentiment": "positive"}
+OK  {"order_id": 88452, "product": "mouse", "sentiment": "negative"}
+OK  {"order_id": 19876, "product": "webcam", "sentiment": "positive"}
+OK  {"order_id": 64230, "product": "smartwatch", "sentiment": "negative"}
+BAD {"order_id": 30519, "product": "laptop charger", "sentiment": "unacceptable"}
+```
+
+Each failure maps to a gap in the training data. Every training ticket started with "Order N: my product ...", so a ticket that opens with a greeting loses the schema entirely; "the speaker sounds amazing" puts the product in an unfamiliar position; and "Unacceptable." leaks into the sentiment field, which should only ever be "positive" or "negative". A schema-constrained decoder would fix the last one ([Constrained Decoding and Structured Output](../10-llm-inference/7-llm-structured-output.mdx)); the other two need more varied training data ([Preparing Fine-Tuning Data](./4-llm-fine-tuning-data.mdx)). In-distribution scores alone would have hidden all three.
+
+## Error Bars: How Many Test Examples Are Enough
+
+A score on $n$ examples is an estimate. If the true accuracy is $p$, the number of correct answers is binomial and the standard error of the measured accuracy $\hat p$ is
+
+$$
+\mathrm{SE}(\hat p) = \sqrt{\frac{\hat p (1 - \hat p)}{n}}
+$$
+
+An approximate 95 percent confidence interval is $\hat p \pm 1.96 \, \mathrm{SE}$. Plug in numbers: at $\hat p = 0.93$ and $n = 100$, $\mathrm{SE} = \sqrt{0.93 \times 0.07 / 100} = 0.0255$, so the interval is about $0.93 \pm 0.05$, from 88 to 98 percent. A fine-tune that scores 96 percent on the same 100 examples is not clearly better. To shrink the half-width of the interval to 1.5 points, so that intervals around 93 and 96 percent no longer overlap, you need roughly
+
+$$
+n \approx \frac{1.96^2 \, p(1-p)}{0.015^2} \approx \frac{3.84 \times 0.065}{0.000225} \approx 1100
+$$
+
+examples per system. (The Wilson interval is more accurate near 0 or 1 and for small $n$; the scaling is the same.)
+
+Two ways to do better with the data you have:
+
+- **Paired comparison.** Run both models on the same examples and count only disagreements: $b$ examples the base gets right and the fine-tune wrong, $c$ the reverse. Under "no difference", each disagreement is a fair coin flip, so McNemar's test compares $b$ and $c$. Paired tests detect smaller differences than comparing two independent accuracies, because shared easy and hard examples cancel out.
+- **Finer-grained metrics.** Field-level accuracy or a graded score has lower variance than all-or-nothing exact match.
+
+The 8-example shifted set above is far too small to report a number from; it is a smoke test that shows the kind of failure to expect. A real evaluation needs hundreds of shifted examples.
+
+For open-ended outputs (summaries, chat answers), there is no exact match. Use pairwise comparisons by humans or by a strong model acting as judge, report win rates with the same binomial error bars, and control for position and length bias; see [LLM-as-a-Judge and Human Evaluation](../12-llm-evaluation/2-llm-llm-as-judge.mdx).
+
+## What Is Catastrophic Forgetting?
+
+**Catastrophic forgetting** (McCloskey and Cohen, 1989, who called it catastrophic interference) is the loss of previously learned abilities when a neural network is trained on new data. The mechanism is simple. Fine-tuning minimizes the loss on your data only:
+
+$$
+\theta^\ast = \arg\min_\theta \; \mathcal{L}_\text{task}(\theta)
+$$
+
+Nothing in this objective mentions the base model's other abilities. The same weights store everything, so any gradient step that helps your task can move weights that other abilities depend on. If those abilities are not exercised by the training data, nothing pushes back.
+
+What does forgetting look like in LLMs?
+
+- **Format collapse.** The model answers every question in the fine-tuned format, for example JSON for "What is the capital of France?".
+- **Knowledge and skill loss.** Lower scores on general benchmarks, worse reasoning or coding.
+- **Lost safety behavior.** Qi et al. (2023) showed that fine-tuning an aligned model can remove refusals: 10 adversarial examples were enough to jailbreak GPT-3.5 Turbo through the fine-tuning API, and fine-tuning on benign, commonly used datasets also degraded safety, to a lesser extent.
+- **Lost diversity.** Lower entropy, repetitive outputs.
+
+Research results give a consistent picture of who forgets more. Luo et al. (2023) observed forgetting in continual instruction tuning across models from 1B to 7B parameters. Biderman et al. (2024), "LoRA Learns Less and Forgets Less", found that LoRA preserved the base model's performance on tasks outside the target domain better than full fine-tuning, more so than common regularizers such as weight decay and dropout, at the cost of learning the target domain less well. The intuition: a low-rank update with a modest learning rate can only move the weights a limited distance.
+
+## Measuring Forgetting
+
+You need a fixed **regression suite** that you run on the base model and on every fine-tune. Three kinds of checks, from cheapest to most informative:
+
+**1. Perplexity on general text.** Take text the fine-tune never saw (here, WikiText-2 test paragraphs) and compute
+
+$$
+\mathrm{PPL} = \exp\!\left(-\frac{1}{N} \sum_{t=1}^{N} \log p_\theta(x_t \mid x_{<t})\right)
+$$
+
+over all $N$ predicted tokens. A rise in perplexity means the model's general language distribution moved. It is cheap and sensitive, but it does not tell you which abilities changed. Note that for a chat model, raw-text perplexity is a proxy; see [Perplexity and Intrinsic Metrics](../12-llm-evaluation/1-llm-perplexity.mdx) for details such as sliding windows.
+
+**2. Behavioral probes.** A fixed list of general prompts (factual, instruction-following, safety-relevant) with greedy decoding. Read the answers side by side with the base model's. This is how you catch format collapse.
+
+**3. Standard benchmarks.** EleutherAI's `lm-evaluation-harness` evaluates a base model plus a PEFT adapter directly:
+
+```bash
+pip install "lm_eval[hf]"
+lm_eval --model hf \
+    --model_args pretrained=HuggingFaceTB/SmolLM2-135M-Instruct,peft=./smol-ticket-lora \
+    --tasks arc_easy,hellaswag --batch_size 8 --output_path results/
+```
+
+The `peft=` argument loads the adapter on top of `pretrained=`. For a quick check of the ticket adapter we ran ARC-Easy (zero-shot, scored by comparing the log-likelihood of each answer choice) on the first 200 questions, adding `--limit 200 --device cpu` to the command above (lm-eval 0.4.13):
+
+```text
+base:     |arc_easy|      1|none  |     0|acc     |↑  |0.500|±  |0.0354|
+          |        |       |none  |     0|acc_norm|↑  |0.445|±  |0.0352|
+adapter:  |arc_easy|      1|none  |     0|acc     |↑  | 0.50|±  |0.0354|
+          |        |       |none  |     0|acc_norm|↑  | 0.46|±  |0.0353|
+```
+
+No measurable change: the differences are far inside the reported standard errors of about 0.035. Three cautions when reading such numbers. First, `--limit` is for smoke tests, and the harness itself warns that real metrics should not be computed with it. Second, log-likelihood multiple-choice tasks never let the model generate, so they cannot see format collapse; a model that answers everything in JSON can keep its ARC score. Third, the harness warned that this is a chat model evaluated without its chat template; add `--apply_chat_template` when you want to evaluate the way users will prompt it, and keep the setting identical for base and fine-tune.
+
+## Experiment: Forgetting and Replay
+
+How much does the ticket adapter make the model forget, and does replay help? We ran a small controlled experiment with four adapters on SmolLM2-135M-Instruct. All use the training script from [the previous page](./3-llm-fine-tuning-with-hf.mdx) with the same 200 ticket examples and LoRA $r = 16$ on all linear layers; only the learning rate, the number of epochs and the replay data change:
+
+- **gentle**: learning rate 2e-4, 2 epochs (the adapter from the previous page),
+- **hot**: learning rate 1e-3, 4 epochs, a deliberately aggressive setting,
+- **hot + replay**: the hot setting with 100 general instruction examples from Alpaca mixed into the 200 ticket examples (a third of the data),
+- **hot, scaled 0.5**: the hot adapter evaluated with its LoRA scale halved.
+
+The replay data is added to the training set and shuffled. General prompts that overlap the probes (about sleep, France, mornings or translation) are filtered out so the probes stay unseen:
+
+```python
+import random
+from datasets import load_dataset
+
+def add_replay(train_rows, n_replay, seed=0):
+    """Mix n_replay general instruction examples into the task data."""
+    alpaca = load_dataset("tatsu-lab/alpaca", split="train").shuffle(seed=seed)
+    banned = ("sleep", "france", "morning", "translate")       # keep the probes unseen
+    general = [r for r in alpaca if r["input"] == "" and len(r["output"]) < 600
+               and not any(b in r["instruction"].lower() for b in banned)][:n_replay]
+    mixed = train_rows + [
+        {"prompt": [{"role": "user", "content": r["instruction"]}],
+         "completion": [{"role": "assistant", "content": r["output"]}]}
+        for r in general
+    ]
+    random.Random(seed).shuffle(mixed)
+    return mixed
+```
+
+Forgetting is measured with WikiText-2 perplexity (the first 40 test paragraphs longer than 30 words, up to 256 tokens each) and three greedy-decoded probes. The core of the measurement:
+
+```python
+import math
+import torch
+
+@torch.no_grad()
+def perplexity(model, tok, texts):
+    nll, n = 0.0, 0
+    for t in texts:
+        ids = tok(t, return_tensors="pt", truncation=True, max_length=256)["input_ids"]  # (1, T)
+        out = model(input_ids=ids, labels=ids)        # loss = mean NLL over T-1 targets
+        nll += out.loss.item() * (ids.shape[1] - 1)
+        n += ids.shape[1] - 1
+    return math.exp(nll / n)
+```
+
+Scaling an adapter needs no retraining. Every PEFT LoRA layer has a `set_scale` method that multiplies its $\alpha / r$ factor:
+
+```python
+from peft.tuners.lora import LoraLayer
+
+def scale_adapter(peft_model, lam, adapter="default"):
+    for module in peft_model.modules():
+        if isinstance(module, LoraLayer):
+            module.set_scale(adapter, lam)    # scaling becomes lam * alpha / r
+```
+
+The results (all measured on CPU; in-distribution exact match uses 40 held-out tickets for the gentle adapter and the first 20 of them for the others):
+
+| Adapter | WikiText-2 PPL | "Capital of France?" probe | In-dist exact match | Shifted exact match (8) |
+|---|---|---|---|---|
+| base model | 37.05 | The capital of France is Paris. | 0.00 | 0.00 |
+| gentle (2e-4, 2 epochs) | 38.04 | The capital of France is Paris. | 1.00 | 0.62 |
+| hot (1e-3, 4 epochs) | 49.50 | `{"capital": " France", "sentiment": "negative"}` | 1.00 | 0.62 |
+| hot + replay | 44.87 | The capital of France is Paris. | 1.00 | 0.62 |
+| hot, scaled 0.5 | 39.63 | not measured | 1.00 | 0.88 |
+
+What the table shows:
+
+- **The gentle adapter forgot little**: perplexity rose 2.7 percent and all probes still got sensible answers. This matches the "LoRA forgets less" result: a modest learning rate and few steps moved the weights a short distance.
+- **The hot adapter shows format collapse.** It learned the task no better (both are perfect in distribution), but it answers a geography question with ticket JSON, and perplexity on general text rose 34 percent. The extra learning rate and epochs bought nothing on the task and cost a lot elsewhere.
+- **Replay restored the behavior and part of the perplexity.** With a third of the data from general instructions, the same aggressive setting answered the probe normally and perplexity rose 21 percent instead of 34, with no loss on the task. Replay protects what it exercises: general instruction following came back, but raw-text perplexity, which the replay data does not target directly, recovered only partly.
+- **Halving the adapter scale** brought perplexity back to 39.63, close to the gentle adapter, while keeping the task. Its higher shifted score (7 of 8) is within the noise of an 8-example set, so do not read it as an improvement.
+
+The experiment is tiny (one seed, a 135M model, 8 shifted examples), so treat the numbers as an illustration of the mechanisms, not as general constants. The pattern, however, is the standard one: forgetting grows with how far training moves the weights, and anything that keeps the base distribution in the loss or limits the update reduces it.
+
+## Mitigating Forgetting
+
+The techniques, roughly from cheapest to most involved:
+
+| Technique | How it works | Cost |
+|---|---|---|
+| Lower learning rate, fewer epochs | Smaller total weight change | May learn the task less |
+| LoRA with modest rank | Limits the update to a low-rank subspace | Default already |
+| Replay (data mixing) | Mix general instruction data into the training set | More tokens per epoch; needs suitable data |
+| Self-distillation replay | Replay the base model's own answers to general prompts | Generation time; keeps the original style |
+| KL or weight regularization | Penalize divergence from the base model's outputs or important weights (EWC) | Extra forward pass or Fisher estimate |
+| Adapter scaling or weight interpolation | Blend base and fine-tuned weights at inference | One knob; trades task gain for retention |
+
+**Replay** is the most widely used. Mixing a fraction of general data into the fine-tuning set keeps those abilities exercised, so the gradient now pushes back when they start to degrade. Luo et al. (2023) also found that prior general instruction tuning reduced forgetting in later fine-tuning. The mix ratio is a hyperparameter; somewhere between 10 and 50 percent general data is a common range to try, and the experiment above used one point in it (a third).
+
+**Regularization toward the base model** adds a term to the loss. A KL penalty on the output distributions,
+
+$$
+\mathcal{L} = \mathcal{L}_\text{task}(\theta) + \beta \, \mathbb{E}_{x \sim \mathcal{D}_\text{general}} \left[ \mathrm{KL}\!\left(p_{\theta_0}(\cdot \mid x) \,\Vert\, p_\theta(\cdot \mid x)\right) \right]
+$$
+
+keeps predictions on general inputs close to the base model $\theta_0$, the same idea as the KL penalty in [RLHF](../8-llm-post-training/2-llm-rlhf.mdx). Elastic Weight Consolidation (Kirkpatrick et al., 2017) instead penalizes changes to weights in proportion to how important they were for earlier tasks, estimated with the Fisher information.
+
+**Interpolation.** WiSE-FT (Wortsman et al., 2022) showed for image models that averaging the weights of the base and fine-tuned models, $\theta = (1 - \lambda)\theta_0 + \lambda \theta_\text{ft}$, often keeps most of the task gain while recovering robustness. With LoRA this is free: $\theta_0 + \lambda s B A$ is just the adapter with its scale multiplied by $\lambda$. PEFT exposes this through each LoRA layer's `set_scale` (used in the experiment above), so you can sweep $\lambda$ between 0 and 1 on the evaluation suite and pick the trade-off point.
+
+## Putting It Together: An Evaluation Report
+
+For every fine-tune, fill in the same table, base model first:
+
+| Check | Base | Fine-tune | Notes |
+|---|---|---|---|
+| Task: exact match, in-distribution (n, 95% CI) | | | |
+| Task: exact match, shifted set (n, 95% CI) | | | Hundreds of examples, real inputs |
+| Format validity | | | |
+| General perplexity (fixed text) | | | Relative change |
+| General benchmarks (lm-eval tasks) | | | Same harness version and settings |
+| Behavioral probes | | | Read, do not just count |
+| Safety prompts: refusal rate on harmful, over-refusal on benign | | | Re-test after every fine-tune |
+| Latency and tokens per answer | | | Fine-tunes often change answer length |
+
+Keep the harness version, prompts, decoding settings and random seeds fixed across rows, and record them. A difference you cannot reproduce is not a result.
+
+## Common Mistakes
+
+- **Using `eval_loss` as the task metric.** Low loss under teacher forcing does not guarantee correct free generation; always score generated outputs.
+- **Evaluating only on data generated like the training data.** In-distribution scores flatter the model; the shifted set shows what users will see.
+- **Reporting differences smaller than the error bars.** At 100 examples, a 3-point gain is noise; use more examples or paired tests.
+- **Skipping the base-model row.** Without it you cannot tell gains from forgetting.
+- **Measuring forgetting only with perplexity.** Small perplexity changes can hide format collapse; read probe answers too.
+- **Forgetting safety.** Re-run refusal and over-refusal checks after every fine-tune, even on benign data.
+- **Changing several things between runs.** Change one variable (learning rate, replay ratio, rank) at a time so the evaluation can attribute the effect.
+
+## Summary
+
+- Evaluate generated outputs with task metrics that match their use, on both in-distribution and shifted data.
+- Report confidence intervals: the standard error is $\sqrt{\hat p(1-\hat p)/n}$, so small test sets cannot separate close systems; use paired tests.
+- Catastrophic forgetting happens because the task loss ignores everything else; it shows up as format collapse, skill loss, lost safety behavior and lower diversity.
+- Measure it with a fixed regression suite: general perplexity, behavioral probes, `lm-eval` benchmarks with `peft=` adapters, and safety prompts.
+- Mitigate with a modest learning rate and LoRA, replay of general data, regularization toward the base model, or adapter scaling.
+
+## Further Reading
+
+- [Catastrophic Interference in Connectionist Networks (McCloskey and Cohen, 1989)](https://doi.org/10.1016/S0079-7421(08)60536-8) - the original description of forgetting.
+- [Overcoming Catastrophic Forgetting in Neural Networks (Kirkpatrick et al., 2017)](https://arxiv.org/abs/1612.00796) - Elastic Weight Consolidation.
+- [An Empirical Study of Catastrophic Forgetting in LLMs During Continual Fine-tuning (Luo et al., 2023)](https://arxiv.org/abs/2308.08747) - forgetting across 1B-7B models.
+- [LoRA Learns Less and Forgets Less (Biderman et al., 2024)](https://arxiv.org/abs/2405.09673) - the LoRA learning-forgetting trade-off.
+- [Fine-tuning Aligned Language Models Compromises Safety (Qi et al., 2023)](https://arxiv.org/abs/2310.03693) - safety regression from fine-tuning.
+- [Robust Fine-Tuning of Zero-Shot Models (Wortsman et al., 2022)](https://arxiv.org/abs/2109.01903) - WiSE-FT weight interpolation.
+- [EleutherAI lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) - the benchmark harness, including PEFT support.

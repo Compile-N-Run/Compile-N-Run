@@ -9,6 +9,8 @@ const root = path.resolve(import.meta.dirname, '../..');
 const require = createRequire(path.join(root, 'tests/content-quality/package.json'));
 const { compile } = await import(pathToFileURL(require.resolve('@mdx-js/mdx')));
 const { default: remarkGfm } = await import(pathToFileURL(require.resolve('remark-gfm')));
+// Docusaurus compiles docs with remark-math (docusaurus.config.js), so $...$ and $$...$$ are formulas, not JSX.
+const { default: remarkMath } = await import(pathToFileURL(require.resolve('remark-math')));
 const listFile = process.argv[2];
 if (!listFile) throw new Error('Usage: node hugo/scripts/check_mdx.mjs FILE_LIST.json');
 const files = JSON.parse(await readFile(listFile, 'utf8'));
@@ -22,7 +24,7 @@ for (const file of files) {
   // Front matter is checked by check_content.py, not interpreted as MDX.
   source = source.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
   try {
-    await compile({ value: source, path: file }, { remarkPlugins: [remarkGfm] });
+    await compile({ value: source, path: file }, { remarkPlugins: [remarkGfm, remarkMath] });
   } catch (error) {
     failures++;
     console.error(`${file}: ${error.message}`);

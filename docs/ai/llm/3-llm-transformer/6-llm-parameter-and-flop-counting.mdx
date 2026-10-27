@@ -1,0 +1,274 @@
+---
+title: "Counting Parameters, FLOPs and Memory"
+description: "Derive per-layer parameter, FLOP and memory formulas for Transformers, verify 6ND with PyTorch's FLOP counter and work them through for Llama 3.1 8B."
+---
+
+# Counting Parameters, FLOPs and Memory
+
+## Introduction
+
+Before you train, fine-tune or serve a model, three questions decide whether the plan is feasible: how many parameters it has, how many floating-point operations each token costs, and how much memory it needs. All three can be computed from the config.json in a few lines of arithmetic, and the formulas are simple enough to do on a whiteboard.
+
+This page derives them from the block structure of the previous pages, checks them against PyTorch (exact parameter counts on a meta device, measured FLOPs with `torch.utils.flop_counter`), and works everything through for a real model: Llama 3.1 8B. You will be able to:
+
+- write the parameter count of any decoder-only model from its config: embeddings, attention with GQA, SwiGLU MLP and norms;
+- explain where "2 FLOPs per parameter per token" and "6ND" come from, and when the attention term breaks them;
+- estimate the compute of a training run and compare it with reported GPU hours to infer utilization;
+- budget memory for inference (weights and KV cache) and training (weights, gradients, optimizer states, activations);
+- bound decoding speed by memory bandwidth.
+
+## Parameters of a Decoder Block
+
+Use the symbols that appear in config.json:
+
+| Symbol | config.json field | Llama 3.1 8B |
+|---|---|---|
+| $d$ | `hidden_size` | 4,096 |
+| $L$ | `num_hidden_layers` | 32 |
+| $n_q$ | `num_attention_heads` | 32 |
+| $n_{kv}$ | `num_key_value_heads` | 8 |
+| $d_h$ | `head_dim` | 128 |
+| $f$ | `intermediate_size` | 14,336 |
+| $V$ | `vocab_size` | 128,256 |
+| | `tie_word_embeddings` | false |
+
+**Attention.** The query projection maps $d$ to $n_q d_h$, the key and value projections map $d$ to $n_{kv} d_h$ each, and the output projection maps $n_q d_h$ back to $d$:
+
+$$
+P_\mathrm{attn} = \underbrace{d\, n_q d_h}_{W_Q} + \underbrace{2\, d\, n_{kv} d_h}_{W_K,\, W_V} + \underbrace{n_q d_h\, d}_{W_O}
+$$
+
+For standard multi-head attention, $n_{kv} = n_q$ and $n_q d_h = d$, giving the familiar $4d^2$.
+
+**MLP.** A SwiGLU MLP has three matrices of size $d \times f$: $P_\mathrm{mlp} = 3 d f$. A classic GELU MLP has two: $2 d f$, which is $8d^2$ for $f = 4d$.
+
+**Norms.** Two RMSNorm gain vectors: $2d$. LayerNorm with bias would be $4d$. Biases in linear layers, where present (GPT-2, Qwen2's QKV), add one vector per matrix.
+
+**Whole model.**
+
+$$
+P = L\,(P_\mathrm{attn} + P_\mathrm{mlp} + 2d) + \underbrace{V d}_{\text{embedding}} + \underbrace{V d}_{\text{LM head, if untied}} + \underbrace{d}_{\text{final norm}}
+$$
+
+For a classic GPT block ($4d^2 + 8d^2$), the block total is $12 d^2$, so a model is about $12 L d^2$ plus embeddings. This is the approximation Kaplan et al. use for "non-embedding parameters". Check it on GPT-2 small ($L = 12$, $d = 768$): $12 \times 12 \times 768^2 = 84.9$M. Adding biases and norms gives 85.05M for the blocks; the token embedding ($50257 \times 768 = 38.6$M, tied with the head) and position table ($1024 \times 768 = 0.79$M) bring the total to 124,439,808, the "124M" of the GPT-2 small checkpoint.
+
+Here is the same formula applied to Llama 3.1 8B, checked against the actual Hugging Face module tree. Building the model under `torch.device("meta")` creates every parameter with its shape but no storage, so this runs instantly on any machine and downloads nothing.
+
+```python
+import torch
+from transformers import LlamaConfig, AutoModelForCausalLM
+
+# Shapes copied from Llama 3.1 8B's config.json (no weights are downloaded).
+cfg = LlamaConfig(hidden_size=4096, intermediate_size=14336, num_hidden_layers=32,
+                  num_attention_heads=32, num_key_value_heads=8, head_dim=128,
+                  vocab_size=128256, tie_word_embeddings=False)
+
+def count_by_formula(c):
+    d, L, V, f = c.hidden_size, c.num_hidden_layers, c.vocab_size, c.intermediate_size
+    hd, nq, nkv = c.head_dim, c.num_attention_heads, c.num_key_value_heads
+    attn = d * nq * hd + 2 * d * nkv * hd + nq * hd * d    # W_Q, W_K + W_V, W_O
+    mlp = 3 * d * f                                        # gate, up, down
+    norms = 2 * d
+    embed = V * d
+    head = 0 if c.tie_word_embeddings else V * d
+    return L * (attn + mlp + norms) + embed + head + d     # + final norm
+
+with torch.device("meta"):                                 # build the module tree without memory
+    model = AutoModelForCausalLM.from_config(cfg)
+actual = sum(p.numel() for p in model.parameters())
+print(f"formula: {count_by_formula(cfg):,}")
+print(f"PyTorch: {actual:,}")
+emb = cfg.vocab_size * cfg.hidden_size
+print(f"non-embedding (excluding input embedding and LM head): {actual - 2 * emb:,}")
+```
+
+```text
+formula: 8,030,261,248
+PyTorch: 8,030,261,248
+non-embedding (excluding input embedding and LM head): 6,979,588,096
+```
+
+The breakdown, by hand:
+
+| Part | Formula | Count | Share |
+|---|---|---|---|
+| Attention, per layer | $4096 \cdot 4096 + 2 \cdot 4096 \cdot 1024 + 4096 \cdot 4096$ | 41,943,040 | |
+| MLP, per layer | $3 \cdot 4096 \cdot 14336$ | 176,160,768 | |
+| Norms, per layer | $2 \cdot 4096$ | 8,192 | |
+| 32 layers | $32 \times 218{,}112{,}000$ | 6,979,584,000 | 86.9% |
+| Input embedding | $128256 \cdot 4096$ | 525,336,576 | 6.5% |
+| LM head (untied) | $128256 \cdot 4096$ | 525,336,576 | 6.5% |
+| Final norm | $4096$ | 4,096 | |
+| **Total** | | **8,030,261,248** | 100% |
+
+Two things to take from this. GQA shrinks attention to 19% of each block; with full multi-head attention (as in Llama 2 7B) it would be $4d^2 = 67$M per layer. And the 128K vocabulary costs over a billion parameters, 13% of the model, which is why small models with large vocabularies tie their embeddings (Llama 3.2 1B sets `tie_word_embeddings: true`).
+
+## FLOPs of a Forward Pass
+
+Multiplying an $m \times k$ matrix by a $k \times n$ matrix takes $mkn$ multiplications and about as many additions: $2mkn$ FLOPs. For one token, a linear layer with weight $W \in \mathbb{R}^{k \times n}$ is a $1 \times k$ by $k \times n$ product, so it costs $2kn$ FLOPs, two per weight. Summing over all linear layers:
+
+$$
+C_\mathrm{forward}^\mathrm{weights} \approx 2 N \quad \text{FLOPs per token}
+$$
+
+where $N$ counts the weights used in matrix multiplies. The input embedding is a lookup, not a matmul, so strictly $N$ excludes it but includes the LM head; for Llama 3.1 8B that is $6.98\text{B} + 0.53\text{B} = 7.50$B, so a forward pass costs about 15.0 GFLOPs per token. Norms, activations, softmax and residual additions are a few FLOPs per element and can be ignored.
+
+Attention adds work that has no weights. For a query at position $t$, computing scores against $t$ keys costs $2 t\, d_h$ FLOPs per head, and the weighted sum of $t$ values costs the same. Summed over $n_q$ heads, that is $4 t\, n_q d_h$ per layer. Averaged over all positions of a causal sequence of length $T$, $t$ averages $T/2$:
+
+$$
+C_\mathrm{forward}^\mathrm{attn} \approx 2\, L\, T\, n_q d_h \quad \text{FLOPs per token}
+$$
+
+This is the $2 n_\mathrm{layer} n_\mathrm{ctx} d_\mathrm{attn}$ term in Kaplan et al.'s Table 1. Note that it uses $n_q d_h$, not $n_{kv} d_h$: GQA reduces the memory of keys and values, not the number of query-key dot products. For Llama 3.1 8B, $2 \cdot 32 \cdot 4096 = 262{,}144$ FLOPs per token per unit of context:
+
+| Context $T$ | Attention FLOPs per token | Relative to weight FLOPs (15.0 G) |
+|---|---|---|
+| 2,048 | 0.54 G | 4% |
+| 8,192 | 2.15 G | 14% |
+| 32,768 | 8.59 G | 57% |
+| 131,072 | 34.4 G | 229% |
+| 1,000,000 | 262 G | 1,746% |
+
+The crossover, where attention costs as much as all the weights together, is at $T = N / (L\, n_q d_h) \approx 57{,}000$ tokens. Below a few thousand tokens, "2N per token" is accurate; at 128K context, attention dominates. [The Quadratic Cost of Attention](../2-llm-attention/7-llm-attention-complexity.mdx) works through memory as well as FLOPs at these lengths.
+
+## Training FLOPs and the 6ND Rule
+
+Backpropagation through a linear layer $y = xW$ needs two matrix products: the gradient with respect to the input, $\partial L / \partial x = (\partial L / \partial y) W^\top$, to keep backpropagating, and the gradient with respect to the weight, $\partial L / \partial W = x^\top (\partial L / \partial y)$, to update it. Each costs the same as the forward product. So the backward pass costs about twice the forward pass, and one training step costs about three forward passes:
+
+$$
+C_\mathrm{train} \approx 6 N \quad \text{FLOPs per token}, \qquad C_\mathrm{total} \approx 6 N D
+$$
+
+for $D$ training tokens. This is the "6ND" rule of Kaplan et al. (2020), used throughout the scaling-law literature ([Scaling Laws](../6-llm-pretraining/2-llm-scaling-laws.mdx)). It ignores the attention term, which adds $6 L T n_q d_h$ per token in training, and it assumes no activation recomputation; recomputing activations in the backward pass adds roughly one more forward pass.
+
+You can verify the rule by counting. PyTorch's `FlopCounterMode` intercepts every matrix multiply. Using the 812,288-parameter GPT from [Building a GPT from Scratch](./5-llm-build-gpt-from-scratch.mdx) (save its `model.py` next to this script):
+
+```python
+import torch
+from torch.utils.flop_counter import FlopCounterMode
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from model import GPT, GPTConfig
+
+torch.manual_seed(0)
+cfg = GPTConfig(vocab_size=65)                     # the 812,288-parameter GPT from this section
+model = GPT(cfg)
+B, T = 8, cfg.block_size
+x = torch.randint(0, 65, (B, T)); y = torch.randint(0, 65, (B, T))
+
+N = sum(m.weight.numel() for m in model.modules() if isinstance(m, torch.nn.Linear))  # matmul weights
+# The MATH backend runs attention as plain matmuls, which the counter can see.
+with sdpa_kernel(SDPBackend.MATH), FlopCounterMode(display=False) as fc:
+    _, loss = model(x, y)
+    loss.backward()
+measured = fc.get_total_flops() / (B * T)
+
+d, L = cfg.d_model, cfg.n_layer
+attn_full = 12 * L * T * d                         # QK^T and AV over the full T x T matrix, fwd + bwd
+for op, f in fc.get_flop_counts()["Global"].items():
+    print(f"  {str(op):28s} {f / (B * T):>12,.0f} per token")
+print(f"weights used in matmuls N:         {N:,}")
+print(f"measured train FLOPs per token:    {measured:,.0f}")
+print(f"6N:                                {6 * N:,}")
+print(f"6N + 12 L T d (full score matrix):  {6 * N + attn_full:,}")
+print(f"6N + 6 L T d (causal half only):    {6 * N + attn_full // 2:,}")
+```
+
+```text
+  aten.mm                         4,768,512 per token
+  aten.bmm                          786,432 per token
+weights used in matmuls N:         794,752
+measured train FLOPs per token:    5,554,944
+6N:                                4,768,512
+6N + 12 L T d (full score matrix):  5,554,944
+6N + 6 L T d (causal half only):    5,161,728
+```
+
+The weight matmuls (`aten.mm`) come to exactly $6N$. The attention matmuls (`aten.bmm`) add $12 L T d$, because the math backend computes the full $T \times T$ score matrix and simply masks half of it. FlashAttention-style kernels skip fully masked tiles and do close to the causal half, $6 L T d$. Note that $N$ here is 794,752, not 812,288: the position table and norm gains are not used in matrix multiplies (the tied token embedding is counted once, as the LM head).
+
+When papers report "model FLOPs utilization" (MFU), introduced in the PaLM paper, they divide this kind of theoretical FLOP count by the hardware's peak, so recomputation and wasted masked work count as overhead, not as useful FLOPs.
+
+## Worked Example: The Compute Behind Llama 3.1 8B
+
+The Llama 3.1 model card reports about 15 trillion pretraining tokens and 1.46M H100-80GB GPU hours for the 8B model. Apply 6ND:
+
+$$
+C \approx 6 \times 8.03 \times 10^{9} \times 15 \times 10^{12} \approx 7.2 \times 10^{23}\ \text{FLOPs}
+$$
+
+Spread over $1.46 \times 10^6$ GPU hours ($5.26 \times 10^9$ GPU-seconds), that is $1.4 \times 10^{14}$ FLOP/s, or 137 TFLOP/s per GPU. An H100 SXM's dense BF16 peak is about 989 TFLOP/s, so the implied average utilization is about 14%.
+
+That is far below the 38% to 43% BF16 MFU that the Llama 3 paper reports for 405B pretraining. The gap is informative rather than alarming: the reported GPU hours are cumulative and may include work beyond one clean pretraining pass (the card does not break them down), the 6ND estimate omits the attention term (14% at 8K context, much more in the long-context stage), and small models are harder to run efficiently on large clusters because each GPU gets less work per communication step. The lesson is to use 6ND for planning and to expect real runs to cost more than the ideal.
+
+For comparison, a hypothetical compute-optimal model for the same budget (Chinchilla's rough rule of 20 tokens per parameter) would be far larger: $C = 6 N \cdot 20 N$ gives $N = \sqrt{C/120} \approx 78$B. Llama 3.1 8B trades training efficiency for a model that is cheap to serve, about 1,900 tokens per parameter.
+
+## Memory: Inference
+
+**Weights.** Bytes per parameter times parameter count. Llama 3.1 8B in bfloat16 needs $8.03 \times 10^9 \times 2 = 16.1$ GB; in FP8, 8.0 GB; in 4-bit formats about 4.0 GB plus a few percent for scales ([Quantization Basics](../11-llm-quantization/0-llm-quantization-basics.mdx)).
+
+**KV cache.** Each generated or prompt token stores one key and one value vector per KV head per layer:
+
+$$
+M_\mathrm{KV} = 2 \times L \times n_{kv} \times d_h \times \text{bytes} \quad \text{per token}
+$$
+
+For Llama 3.1 8B in bfloat16: $2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes, exactly 128 KiB per token. An 8K-token conversation needs 1 GiB; a full 128K context needs 16 GiB, as much as the weights. Llama 2 7B, with 32 KV heads, needs 512 KiB per token, four times more; that difference is the main reason GQA exists ([MQA and GQA](../2-llm-attention/5-llm-mqa-gqa.mdx), [The KV Cache](../10-llm-inference/2-llm-kv-cache.mdx)).
+
+**Decoding speed bound.** Generating one token with batch size 1 requires reading every weight from GPU memory once. With 16.1 GB of weights and an H100 SXM's roughly 3.35 TB/s of HBM bandwidth, the upper bound is about $3.35 \times 10^{12} / 1.61 \times 10^{10} \approx 208$ tokens per second, regardless of how many FLOPs the GPU has. The arithmetic (15 GFLOPs per token) would take about 15 microseconds at peak; reading the weights takes about 5 milliseconds. That is why decoding is memory-bound and why batching many users together raises throughput ([Prefill and Decode](../10-llm-inference/0-llm-inference-overview.mdx)).
+
+## Memory: Training
+
+Training with AdamW in mixed precision keeps, for every parameter:
+
+| Item | Precision | Bytes per parameter |
+|---|---|---|
+| Weights used in forward and backward | bf16 | 2 |
+| Gradients | bf16 | 2 |
+| Master copy of weights | fp32 | 4 |
+| Adam first moment $m$ | fp32 | 4 |
+| Adam second moment $v$ | fp32 | 4 |
+| **Total** | | **16** |
+
+This 16-bytes-per-parameter accounting is the one used in the ZeRO paper (Rajbhandari et al., 2019). For Llama 3.1 8B it gives $16 \times 8.03 \times 10^9 = 128$ GB before a single activation is stored: more than one 80 GB GPU. That is the problem ZeRO and FSDP solve by sharding these states across GPUs ([Distributed Training](../6-llm-pretraining/5-llm-distributed-training.mdx)), and the reason parameter-efficient methods such as LoRA, which keep optimizer states only for small adapter matrices, fit on a single GPU ([LoRA Explained](../9-llm-fine-tuning/1-llm-lora.mdx)).
+
+**Activations.** The backward pass needs intermediate tensors from the forward pass. Korthikanti et al. ("Reducing Activation Recomputation in Large Transformer Models", 2022) estimate, for a GPT-style layer in 16-bit precision without recomputation, about $s\,b\,h\,(34 + 5 a s / h)$ bytes per layer, where $s$ is sequence length, $b$ batch size, $h$ hidden size and $a$ the number of heads. The $5as/h$ term is the stored attention matrix, which FlashAttention avoids storing; dropping it leaves about $34\, s\, b\, h$. For one 8,192-token sequence through a 4,096-wide, 32-layer model, that is roughly $34 \times 8192 \times 4096 \times 32 \approx 36$ GB. The exact constant differs for SwiGLU and GQA, but the scaling is the point: activations grow linearly with tokens per batch and with depth, and activation checkpointing trades about one extra forward pass for most of that memory.
+
+| Llama 3.1 8B | Memory |
+|---|---|
+| Weights, bf16 | 16.1 GB |
+| KV cache, 8K tokens, bf16 | 1 GiB |
+| KV cache, 128K tokens, bf16 | 16 GiB |
+| Full training states (16 bytes/param) | 128 GB |
+| Activations, one 8K sequence, rough estimate | about 36 GB |
+
+:::tip
+Keep a tiny script like the meta-device counter above for any model you work with. Plugging a new config.json into it gives parameter count, KV bytes per token and training memory in seconds, which is faster and more reliable than searching for numbers in blog posts.
+:::
+
+## Common Mistakes
+
+- **Counting the embedding as compute.** The input embedding is a lookup; it costs memory, not FLOPs. The LM head is a real matmul and costs $2Vd$ FLOPs per token.
+- **Using $n_{kv}$ for attention FLOPs.** GQA reduces KV memory and bandwidth, not the number of score computations. FLOPs use $n_q d_h$.
+- **Applying 6ND to MoE models with total parameters.** For a mixture-of-experts model, $N$ in the compute formula is the active parameters per token (37B for DeepSeek-V3, not 671B); memory still scales with the total.
+- **Forgetting the optimizer.** "The model is 16 GB, my GPU has 24 GB" is true for inference and false for full fine-tuning, which needs about 128 GB for an 8B model.
+- **Quoting KV cache in GB per model instead of per token.** It scales with batch size times context length; at long context and high concurrency it is often larger than the weights.
+- **Expecting peak FLOPs during decoding.** Single-stream generation is bounded by memory bandwidth, so a GPU with twice the FLOPs but the same bandwidth generates no faster.
+- **Mixing GB and GiB.** $2^{30}$ bytes is 7% more than $10^9$; at 128K tokens the difference is over a gigabyte.
+
+## Summary
+
+- Parameters per decoder block: $d n_q d_h + 2 d n_{kv} d_h + n_q d_h d$ for attention, $3df$ for SwiGLU, $2d$ for norms; plus $Vd$ for the embedding and $Vd$ for an untied head. Llama 3.1 8B totals exactly 8,030,261,248.
+- A forward pass costs about $2N$ FLOPs per token plus $2 L T n_q d_h$ for attention; the attention term passes the weight term near 57K tokens for Llama 3.1 8B.
+- Training costs about $6N$ per token, $6ND$ in total, as PyTorch's FLOP counter confirms exactly for the weight matmuls.
+- Llama 3.1 8B's pretraining is about $7.2 \times 10^{23}$ FLOPs; compared with reported GPU hours that implies about 14% average utilization, below the 38-43% MFU reported for 405B.
+- Inference memory is weights (16 GB in bf16) plus KV cache (128 KiB per token); training needs about 16 bytes per parameter plus activations; decoding speed is bounded by memory bandwidth.
+
+## Further Reading
+
+- [Scaling Laws for Neural Language Models (Kaplan et al., 2020)](https://arxiv.org/abs/2001.08361): Table 1 gives the per-operation parameter and FLOP counts used here.
+- [Training Compute-Optimal Large Language Models (Hoffmann et al., 2022)](https://arxiv.org/abs/2203.15556): Chinchilla and tokens per parameter.
+- [PaLM (Chowdhery et al., 2022)](https://arxiv.org/abs/2204.02311): defines model FLOPs utilization, with the attention term in its appendix.
+- [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (Rajbhandari et al., 2019)](https://arxiv.org/abs/1910.02054): the 16-bytes-per-parameter accounting and sharding.
+- [Reducing Activation Recomputation in Large Transformer Models (Korthikanti et al., 2022)](https://arxiv.org/abs/2205.05198): activation memory formulas and selective recomputation.
+- [The Llama 3 Herd of Models (Llama Team, 2024)](https://arxiv.org/abs/2407.21783): training configuration and the 38-43% MFU figures.
+- [Llama 3.1 model card](https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/MODEL_CARD.md): tokens and GPU hours per model size.
+- [torch.utils.flop_counter source](https://github.com/pytorch/pytorch/blob/main/torch/utils/flop_counter.py): which operations the FLOP counter recognizes.

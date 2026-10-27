@@ -1,0 +1,385 @@
+---
+title: "Causal Masking and Autoregressive Decoding"
+description: "How the causal mask lets an LLM train on every position in one pass, how padding and document masks combine with it, and how decoding stays consistent."
+---
+
+# Causal Masking and Autoregressive Decoding
+
+## Introduction
+
+A language model predicts the next token from the tokens before it. Plain self-attention, as built on the [previous page](./2-llm-self-attention-from-scratch.mdx), lets every token see every other token, including the ones after it. If the model can see token $t+1$ while predicting token $t+1$, training becomes trivial copying and the model learns nothing useful.
+
+The **causal mask** fixes this with one line of code: it sets the attention score from each position to every later position to $-\infty$. That small change has large consequences. It lets a GPT-style model compute the loss for **every position of a sequence in a single parallel forward pass** (teacher forcing), and it guarantees that generating one token at a time with a KV cache gives exactly the same numbers as that parallel pass.
+
+On this page you will:
+
+- Build the causal mask, prove that it removes all dependence on future tokens and test the claim in code.
+- Understand teacher forcing: one forward pass, $T$ predictions, labels shifted by one.
+- Decode token by token with a cache and confirm it matches the parallel pass.
+- Combine causal masks with **padding masks** and **document masks**, and handle the fully masked rows they can create.
+- Avoid the `is_causal=True` alignment trap when queries and keys have different lengths.
+
+## Why a Language Model Must Not See the Future
+
+An autoregressive language model factors the probability of a sequence with the chain rule (derived in [Language Modeling and Next-Token Prediction](../0-llm-fundamentals/1-llm-language-modeling.mdx)):
+
+$$
+p(x_1, \dots, x_T) = \prod_{t=1}^{T} p(x_t \mid x_1, \dots, x_{t-1})
+$$
+
+Each factor conditions only on the **past**. At generation time that is not a choice: token $t+1$ does not exist yet. The training setup must match, so the representation at position $t$, which is used to predict $x_{t+1}$, may depend only on $x_1, \dots, x_t$.
+
+In attention terms: the output for query $i$ may use keys and values $j \le i$ only. Encoder models such as BERT do not have this restriction, because they are not trained to generate (see [Encoder-Only, Decoder-Only and Encoder-Decoder Models](../3-llm-transformer/1-llm-encoder-decoder-variants.mdx)).
+
+## Building the Causal Mask
+
+The rule "query $i$ may see key $j$ only if $j \le i$" is a lower-triangular boolean matrix. Applying it is the masking step from the previous page: wherever the mask is `False`, replace the score by $-\infty$. Since $e^{-\infty} = 0$, those keys get weight exactly 0 and the remaining weights still sum to 1.
+
+$$
+M_{ij} = \begin{cases} 0 & j \le i \\ -\infty & j > i \end{cases}, \qquad
+P = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}} + M\right)
+$$
+
+```python
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+T, d = 4, 8
+q, k, v = (torch.randn(T, d) for _ in range(3))
+
+causal = torch.tril(torch.ones(T, T, dtype=torch.bool))  # True = may attend
+scores = q @ k.T / d ** 0.5
+scores = scores.masked_fill(~causal, float("-inf"))
+weights = torch.softmax(scores, dim=-1)
+
+torch.set_printoptions(precision=3, sci_mode=False)
+print(causal.int())
+print(scores)
+print(weights)
+out = weights @ v
+print("matches is_causal=True:",
+      torch.allclose(out, F.scaled_dot_product_attention(q, k, v, is_causal=True), atol=1e-6))
+```
+
+```text
+tensor([[1, 0, 0, 0],
+        [1, 1, 0, 0],
+        [1, 1, 1, 0],
+        [1, 1, 1, 1]], dtype=torch.int32)
+tensor([[-0.005,   -inf,   -inf,   -inf],
+        [ 0.164,  0.193,   -inf,   -inf],
+        [ 0.488, -2.487, -0.098,   -inf],
+        [ 0.239,  1.360, -0.446, -0.815]])
+tensor([[1.000, 0.000, 0.000, 0.000],
+        [0.493, 0.507, 0.000, 0.000],
+        [0.622, 0.032, 0.346, 0.000],
+        [0.203, 0.623, 0.102, 0.071]])
+matches is_causal=True: True
+```
+
+Read the weight matrix row by row. Token 0 can see only itself, so its weight is 1. Token 1 splits its attention between tokens 0 and 1. Token 3 sees everything. The upper triangle is exactly zero. `F.scaled_dot_product_attention(..., is_causal=True)` builds the same mask internally, and fused kernels go further: they skip the masked blocks entirely, so causal attention costs about half the FLOPs of full attention.
+
+### Why It Works Through the Whole Network
+
+Masking one attention layer is not obviously enough, since a model has many layers and the MLPs mix features. The argument is an induction over layers:
+
+1. **The MLP, normalization and residual connections are position-wise.** They transform each token's vector on its own, with no access to other positions.
+2. **Attention with a causal mask** computes output $i$ from values $j \le i$ only.
+3. So if the inputs to a layer at positions $\le i$ depend only on tokens $\le i$, the outputs at positions $\le i$ do too. The embeddings satisfy this at the start, so by induction every layer does.
+
+Attention is the **only** place information moves between positions, so masking it is sufficient. A direct test: change the future tokens and check that earlier outputs do not move.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+d_model, T = 16, 6
+W_q, W_k, W_v = (nn.Linear(d_model, d_model, bias=False) for _ in range(3))
+
+
+def causal_self_attention(x):                       # x: (batch, T, d_model)
+    return F.scaled_dot_product_attention(W_q(x), W_k(x), W_v(x), is_causal=True)
+
+
+x = torch.randn(1, T, d_model)
+x_changed = x.clone()
+x_changed[:, 4:] = torch.randn(1, T - 4, d_model)   # rewrite the "future" tokens 4 and 5
+
+with torch.no_grad():
+    a, b = causal_self_attention(x), causal_self_attention(x_changed)
+print("max change per position:", (a - b).abs().amax(dim=-1).squeeze().numpy().round(4))
+```
+
+```text
+max change per position: [0.     0.     0.     0.     0.5163 0.4196]
+```
+
+Positions 0 to 3 are bit-for-bit unchanged. This "perturb the future" test is worth adding to the test suite of any model you write; it catches a missing or inverted mask immediately.
+
+:::tip
+Libraries often use the most negative finite number, `torch.finfo(dtype).min`, instead of $-\infty$ in float masks (Hugging Face `transformers` does this in its mask utilities). The effect on softmax is the same, but a row whose entries are **all** masked then produces a uniform distribution instead of NaN. More on fully masked rows below.
+:::
+
+## Teacher Forcing: One Pass, T Predictions
+
+Because position $t$ only sees tokens up to $t$, its output can be trained to predict token $t+1$, and this is true at every position simultaneously. So one forward pass over a sequence of $T+1$ tokens yields $T$ next-token predictions, each with its own cross-entropy term. Feeding the model the **true** previous tokens rather than its own predictions is called **teacher forcing**.
+
+The data preparation is a shift by one:
+
+| Position | 0 | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- | --- |
+| input token | 3 | 7 | 1 | 9 | 4 |
+| label (next token) | 7 | 1 | 9 | 4 | 2 |
+
+The next example builds a one-layer causal model that also supports a KV cache, computes the teacher-forced loss, and then generates step by step:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+vocab, d_model = 20, 16
+
+
+class TinyCausalLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, d_model)
+        self.pos = nn.Embedding(32, d_model)               # learned positions, enough for a demo
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.head = nn.Linear(d_model, vocab, bias=False)
+
+    def forward(self, ids, cache=None, start=0):
+        # ids: (batch, T_new); cache: None or (k, v) of shape (batch, T_past, d_model)
+        pos = torch.arange(start, start + ids.size(1))
+        x = self.emb(ids) + self.pos(pos)                  # (batch, T_new, d_model)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        if cache is not None:                              # append new keys/values to the cache
+            k = torch.cat([cache[0], k], dim=1)
+            v = torch.cat([cache[1], v], dim=1)
+        # Full-sequence pass needs the causal mask; one new query may see every cached key.
+        h = F.scaled_dot_product_attention(q, k, v, is_causal=cache is None)
+        return self.head(x + h), (k, v)
+
+
+model = TinyCausalLM().eval()
+ids = torch.tensor([[3, 7, 1, 9, 4, 2]])                  # (1, 6)
+
+# Teacher forcing: ONE forward pass yields a prediction at every position.
+inputs, labels = ids[:, :-1], ids[:, 1:]                   # shift by one
+logits, _ = model(inputs)                                  # (1, 5, vocab)
+loss = F.cross_entropy(logits.reshape(-1, vocab), labels.reshape(-1))
+print("logits:", tuple(logits.shape), " loss over 5 positions:", round(loss.item(), 4))
+
+# Autoregressive decoding: feed tokens one at a time, reusing the cache.
+with torch.no_grad():
+    step_logits, cache = [], None
+    first, cache = model(inputs[:, :1])                    # prefill the first token
+    step_logits.append(first)
+    for t in range(1, inputs.size(1)):
+        out, cache = model(inputs[:, t:t + 1], cache=cache, start=t)
+        step_logits.append(out)
+    step_logits = torch.cat(step_logits, dim=1)
+print("token-by-token logits match the parallel pass:",
+      torch.allclose(step_logits, logits, atol=1e-5))
+```
+
+```text
+logits: (1, 5, 20)  loss over 5 positions: 3.2996
+token-by-token logits match the parallel pass: True
+```
+
+A loss near 3.0 is what an untrained model should give: $\ln 20 \approx 3.0$ is the loss of a uniform guess over 20 tokens. The more important line is the last one. Running the sequence through the model one token at a time, appending each new key and value to a cache, produces **the same logits** as the single masked pass. This equivalence is what makes LLM serving possible:
+
+- **Training** uses the parallel form: $T$ predictions per pass, all positions computed at once on a GPU.
+- **Inference** uses the sequential form: each new token computes one query, attends to all cached keys and values, and appends its own. The past is never recomputed. The full treatment is [The KV Cache](../10-llm-inference/2-llm-kv-cache.mdx), and the two phases (parallel **prefill** of the prompt, then one-token **decode** steps) are described in [How LLM Inference Works](../10-llm-inference/0-llm-inference-overview.mdx).
+
+```mermaid
+flowchart LR
+    P["Prompt tokens"] --> F["Prefill: one causal pass over the prompt"]
+    F --> C["KV cache holds K and V for every prompt token"]
+    C --> D["Decode step: 1 new query attends to all cached keys"]
+    D --> S["Sample next token"]
+    S --> A["Append its K and V to the cache"]
+    A --> D
+```
+
+Teacher forcing has a known side effect called **exposure bias** (a term popularized by Ranzato et al., 2015): during training the model always sees correct history, but during generation it sees its own, possibly wrong, outputs. In practice large LLMs trained with teacher forcing generate well, and post-training methods that learn from the model's own samples (covered in the [Post-Training section](../8-llm-post-training/0-llm-post-training-overview.mdx)) reduce the mismatch further.
+
+## The is_causal Alignment Trap
+
+Look again at the decoding step above: with a cache, the model passes `is_causal=False`. That is deliberate. During decoding the query tensor has length 1 (the new token) and the key tensor has length $T$ (all tokens so far). The new token is the **last** position and may see everything.
+
+PyTorch's `is_causal=True` builds its mask with `torch.ones(L, S).tril(diagonal=0)`, aligned to the **top-left** corner. When $L = 1$ and $S = 5$ that keeps only key 0:
+
+```python
+import torch
+import torch.nn.functional as F
+from torch.nn.attention.bias import causal_lower_right
+
+torch.manual_seed(0)
+d = 8
+k, v = torch.randn(1, 1, 5, d), torch.randn(1, 1, 5, d)   # 5 keys already in the cache
+q = torch.randn(1, 1, 1, d)                                # 1 new query: the token at position 4
+
+wrong = F.scaled_dot_product_attention(q, k, v, is_causal=True)      # top-left aligned mask
+right = F.scaled_dot_product_attention(q, k, v)                      # 1 query may see every cached key
+also_right = F.scaled_dot_product_attention(q, k, v, attn_mask=causal_lower_right(1, 5))
+
+print("is_causal=True equals attending to key 0 only:", torch.allclose(wrong, v[:, :, :1]))
+print("no mask equals causal_lower_right:", torch.allclose(right, also_right))
+```
+
+```text
+is_causal=True equals attending to key 0 only: True
+no mask equals causal_lower_right: True
+```
+
+When several new queries are processed against a longer cache (chunked prefill, or the verification step of [speculative decoding](../10-llm-inference/4-llm-speculative-decoding.mdx)), the correct mask is aligned to the **bottom-right**: the last query sees all keys, the one before it sees all but the last, and so on. PyTorch provides this as `torch.nn.attention.bias.causal_lower_right(L, S)`.
+
+| Situation | $T_q$ vs $T_k$ | Correct mask |
+| --- | --- | --- |
+| Training, prefill | equal | `is_causal=True` (both alignments agree) |
+| Single-token decode | 1 vs $T$ | none |
+| Several new tokens with a cache | $L$ vs $S$, $L < S$ | bottom-right causal |
+
+## Padding Masks
+
+Real batches contain sequences of different lengths. To stack them into one tensor we pad the short ones with a filler token, and the model must never attend **to** a pad. That is a second mask over keys, the **padding mask** (Hugging Face calls it `attention_mask`, a `(batch, seq_len)` tensor of 1s and 0s). It is combined with the causal mask by logical AND and broadcast over queries and heads.
+
+```python
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+B, H, T, d = 2, 1, 4, 8
+q, k, v = (torch.randn(B, H, T, d) for _ in range(3))
+
+# Sequence 0 has 4 real tokens; sequence 1 has 2 real tokens and 2 pads on the RIGHT.
+real = torch.tensor([[1, 1, 1, 1],
+                     [1, 1, 0, 0]], dtype=torch.bool)          # (B, T)
+causal = torch.tril(torch.ones(T, T, dtype=torch.bool))        # (T, T)
+key_ok = real[:, None, None, :]                                # (B, 1, 1, T) broadcast over queries
+mask = causal & key_ok                                         # (B, 1, T, T)
+print(mask[1, 0].int())
+
+out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+print("outputs at the real positions of seq 1 are finite:", torch.isfinite(out[1, 0, :2]).all().item())
+
+# Now LEFT padding: pads first, real tokens last (what batched generation uses).
+real_left = torch.tensor([[1, 1, 1, 1],
+                          [0, 0, 1, 1]], dtype=torch.bool)
+mask_left = causal & real_left[:, None, None, :]
+print(mask_left[1, 0].int())                                   # rows 0 and 1 have no key at all
+
+scores = (q @ k.transpose(-2, -1) / d ** 0.5).masked_fill(~mask_left, float("-inf"))
+print("hand-written softmax, row 0 of seq 1:", torch.softmax(scores, -1)[1, 0, 0])
+print("SDPA, row 0 of seq 1:", F.scaled_dot_product_attention(q, k, v, attn_mask=mask_left)[1, 0, 0, :4])
+```
+
+```text
+tensor([[1, 0, 0, 0],
+        [1, 1, 0, 0],
+        [1, 1, 0, 0],
+        [1, 1, 0, 0]], dtype=torch.int32)
+outputs at the real positions of seq 1 are finite: True
+tensor([[0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 1, 1]], dtype=torch.int32)
+hand-written softmax, row 0 of seq 1: tensor([nan, nan, nan, nan])
+SDPA, row 0 of seq 1: tensor([0., 0., 0., 0.])
+```
+
+Several practical points come out of this:
+
+- **The mask shape is `(B, 1, T, T)`**: per sequence, shared by all heads. Building `real[:, None, None, :]` masks **keys** (columns). Pad positions still compute outputs as queries; those outputs are simply ignored, and their labels are set to the ignore index (-100 in PyTorch's `cross_entropy`) so they add nothing to the loss.
+- **Right padding is natural for training**: real tokens start at position 0, and every real query has at least one real key (itself).
+- **Left padding is used for batched generation**, so that every sequence's last real token sits at the same index and new tokens are appended in the same column. But with left padding, the pad **queries** at the start can see no key at all.
+- **Fully masked rows are dangerous.** A row of all $-\infty$ gives $0/0$ in softmax, which is NaN, and one NaN can spread through later layers and the loss. Recent PyTorch versions return zeros for such rows in SDPA (as the output shows for PyTorch 2.14), and Hugging Face uses `finfo.min` instead of $-\infty$, but do not rely on every kernel and version doing the same. Make sure every row you care about has at least one valid key, and ignore the outputs of pad positions.
+- **Position ids must skip the pads.** With left padding, the first real token should still get position 0. Hugging Face generation computes position ids from the attention mask for this reason; if you write your own loop, do the same, or RoPE and learned positions will be shifted.
+
+## Document Masks for Packed Sequences
+
+Pretraining usually concatenates many documents into fixed-length rows to avoid wasting compute on padding (**packing**, see [The Training Objective, Loss Curves and Data Loading](../6-llm-pretraining/1-llm-training-objective.mdx)). A plain causal mask then lets a token attend to the end of the previous, unrelated document. A **document mask** forbids that: query $i$ may see key $j$ only if $j \le i$ **and** both belong to the same document. The result is block-diagonal with a triangle in each block.
+
+PyTorch's FlexAttention expresses such masks as a Python function of indices, the same `(batch, head, q_idx, kv_idx) -> bool` signature that Hugging Face uses for its mask functions:
+
+```python
+import torch
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+torch.manual_seed(0)
+B, H, T, d = 1, 2, 8, 16
+q, k, v = (torch.randn(B, H, T, d) for _ in range(3))
+doc_id = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2])          # three documents packed into one row
+
+
+def causal_document(b, h, q_idx, kv_idx):                 # True = may attend
+    return (kv_idx <= q_idx) & (doc_id[q_idx] == doc_id[kv_idx])
+
+
+block_mask = create_block_mask(causal_document, B=None, H=None, Q_LEN=T, KV_LEN=T, device="cpu")
+out_flex = flex_attention(q, k, v, block_mask=block_mask)
+
+dense = causal_document(None, None, torch.arange(T)[:, None], torch.arange(T)[None, :])
+print(dense.int())
+out_sdpa = F.scaled_dot_product_attention(q, k, v, attn_mask=dense)
+print("flex_attention matches SDPA with the dense mask:", torch.allclose(out_flex, out_sdpa, atol=1e-5))
+```
+
+```text
+tensor([[1, 0, 0, 0, 0, 0, 0, 0],
+        [1, 1, 0, 0, 0, 0, 0, 0],
+        [1, 1, 1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 1, 1, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 1, 1, 0],
+        [0, 0, 0, 0, 0, 1, 1, 1]], dtype=torch.int32)
+flex_attention matches SDPA with the dense mask: True
+```
+
+Called without `torch.compile`, as here, `flex_attention` prints a warning and falls back to an unfused implementation that builds the full score matrix; wrapped in `torch.compile` it generates a fused kernel that skips fully masked blocks. The same mask-function style also expresses sliding windows and prefix-LM masks, which are discussed in [Sliding Window, Sparse and Linear Attention](../5-llm-flash-attention/5-llm-sparse-and-linear-attention.mdx).
+
+## Worked Scenario: Batched Generation with Two Prompts
+
+Suppose a server receives two prompts in one batch: "The cat" (2 tokens) and "Once upon a time" (4 tokens), and must generate 2 more tokens for each.
+
+1. **Pad on the left** to length 4: `[pad, pad, The, cat]` and `[Once, upon, a, time]`. The padding mask is `[[0,0,1,1],[1,1,1,1]]`, and the position ids are `[[0,0,0,1],[0,1,2,3]]` (pads get a dummy position, real tokens start at 0).
+2. **Prefill.** One forward pass over the `(2, 4)` batch with mask = causal AND padding, shape `(2, 1, 4, 4)`. The rows of the two pad queries in prompt 1 are fully masked; their outputs are garbage and ignored. The last column holds each prompt's final real token, so the logits at index 3 give the first new token for both.
+3. **Decode step 1.** Each sequence feeds one new token. Queries have length 1, keys have length 5 (4 cached + 1 new). No causal mask is needed (the new token is last), but the **padding mask still applies**: prompt 1 must not attend to its two pad keys. The key mask grows to `[[0,0,1,1,1],[1,1,1,1,1]]`.
+4. **Decode step 2.** Same again with 6 keys.
+
+The pads cost a little compute and cache memory in every step. Serving engines avoid that by not padding at all: they keep each sequence's cache separately in pages and batch requests of different lengths with custom kernels, described in [PagedAttention, Continuous Batching and Prefix Caching](../10-llm-inference/3-llm-paged-attention.mdx).
+
+## Common Mistakes
+
+- **Inverting the mask convention.** SDPA's boolean mask uses `True` = attend. `nn.MultiheadAttention` and `nn.Transformer` use `True` = block. Converting between them needs `~mask`.
+- **Using `is_causal=True` with a KV cache.** It is top-left aligned; for $T_q < T_k$ use no mask (single token) or `causal_lower_right`.
+- **Masking queries instead of keys** for padding. The padding mask must zero the columns of pad tokens, not their rows.
+- **Forgetting to shift labels.** Comparing logits at position $t$ with token $t$ instead of $t+1$ trains an identity function and gives a suspiciously low loss.
+- **Letting fully masked rows produce NaN** in a hand-written softmax. Use `finfo.min`, guarantee a valid key per row, or rely on a kernel that handles it, and test.
+- **Wrong position ids with left padding**, which shifts RoPE angles and degrades generation for the padded prompts.
+- **Packing documents without a document mask** when the training recipe calls for one; tokens then attend across document boundaries.
+
+## Summary
+
+- The causal mask sets scores for keys $j > i$ to $-\infty$, so query $i$ uses only tokens up to $i$; because attention is the only cross-position operation, this makes the whole network causal.
+- Teacher forcing uses that property to train on all $T$ positions in one forward pass, with labels shifted by one.
+- Decoding one token at a time with a KV cache gives the same logits as the parallel masked pass, which is what makes efficient generation possible.
+- `is_causal=True` in PyTorch is top-left aligned; with fewer queries than keys use `causal_lower_right` or no mask.
+- Padding masks block pad keys and combine with the causal mask by AND into a `(B, 1, T, T)` mask; left padding for generation needs correct position ids and care with fully masked rows.
+- Document masks keep packed documents separate; FlexAttention expresses them as a mask function that compiles into a fused kernel.
+
+## Further Reading
+
+- [Attention Is All You Need (Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762): section 3.2.3 introduces masking in the decoder.
+- [torch.nn.attention.bias](https://docs.pytorch.org/docs/stable/nn.attention.bias.html): `causal_upper_left` and `causal_lower_right` and when each applies.
+- [FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention (PyTorch blog)](https://pytorch.org/blog/flexattention/): mask functions, block masks and document masking.
+- [Sequence Level Training with Recurrent Neural Networks (Ranzato et al., 2015)](https://arxiv.org/abs/1511.06732): exposure bias in teacher-forced models.

@@ -1,0 +1,319 @@
+---
+title: "Multi-Head Latent Attention (DeepSeek)"
+description: "DeepSeek's multi-head latent attention derived: low-rank KV compression, weight absorption, decoupled RoPE, DeepSeek-V3 cache math and PyTorch code."
+---
+
+# Multi-Head Latent Attention (DeepSeek)
+
+## Introduction
+
+[Grouped-query attention](./5-llm-mqa-gqa.mdx) shrinks the KV cache by letting query heads share keys and values. It works, but it is a blunt instrument: fewer KV heads means less capacity, and controlled ablations show a quality cost. DeepSeek's team, designing DeepSeek-V2 (2024), asked a different question: what if every head keeps its own keys and values, but we **cache a small compressed vector** from which all of them can be reconstructed?
+
+The answer is **multi-head latent attention** (MLA). Each token's keys and values for all 128 heads are generated from one 512-dimensional latent vector, and only that latent (plus a small 64-dimensional positional key) is cached. For DeepSeek-V3 that is 576 numbers per token per layer, about 1.4% of what full multi-head attention with the same heads would store. In their ablations MLA matched or beat MHA in quality. Two algebraic tricks make it practical: **weight absorption**, which lets attention run directly on the latents, and **decoupled RoPE**, which keeps rotary position embeddings from breaking that absorption.
+
+On this page you will:
+
+- Derive MLA's low-rank key-value compression and see why GQA is a special case of it.
+- Prove weight absorption and understand why RoPE breaks it.
+- Follow the decoupled RoPE fix and write down the complete set of MLA equations with DeepSeek-V3's dimensions.
+- Implement MLA in PyTorch both ways (naive and absorbed) and verify they agree to $10^{-16}$.
+- Compute DeepSeek-V3's KV cache and analyze why MLA decoding becomes compute-bound.
+
+You should be comfortable with [multi-head attention](./4-llm-multi-head-attention.mdx) and know what RoPE does at a high level; it is explained fully in [Rotary Position Embedding (RoPE) Explained](../4-llm-positional-encoding/3-llm-rope.mdx).
+
+## The Idea: Cache a Latent, Not the Keys
+
+Use the notation of the DeepSeek-V2 paper: $h_t \in \mathbb{R}^d$ is the input to the attention layer for token $t$, $n_h$ is the number of heads and $d_h$ the dimension per head. Standard MHA computes $k_t = W^K h_t$ and $v_t = W^V h_t$, each of size $n_h d_h$, and caches both: $2 n_h d_h$ numbers per token per layer.
+
+MLA inserts a bottleneck. First a **down-projection** compresses the token into a latent vector $c^{KV}_t$ of size $d_c$, much smaller than $n_h d_h$. Then two **up-projections** produce the keys and values of all heads from that latent:
+
+$$
+c^{KV}_t = W^{DKV} h_t, \qquad k^C_t = W^{UK} c^{KV}_t, \qquad v^C_t = W^{UV} c^{KV}_t
+$$
+
+with $W^{DKV} \in \mathbb{R}^{d_c \times d}$ and $W^{UK}, W^{UV} \in \mathbb{R}^{n_h d_h \times d_c}$. The superscript $C$ marks the "compressed" (content) part. Because $k^C_t$ and $v^C_t$ are deterministic functions of $c^{KV}_t$, the cache only needs to hold the latent: $d_c$ numbers per token per layer instead of $2 n_h d_h$.
+
+This is the same low-rank idea as LoRA (see [LoRA Explained](../9-llm-fine-tuning/1-llm-lora.mdx)), applied to activations: the product $W^{UK} W^{DKV}$ is an ordinary key projection constrained to rank at most $d_c$. The key and value up-projections share **one** latent, which is why the paper calls it joint compression.
+
+DeepSeek-V2 also compresses the queries, $c^Q_t = W^{DQ} h_t$ and $q^C_t = W^{UQ} c^Q_t$ with latent size $d_c'$. This does not shrink the KV cache (queries are not cached); it reduces activation memory during training.
+
+### GQA Is a Special Case
+
+It helps to see that MLA is a generalization, not a competitor. In GQA with $n_{kv}$ KV heads, the keys of all $n_h$ heads are copies of $n_{kv}$ distinct key vectors. Write the distinct keys and values as one vector $z_t = [k^{(1)}; \dots; k^{(n_{kv})}; v^{(1)}; \dots; v^{(n_{kv})}]$ of size $2 n_{kv} d_h$. Then the full per-head keys are $k_t = R_K z_t$, where $R_K$ is a fixed 0/1 matrix that copies the right KV head into each query head's slot, and similarly $v_t = R_V z_t$.
+
+That is exactly MLA's form with $c^{KV}_t = z_t$, $d_c = 2 n_{kv} d_h$, and up-projections fixed to copy matrices. MLA instead **learns** the up-projections, so with the same cache size it can represent anything GQA can and more. The TransMLA paper (Meng et al., 2025) makes this argument formally and uses it to convert GQA models into MLA models.
+
+## Weight Absorption: Attention on the Latents
+
+If inference had to recompute $k^C_j = W^{UK} c^{KV}_j$ for every cached token at every step, MLA would trade memory for a large amount of extra compute. It does not have to. Look at the score between query $t$ and key $j$ in head $i$, ignoring position for the moment. Let $W^{UK}_i \in \mathbb{R}^{d_h \times d_c}$ be the rows of $W^{UK}$ belonging to head $i$:
+
+$$
+\left(q^C_{t,i}\right)^\top k^C_{j,i}
+= \left(q^C_{t,i}\right)^\top W^{UK}_i\, c^{KV}_j
+= \underbrace{\left( \left(W^{UK}_i\right)^\top q^C_{t,i} \right)^\top}_{\tilde q_{t,i} \in \mathbb{R}^{d_c}} c^{KV}_j
+$$
+
+By associativity of matrix multiplication, we can move $W^{UK}_i$ onto the **query side**. Compute an "absorbed" query $\tilde q_{t,i} = (W^{UK}_i)^\top q^C_{t,i}$ once per new token and take its dot product directly with the cached latents. The keys never need to be materialized. Since $q^C_{t,i} = W^{UQ}_i c^Q_t$, the two matrices can even be multiplied in advance into one $d_c' \times d_c$ matrix per head, which is what the paper means by absorbing $W^{UK}$ into $W^{UQ}$.
+
+The values work the same way on the output side. With $p_{tj,i}$ the attention weights of head $i$ and $W^O_i$ the block of the output projection for head $i$:
+
+$$
+W^O_i\, o_{t,i} = W^O_i \sum_j p_{tj,i}\, W^{UV}_i c^{KV}_j = \underbrace{W^O_i W^{UV}_i}_{\text{absorbed}} \left( \sum_j p_{tj,i}\, c^{KV}_j \right)
+$$
+
+Attention averages the **latents**, and the combined matrix $W^O_i W^{UV}_i$ turns the averaged latent into the head's contribution to the output.
+
+The absorbed form has a striking structure: every head computes scores against the **same** cached vectors $c^{KV}_j$ and averages the **same** vectors. Keys and values are shared by all heads. At inference time MLA is **multi-query attention** over latents of dimension $d_c$, while at training time it behaves like multi-head attention with $n_h$ distinct heads. It gets MQA's memory traffic with more than MHA's flexibility in what each head can compute.
+
+## The RoPE Problem and Decoupled RoPE
+
+Modern LLMs encode position with RoPE, which rotates queries and keys by position-dependent angles: the key at position $j$ becomes $\mathcal{R}_j k_j$ and the query at position $t$ becomes $\mathcal{R}_t q_t$, where $\mathcal{R}_m$ is a block-diagonal rotation matrix. Their dot product is
+
+$$
+\left(\mathcal{R}_t q_t\right)^\top \mathcal{R}_j k_j = q_t^\top \mathcal{R}_{j-t}\, k_j
+$$
+
+which depends only on the relative position (proved in the RoPE pages). Now try to combine this with absorption. With RoPE applied to the compressed keys, the score in head $i$ becomes
+
+$$
+\left(q^C_{t,i}\right)^\top \mathcal{R}_{j-t}\, W^{UK}_i\, c^{KV}_j
+$$
+
+A rotation matrix that depends on **both** positions now sits between $q^C_{t,i}$ and $W^{UK}_i$. Matrix multiplication does not commute, so $W^{UK}_i$ can no longer be moved to the query side and folded into a fixed matrix: the absorbed matrix would be different for every pair $(t, j)$. Inference would have to reconstruct all keys from the latents at every step, which is what absorption was meant to avoid.
+
+DeepSeek's solution, **decoupled RoPE**, separates the two jobs:
+
+- The compressed part $k^C$ carries content and gets **no** rotation, so it stays absorbable.
+- A small extra part carries position. Each head gets an additional rotated query $q^R_{t,i} \in \mathbb{R}^{d_h^R}$, and all heads share **one** rotated key $k^R_t \in \mathbb{R}^{d_h^R}$ computed directly from $h_t$, MQA style.
+- The full query and key of head $i$ are concatenations, $q_{t,i} = [q^C_{t,i}; q^R_{t,i}]$ and $k_{t,i} = [k^C_{t,i}; k^R_t]$, so the score is the content score plus a positional score.
+
+The shared rotated key must be cached too, because it cannot be recomputed from the latent. The total cache is $d_c + d_h^R$ numbers per token per layer.
+
+## The Complete MLA Equations
+
+Putting it together (following the DeepSeek-V2 paper's appendix C), for token $t$ and head $i$:
+
+$$
+c^Q_t = W^{DQ} h_t, \qquad q^C_t = W^{UQ} c^Q_t, \qquad q^R_t = \mathrm{RoPE}\!\left(W^{QR} c^Q_t\right)
+$$
+
+$$
+\boxed{c^{KV}_t = W^{DKV} h_t}, \qquad k^C_t = W^{UK} c^{KV}_t, \qquad \boxed{k^R_t = \mathrm{RoPE}\!\left(W^{KR} h_t\right)}, \qquad v^C_t = W^{UV} c^{KV}_t
+$$
+
+$$
+q_{t,i} = [q^C_{t,i};\, q^R_{t,i}], \qquad k_{t,i} = [k^C_{t,i};\, k^R_t]
+$$
+
+$$
+o_{t,i} = \sum_{j \le t} \mathrm{softmax}_j\!\left( \frac{q_{t,i}^\top k_{j,i}}{\sqrt{d_h + d_h^R}} \right) v^C_{j,i}, \qquad u_t = W^O [o_{t,1}; \dots; o_{t,n_h}]
+$$
+
+The boxed vectors are the only ones cached. The softmax scale uses the dimension of the full query-key dot product, $d_h + d_h^R$.
+
+The dimensions, as published in DeepSeek-V3's config.json (field names in parentheses):
+
+| Symbol | Meaning | DeepSeek-V3 |
+| --- | --- | --- |
+| $d$ | hidden size (`hidden_size`) | 7168 |
+| $n_h$ | attention heads (`num_attention_heads`) | 128 |
+| $d_c$ | KV latent (`kv_lora_rank`) | 512 |
+| $d_c'$ | query latent (`q_lora_rank`) | 1536 |
+| $d_h$ | content dim per head for q and k (`qk_nope_head_dim`) | 128 |
+| $d_h^R$ | RoPE dim per head (`qk_rope_head_dim`) | 64 |
+| value dim per head | (`v_head_dim`) | 128 |
+| layers | (`num_hidden_layers`) | 61 |
+
+DeepSeek-V2 uses the same attention dimensions with $d = 5120$ and 60 layers. DeepSeek-V2-Lite sets `q_lora_rank` to null, meaning no query compression. Kimi K2 reuses the DeepSeek-V3 architecture (`DeepseekV3ForCausalLM` in its config) with 64 heads instead of 128.
+
+In the released code and in Hugging Face's implementation the matrices are packed differently from the paper: `q_a_proj` is $W^{DQ}$, `q_b_proj` holds $W^{UQ}$ and $W^{QR}$ together, `kv_a_proj_with_mqa` produces $c^{KV}$ and the pre-rotation $k^R$ in one $512 + 64 = 576$-wide projection, and `kv_b_proj` holds $W^{UK}$ and $W^{UV}$. The implementation also applies an RMSNorm to each latent (`q_a_layernorm`, `kv_a_layernorm`), a detail not shown in the paper's equations.
+
+## Implementing MLA in PyTorch
+
+The next script builds MLA at small sizes with the same structure as DeepSeek-V3, and computes attention two ways:
+
+1. **Naive:** up-project the cached latents into full per-head keys and values, then run ordinary multi-head attention.
+2. **Absorbed:** fold $W^{UK}$ into the queries and $W^{UV}$ into the output, then run attention with one shared key-value "head" built from the latents.
+
+It uses float64 so the agreement can be checked tightly. RoPE here uses the interleaved-pairs layout, described in [Implementing RoPE in PyTorch](../4-llm-positional-encoding/4-llm-rope-implementation.mdx).
+
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+torch.set_default_dtype(torch.float64)          # float64 so the two paths agree to ~1e-12
+
+# Small sizes with the same structure as DeepSeek-V3 (real values in comments).
+d_model = 64      # hidden_size          7168
+n_h     = 4       # num_attention_heads  128
+d_nope  = 16      # qk_nope_head_dim     128
+d_rope  = 8       # qk_rope_head_dim     64
+d_v     = 16      # v_head_dim           128
+d_c     = 32      # kv_lora_rank         512
+d_cq    = 48      # q_lora_rank          1536
+
+
+def rope(x, pos, base=10000.0):
+    # x: (..., T, d) with d even; rotate pairs (x[2i], x[2i+1]) by angle pos * base^(-2i/d)
+    d = x.size(-1)
+    inv_freq = base ** (-torch.arange(0, d, 2) / d)                 # (d/2,)
+    ang = pos[:, None] * inv_freq[None, :]                           # (T, d/2)
+    cos, sin = ang.cos(), ang.sin()
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
+
+
+W_dq  = nn.Linear(d_model, d_cq, bias=False)            # h -> c^Q
+W_uq  = nn.Linear(d_cq, n_h * d_nope, bias=False)       # c^Q -> q^C (all heads)
+W_qr  = nn.Linear(d_cq, n_h * d_rope, bias=False)       # c^Q -> q^R (all heads)
+W_dkv = nn.Linear(d_model, d_c, bias=False)             # h -> c^KV   (cached)
+W_kr  = nn.Linear(d_model, d_rope, bias=False)          # h -> k^R    (cached, shared by heads)
+W_uk  = nn.Linear(d_c, n_h * d_nope, bias=False)        # c^KV -> k^C
+W_uv  = nn.Linear(d_c, n_h * d_v, bias=False)           # c^KV -> v^C
+W_o   = nn.Linear(n_h * d_v, d_model, bias=False)
+scale = 1 / math.sqrt(d_nope + d_rope)                  # the paper's 1/sqrt(d_h + d_h^R)
+
+T = 10
+h = torch.randn(1, T, d_model)                          # (batch, T, d_model)
+pos = torch.arange(T, dtype=torch.float64)
+
+# Shared pieces: the cache holds only c_kv and k_rope.
+c_q = W_dq(h)                                                       # (1, T, d_cq)
+q_nope = W_uq(c_q).view(1, T, n_h, d_nope).transpose(1, 2)          # (1, n_h, T, d_nope)
+q_rope = rope(W_qr(c_q).view(1, T, n_h, d_rope).transpose(1, 2), pos)  # (1, n_h, T, d_rope)
+c_kv = W_dkv(h)                                                     # (1, T, d_c)     cached
+k_rope = rope(W_kr(h), pos)                                         # (1, T, d_rope)  cached
+
+# Path 1, "naive": up-project the cache into full per-head keys and values.
+k_nope = W_uk(c_kv).view(1, T, n_h, d_nope).transpose(1, 2)         # (1, n_h, T, d_nope)
+v = W_uv(c_kv).view(1, T, n_h, d_v).transpose(1, 2)                 # (1, n_h, T, d_v)
+q = torch.cat([q_nope, q_rope], dim=-1)                             # (1, n_h, T, d_nope+d_rope)
+k = torch.cat([k_nope, k_rope[:, None].expand(-1, n_h, -1, -1)], dim=-1)
+o = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+out_naive = W_o(o.transpose(1, 2).reshape(1, T, n_h * d_v))
+
+# Path 2, "absorbed": fold W_uk into the query and W_uv into the output projection.
+W_uk_h = W_uk.weight.view(n_h, d_nope, d_c)                         # per-head (d_nope, d_c)
+W_uv_h = W_uv.weight.view(n_h, d_v, d_c)                            # per-head (d_v, d_c)
+q_lat = torch.einsum("bhtn,hnc->bhtc", q_nope, W_uk_h)              # (1, n_h, T, d_c)
+q_abs = torch.cat([q_lat, q_rope], dim=-1)                          # (1, n_h, T, d_c+d_rope)
+k_abs = torch.cat([c_kv, k_rope], dim=-1)[:, None]                  # (1, 1,   T, d_c+d_rope)
+v_abs = c_kv[:, None]                                               # (1, 1,   T, d_c)
+# One shared K/V "head" for all query heads: this is MQA over the latent.
+o_lat = F.scaled_dot_product_attention(q_abs, k_abs, v_abs, is_causal=True,
+                                       scale=scale, enable_gqa=True)  # (1, n_h, T, d_c)
+o_abs = torch.einsum("bhtc,hvc->bhtv", o_lat, W_uv_h)               # (1, n_h, T, d_v)
+out_absorbed = W_o(o_abs.transpose(1, 2).reshape(1, T, n_h * d_v))
+
+print("max |naive - absorbed| =", (out_naive - out_absorbed).abs().max().item())
+print("cached elements per token per layer: MLA", d_c + d_rope,
+      "| MHA with these heads", n_h * (d_nope + d_rope) + n_h * d_v)
+```
+
+```text
+max |naive - absorbed| = 1.6653345369377348e-16
+cached elements per token per layer: MLA 40 | MHA with these heads 160
+```
+
+The two paths agree to machine precision, which confirms the absorption algebra including the decoupled RoPE part. Details worth noting:
+
+- **The absorbed attention is MQA.** `k_abs` and `v_abs` have a head dimension of 1 and are shared by all `n_h` query heads via `enable_gqa=True`. The key is $[c^{KV}; k^R]$ of size $d_c + d_h^R$ (576 in DeepSeek-V3) and the value is $c^{KV}$ itself (512). This is the exact shape that DeepSeek's FlashMLA decoding kernel is built around.
+- **The scale must be passed explicitly.** SDPA would default to $1/\sqrt{d_c + d_h^R}$, the width of the absorbed vectors. The correct scale comes from the original per-head dimension, $1/\sqrt{d_h + d_h^R}$, because absorption does not change any score.
+- **Only `c_kv` and `k_rope` come from the cache.** Both paths start from them; the naive path re-expands them into per-head tensors every time.
+- **The `einsum` strings** name the axes: `b` batch, `h` head, `t` token, `n` content dim, `c` latent dim, `v` value dim. `"bhtn,hnc->bhtc"` multiplies each head's query by that head's $d_{\text{nope}} \times d_c$ block of $W^{UK}$.
+
+## Cache Size and the Compute Trade-off
+
+With DeepSeek-V3's dimensions the cache comparison is dramatic:
+
+```python
+# Per-token KV cache for DeepSeek-V3 (values from its config.json), bf16 = 2 bytes.
+layers, heads = 61, 128
+kv_lora_rank, rope_dim, nope_dim, v_dim = 512, 64, 128, 128
+B = 2
+
+mla = (kv_lora_rank + rope_dim) * layers * B
+mha = heads * ((nope_dim + rope_dim) + v_dim) * layers * B      # full per-head K (192) and V (128)
+gqa8 = 8 * (128 + 128) * layers * B                             # a Llama-style GQA with 8 KV heads
+
+for name, b in [("MLA (as shipped)", mla), ("MHA, same heads", mha), ("GQA, 8 KV heads", gqa8)]:
+    print(f"{name:17} {b / 1024:8.1f} KiB/token  {b * 131_072 / 2**30:7.1f} GiB at 128k tokens")
+print(f"MLA / MHA = {mla / mha:.2%}")
+```
+
+```text
+MLA (as shipped)      68.6 KiB/token      8.6 GiB at 128k tokens
+MHA, same heads     4880.0 KiB/token    610.0 GiB at 128k tokens
+GQA, 8 KV heads      244.0 KiB/token     30.5 GiB at 128k tokens
+MLA / MHA = 1.41%
+```
+
+A 671-billion-parameter model with 128 heads caches less per token (68.6 KiB) than Llama 3.1 8B with GQA (128 KiB, from the [previous page](./5-llm-mqa-gqa.mdx)). The DeepSeek-V2 paper expresses the same comparison in units of $d_h$: with $d_c = 4 d_h$ and $d_h^R = d_h / 2$, MLA caches $4.5 d_h$ elements per layer, the same as GQA with only 2.25 groups ($2 \times 2.25 \times d_h$).
+
+What does MLA pay? **Compute in the decode step.** In the absorbed form each head's dot products have length 576 instead of 192, and the weighted sums have length 512 instead of 128. Per cached token and head that is $2 \cdot (576 + 512) = 2176$ FLOPs instead of $2 \cdot (192 + 128) = 640$, about 3.4 times more. But all 128 heads share the 576 cached numbers, so the arithmetic intensity is
+
+$$
+\frac{128 \times 2176 \ \text{FLOPs}}{576 \ \text{elements} \times 2 \ \text{bytes}} \approx 242 \ \text{FLOPs per byte}
+$$
+
+compared with about 1 FLOP per byte for MHA decoding. That is close to the roughly 295 FLOPs per byte an H100-class GPU needs to be compute-bound. MLA turns decode attention from a memory-bound operation into a nearly compute-bound one, which is a much better use of the hardware. DeepSeek's FlashMLA kernel reports up to 660 TFLOP/s in compute-bound configurations on H800 GPUs.
+
+For **prefill and training**, where many queries are processed at once, the trade-off flips: the naive form with $192$-dimensional heads needs fewer FLOPs, and the data movement is amortized over many queries anyway. Serving engines therefore use both. vLLM's MLA backend, for example, documents a compute-friendly path for prefill and a data-movement-friendly absorbed path for decode. Hugging Face transformers (checked in version 5.21) caches the compressed latents but expands them to full keys and values at each step, the simple naive path.
+
+## Quality: Does Compression Cost Accuracy?
+
+Surprisingly, not in DeepSeek's experiments. Appendix D.2 of the DeepSeek-V2 paper compares MoE models that differ only in the attention mechanism:
+
+| Model pair | KV cache per token (elements) | MMLU, 5-shot | BBH, 3-shot |
+| --- | --- | --- | --- |
+| Small MoE (about 16B total), MHA | 110.6K | 48.7 | 37.9 |
+| Small MoE, MLA | 15.6K | 50.0 | 39.0 |
+| Large MoE (about 250B total), MHA | 860.2K | 57.5 | 46.6 |
+| Large MoE, MLA | 34.6K | 59.0 | 50.7 |
+
+MLA scored higher than MHA on three of the four benchmarks the paper reports at small scale (C-Eval was 0.7 points lower) and on all four at large scale, while caching 14% and 4% as much. Compared with DeepSeek's previous dense model, DeepSeek 67B, the paper reports that DeepSeek-V2 reduced the KV cache by 93.3% and raised maximum generation throughput to 5.76 times.
+
+Some caution is in order. These are DeepSeek's own experiments at fixed training budgets, and the small-model numbers differ by about one point. The safe conclusion is that MLA does not cost quality the way GQA and MQA do, and possibly helps, while saving far more memory. Independent replications and conversion methods such as TransMLA are an active research area.
+
+Where MLA is used today: DeepSeek-V2, V2-Lite, V3 and R1, the experimental DeepSeek-V3.2-Exp (which adds a sparse "lightning indexer" that selects 2,048 tokens per query on top of MLA, `index_topk` in its config; see [Sliding Window, Sparse and Linear Attention](../5-llm-flash-attention/5-llm-sparse-and-linear-attention.mdx)), and Kimi K2. The MoE side of these models is covered in [MoE Architectures](../7-llm-mixture-of-experts/2-llm-moe-architectures.mdx).
+
+## Worked Scenario: Serving DeepSeek-V3 at Long Context
+
+Suppose you serve DeepSeek-V3 on one node of 8 GPUs with 141 GB each (H200 class), 1,128 GB in total. The FP8 weights take roughly 671 GB, leaving about 450 GB for the KV cache and activations. How many tokens of context fit?
+
+- **With MLA** (68.6 KiB per token in bf16): $450\ \text{GB} / 70{,}272\ \text{bytes} \approx 6.4$ million cached tokens, for example about 48 concurrent requests at 128k tokens each.
+- **If the same model used MHA** (4,880 KiB per token): about 90,000 tokens in total, not even one 128k request.
+- **With GQA-8 instead** (244 KiB per token): about 1.8 million tokens, 13 requests at 128k.
+
+Concurrency drives throughput in decoding, because the weights are read once per step for the whole batch. The cache design therefore determines how many users one node can serve, which is the economic argument that made MLA worth its complexity. (Real numbers also depend on the cache dtype, the KV cache layout of the serving engine and activation memory; see [The KV Cache](../10-llm-inference/2-llm-kv-cache.mdx).)
+
+## Common Mistakes
+
+- **Using the latent width for the softmax scale.** The scale is $1/\sqrt{d_h + d_h^R}$ (192 for DeepSeek-V3), even in the absorbed form.
+- **Applying RoPE to the compressed keys.** That makes $W^{UK}$ non-absorbable. RoPE goes only on the separate $q^R$ and the shared $k^R$.
+- **Forgetting to cache $k^R$.** It is computed from $h_t$, not from the latent, so it cannot be reconstructed later.
+- **Expecting MLA to reduce FLOPs.** It reduces cache size and memory traffic; the absorbed decode path does more arithmetic per cached token.
+- **Reading `num_key_value_heads: 128` in DeepSeek's config as an MHA-sized cache.** That field describes the expanded per-head keys of the naive form; the cache size comes from `kv_lora_rank + qk_rope_head_dim`.
+- **Mixing RoPE layouts.** Hugging Face's DeepSeek-V3 implementation has a `rope_interleave` option; the pair layout must match the weights.
+- **Skipping the latent RMSNorms** when porting the released weights; the checkpoints expect them.
+
+## Summary
+
+- MLA caches a low-rank latent $c^{KV}_t = W^{DKV} h_t$ ($d_c = 512$ in DeepSeek-V3) from which every head's keys and values are up-projected; GQA is the special case with fixed copy matrices as up-projections.
+- Weight absorption moves $W^{UK}$ to the query side and $W^{UV}$ into the output projection, so decoding runs attention directly on the latents: MQA with a 576-dimensional shared key and 512-dimensional shared value.
+- RoPE's position-dependent rotation would sit between $W^{UQ}$ and $W^{UK}$ and block absorption; decoupled RoPE adds a small rotated query per head and one shared rotated key $k^R$ ($d_h^R = 64$), which is also cached.
+- DeepSeek-V3 caches $(512 + 64) \times 61$ elements per token, 68.6 KiB in bf16, 1.4% of MHA with the same heads and less than Llama 3.1 8B.
+- Absorbed decoding does about 3.4 times more FLOPs per cached token but reaches about 242 FLOPs per byte, close to compute-bound; prefill uses the naive form.
+- DeepSeek's ablations found MLA equal to or better than MHA; it is used by DeepSeek-V2, V3, R1, V3.2 and Kimi K2.
+
+## Further Reading
+
+- [DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model (DeepSeek-AI, 2024)](https://arxiv.org/abs/2405.04434): section 2.1 introduces MLA; appendix C has the full equations and appendix D the ablations.
+- [DeepSeek-V3 Technical Report (DeepSeek-AI, 2024)](https://arxiv.org/abs/2412.19437): MLA at 671B parameters.
+- [DeepSeek-V3 config.json on Hugging Face](https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json): the attention dimensions used on this page.
+- [FlashMLA (DeepSeek, GitHub)](https://github.com/deepseek-ai/FlashMLA): the MLA decoding kernels for Hopper and Blackwell GPUs.
+- [TransMLA (Meng et al., 2025)](https://arxiv.org/abs/2502.07864): converting GQA models to MLA and the expressivity argument.
+- [vLLM MLA common backend (v0.11.0 API docs)](https://docs.vllm.ai/en/v0.11.0/api/vllm/v1/attention/backends/mla/common.html): the compute-friendly prefill and data-movement-friendly decode paths described above.

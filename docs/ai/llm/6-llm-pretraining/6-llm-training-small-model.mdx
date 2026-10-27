@@ -1,0 +1,427 @@
+---
+title: "Pretraining a Small Language Model End to End"
+description: "Pretrain a 5.8M-parameter Llama-style model on TinyStories: clean data, train a BPE tokenizer, train with AdamW and cosine decay, checkpoint and sample."
+---
+
+# Pretraining a Small Language Model End to End
+
+## Introduction
+
+The previous pages of this section took pretraining apart: data, the objective and loader, scaling laws, the optimizer, numeric precision and parallelism. This page puts it back together. You will pretrain a small Llama-style language model from raw text to generated stories, with every stage of a real pipeline present in miniature: download, cleaning and deduplication, a byte-level BPE tokenizer trained on your own corpus, flat binary token files, a decoder with RMSNorm, RoPE and SwiGLU, AdamW with warmup and cosine decay, gradient clipping, evaluation, resumable checkpoints and sampling.
+
+The whole run fits on a CPU. The numbers shown were produced on a shared CPU server using four threads, so a laptop will usually be faster, and a single GPU much faster. The corpus is TinyStories (Eldan and Li, 2023, "TinyStories: How Small Can Language Models Be and Still Speak Coherent English?"), a dataset of short children's stories written by GPT-3.5 and GPT-4 with a deliberately small vocabulary. Its authors showed that models with only a few million parameters trained on it produce fluent, mostly consistent English, which makes it the right dataset for seeing real learning at laptop scale.
+
+The code is four files: `prepare.py`, `model.py`, `train.py` and `sample.py`. Put them in one folder and run them in order.
+
+```bash
+pip install torch numpy tokenizers
+python prepare.py      # about 22 MB download, then cleaning, tokenizer training and tokenization
+python model.py        # prints the parameter count
+python train.py        # STEPS=600 by default; set STEPS=100 for a quick smoke test
+python sample.py
+```
+
+## Planning the Run
+
+Start where a real team starts: with the budget.
+
+| Choice | Value | Where it comes from |
+| --- | --- | --- |
+| Architecture | 6 layers, $d_\mathrm{model} = 256$, 8 heads, SwiGLU with $d_\mathrm{ff} = 688$ | [The modern LLM recipe](../3-llm-transformer/7-llm-modern-architecture-recipe.mdx) |
+| Positions | RoPE, $\theta = 10{,}000$, context 256 | [RoPE explained](../4-llm-positional-encoding/3-llm-rope.mdx) |
+| Vocabulary | byte-level BPE, 4,096 tokens | [Byte-pair encoding](../1-llm-tokenization/1-llm-bpe.mdx) |
+| Parameters | 5.8M total, 4.7M non-embedding | `model.py` |
+| Batch | 16 sequences of 256 tokens = 4,096 tokens per step | [Data loading](./1-llm-training-objective.mdx) |
+| Steps and tokens | 600 steps, 2.46M tokens | CPU time budget |
+| Optimizer | AdamW, $\beta = (0.9, 0.95)$, weight decay 0.1 on matrices, clipping at 1.0 | [Optimizers](./3-llm-optimizers-and-schedules.mdx) |
+| Schedule | 30 warmup steps to 3e-3, cosine to 3e-4 | [Optimizers](./3-llm-optimizers-and-schedules.mdx) |
+
+A few numbers to check by hand. Training compute is $C \approx 6ND = 6 \times 5.8 \times 10^6 \times 2.46 \times 10^6 \approx 8.6 \times 10^{13}$ FLOPs, a few minutes of work for one modern GPU. The Chinchilla rule would suggest about $20 \times 5.8\text{M} \approx 116\text{M}$ tokens for this model, so with 2.46M tokens the run is far below compute-optimal: the model sees less than half of the 5.3M training tokens, and the loss is still falling when it stops. That is deliberate, to keep the run short, and the [scaling laws page](./2-llm-scaling-laws.mdx) tells you what to expect from more tokens: a lower loss following a power law.
+
+Why a 4,096-token vocabulary rather than GPT-2's 50,257? With $d_\mathrm{model} = 256$, a 50k vocabulary would put 12.9M parameters in the embedding matrix, more than twice the rest of the model, and the output softmax over 50k entries would dominate compute. A small model should have a small vocabulary, and TinyStories uses few distinct words.
+
+## Step 1: Prepare the Data
+
+`prepare.py` does in 50 lines what the [pretraining data page](./0-llm-pretraining-data.mdx) described at web scale: split the raw text into documents, drop fragments, remove exact duplicates after normalizing whitespace and case, shuffle at the document level, hold out 5% for validation, train the tokenizer on the training split only, and write each split as a flat `uint16` array with an end-of-text token between documents.
+
+```python
+"""Step 1: download, clean, deduplicate, train a tokenizer and write uint16 token files."""
+import hashlib
+import os
+import urllib.request
+import numpy as np
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+
+URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt"
+RAW = "tinystories_valid.txt"
+EOS = "<|endoftext|>"
+if not os.path.exists(RAW):
+    urllib.request.urlretrieve(URL, RAW)                  # about 22 MB
+
+# --- clean and deduplicate --------------------------------------------------------------
+docs = [d.strip() for d in open(RAW, encoding="utf-8").read().split(EOS)]
+n_raw = len(docs)
+docs = [d for d in docs if len(d.split()) >= 20]           # drop fragments
+seen, unique = set(), []
+for d in docs:
+    h = hashlib.sha1(" ".join(d.lower().split()).encode()).hexdigest()   # normalized exact dedup
+    if h not in seen:
+        seen.add(h); unique.append(d)
+print(f"documents: {n_raw:,} raw, {len(docs):,} after length filter, {len(unique):,} after dedup")
+
+rng = np.random.default_rng(0)
+rng.shuffle(unique)                                         # shuffle documents, not tokens
+n_val = len(unique) // 20                                   # 5% held out for validation
+splits = {"val": unique[:n_val], "train": unique[n_val:]}
+
+# --- train a byte-level BPE tokenizer on the training split only --------------------------
+tok = Tokenizer(models.BPE())
+tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+tok.decoder = decoders.ByteLevel()
+trainer = trainers.BpeTrainer(vocab_size=4096, special_tokens=[EOS],
+                              initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+tok.train_from_iterator(splits["train"], trainer=trainer)
+tok.save("tokenizer.json")
+eos_id = tok.token_to_id(EOS)
+print(f"vocabulary {tok.get_vocab_size()}, EOS id {eos_id}")
+
+# --- tokenize once into flat binary files ------------------------------------------------------
+for name, part in splits.items():
+    ids = []
+    for enc in tok.encode_batch(part):
+        ids.extend(enc.ids); ids.append(eos_id)              # EOS separates documents
+    arr = np.array(ids, dtype=np.uint16)                     # vocab 4096 < 65536
+    arr.tofile(f"{name}.bin")
+    n_bytes = sum(len(d.encode()) for d in part)
+    print(f"{name}: {len(part):,} docs, {len(arr):,} tokens, {n_bytes / len(arr):.2f} bytes per token")
+```
+
+```text
+
+
+
+documents: 27,631 raw, 27,630 after length filter, 27,630 after dedup
+vocabulary 4096, EOS id 0
+val: 1,381 docs, 283,587 tokens, 3.96 bytes per token
+train: 26,249 docs, 5,290,823 tokens, 3.96 bytes per token
+```
+
+Three details are worth noticing. The tokenizer is trained only on the training documents, so validation text is truly unseen. The split is by document, so no story is half in training and half in validation. And the dedup step found no exact duplicates: TinyStories was generated, not crawled, so it does not have the web's mirror copies. On a web corpus the same lines would remove a large share of documents, and you would add MinHash for near duplicates. At 3.96 bytes per token, the 4,096-token BPE compresses this simple English about as well as GPT-2's much larger tokenizer does on the same text.
+
+## Step 2: Define the Model
+
+`model.py` is a compact Llama-style decoder. Each block is pre-norm with RMSNorm, causal self-attention with rotary position embeddings applied to queries and keys (the half-split `rotate_half` layout), and a SwiGLU MLP. The output head shares its weights with the token embedding. Attention uses `F.scaled_dot_product_attention`, which picks a fused kernel such as FlashAttention when one is available.
+
+```python
+"""Step 2: a small Llama-style decoder: RMSNorm, RoPE, SwiGLU, tied embeddings."""
+from dataclasses import dataclass
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+@dataclass
+class Config:
+    vocab_size: int = 4096
+    d_model: int = 256
+    n_layers: int = 6
+    n_heads: int = 8
+    d_ff: int = 688               # about 8/3 * d_model, rounded to a multiple of 16
+    max_seq: int = 256
+    rope_theta: float = 10000.0
+
+def rope_cache(cfg):
+    hd = cfg.d_model // cfg.n_heads
+    inv_freq = 1.0 / cfg.rope_theta ** (torch.arange(0, hd, 2).float() / hd)   # (hd/2,)
+    angles = torch.outer(torch.arange(cfg.max_seq).float(), inv_freq)        # (max_seq, hd/2)
+    angles = torch.cat([angles, angles], dim=-1)                             # (max_seq, hd)
+    return angles.cos(), angles.sin()
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_heads, self.hd = cfg.n_heads, cfg.d_model // cfg.n_heads
+        self.norm1, self.norm2 = nn.RMSNorm(cfg.d_model), nn.RMSNorm(cfg.d_model)
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.gate_up = nn.Linear(cfg.d_model, 2 * cfg.d_ff, bias=False)
+        self.down = nn.Linear(cfg.d_ff, cfg.d_model, bias=False)
+
+    def forward(self, x, cos, sin):
+        B, T, C = x.shape
+        q, k, v = self.qkv(self.norm1(x)).split(C, dim=-1)
+        q, k, v = (t.view(B, T, self.n_heads, self.hd).transpose(1, 2) for t in (q, k, v))  # (B, H, T, hd)
+        q = q * cos[:T] + rotate_half(q) * sin[:T]
+        k = k * cos[:T] + rotate_half(k) * sin[:T]
+        att = F.scaled_dot_product_attention(q, k, v, is_causal=True)          # (B, H, T, hd)
+        x = x + self.proj(att.transpose(1, 2).reshape(B, T, C))
+        gate, up = self.gate_up(self.norm2(x)).chunk(2, dim=-1)
+        return x + self.down(F.silu(gate) * up)                               # SwiGLU MLP
+
+class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layers))
+        self.norm = nn.RMSNorm(cfg.d_model)
+        cos, sin = rope_cache(cfg)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        self.apply(self._init)
+        for name, p in self.named_parameters():                  # GPT-2 style: shrink residual outputs
+            if name.endswith(("proj.weight", "down.weight")):
+                nn.init.normal_(p, std=0.02 / (2 * cfg.n_layers) ** 0.5)
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, idx):                                      # idx: (B, T) token ids
+        x = self.embed(idx)                                       # (B, T, C)
+        for blk in self.blocks:
+            x = blk(x, self.cos, self.sin)
+        return self.norm(x) @ self.embed.weight.T                # (B, T, V), tied output head
+
+    @torch.no_grad()
+    def generate(self, idx, n_new, temperature=0.8, top_k=50):
+        for _ in range(n_new):
+            logits = self(idx[:, -self.cfg.max_seq:])[:, -1] / temperature   # (B, V)
+            kth = logits.topk(top_k).values[:, -1:]
+            logits[logits < kth] = float("-inf")                 # keep the top_k candidates
+            nxt = torch.multinomial(F.softmax(logits, dim=-1), 1)
+            idx = torch.cat([idx, nxt], dim=1)
+        return idx
+
+if __name__ == "__main__":
+    model = GPT(Config())
+    n = sum(p.numel() for p in model.parameters())
+    n_emb = model.embed.weight.numel()
+    print(f"parameters: {n:,} total, {n - n_emb:,} non-embedding")
+    print(model(torch.randint(0, 4096, (2, 16))).shape)
+```
+
+```text
+parameters: 5,795,072 total, 4,746,496 non-embedding
+torch.Size([2, 16, 4096])
+```
+
+The initialization follows GPT-2: normal with standard deviation 0.02, and the two projections that write into the residual stream (`proj` and `down`) scaled down by $1/\sqrt{2L}$ for $L$ layers, so the residual stream's variance does not grow with depth. Every block adds two such contributions, which is where the factor 2 comes from.
+
+## Step 3: Train
+
+`train.py` contains the training loop. Each part maps to a section of this tutorial:
+
+- **Data.** The loader samples random windows of $T + 1$ tokens and splits them into inputs and targets shifted by one. Random windows are a simple form of packing: windows cross document boundaries, separated by the end-of-text token, with a plain causal mask. The loader's state is just its random generator, which goes into the checkpoint.
+- **Parameter groups.** Weight decay applies to the 2D weight matrices only; norms and the (tied) embedding have no decay.
+- **Schedule.** The learning rate is set by hand each step: linear warmup for 30 steps, then cosine decay to 10% of the peak at the final step.
+- **Precision.** On a GPU the forward pass runs under BF16 autocast; the loss is computed in FP32 either way. On CPU autocast is disabled because BF16 matmuls are not faster on most CPUs.
+- **Clipping and logging.** The gradient norm before clipping is logged, together with loss, learning rate and throughput.
+- **Evaluation and checkpoints.** Every 100 steps the model is scored on the same 10 validation batches, and model, optimizer, step and loader state are saved. Run the script again and it resumes where it stopped.
+
+```python
+"""Step 3: pretrain the model with AdamW, warmup + cosine, clipping, eval and checkpoints."""
+import math
+import os
+import time
+import numpy as np
+import torch
+import torch.nn.functional as F
+from model import GPT, Config
+
+torch.manual_seed(1337)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+B, T, ACCUM = 16, 256, 1                 # 4,096 tokens per optimizer step; raise ACCUM on a GPU
+MAX_STEPS, WARMUP, PEAK_LR, MIN_LR = int(os.environ.get("STEPS", 600)), 30, 3e-3, 3e-4
+EVAL_EVERY, CKPT = 100, "ckpt.pt"
+
+class Loader:
+    """Random windows from a uint16 token file. The RNG state is the loader state."""
+    def __init__(self, path, seed):
+        self.data = np.memmap(path, dtype=np.uint16, mode="r")
+        self.rng = np.random.default_rng(seed)
+    def batch(self):
+        starts = self.rng.integers(0, len(self.data) - T - 1, size=B)
+        chunk = np.stack([self.data[s:s + T + 1] for s in starts]).astype(np.int64)   # (B, T+1)
+        x, y = torch.from_numpy(chunk[:, :-1]), torch.from_numpy(chunk[:, 1:])         # shifted targets
+        return x.to(device), y.to(device)
+
+def lr_at(step):
+    if step < WARMUP:
+        return PEAK_LR * (step + 1) / WARMUP
+    p = (step - WARMUP) / max(1, MAX_STEPS - WARMUP)
+    return MIN_LR + 0.5 * (PEAK_LR - MIN_LR) * (1 + math.cos(math.pi * p))
+
+model = GPT(Config()).to(device)
+decay = [p for n, p in model.named_parameters() if p.dim() >= 2 and "embed" not in n]
+no_decay = [p for n, p in model.named_parameters() if p.dim() < 2 or "embed" in n]
+opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                         {"params": no_decay, "weight_decay": 0.0}],
+                        lr=PEAK_LR, betas=(0.9, 0.95), eps=1e-8)
+train, val = Loader("train.bin", seed=0), Loader("val.bin", seed=1)
+step = 0
+if os.path.exists(CKPT):                               # resume: model, optimizer, step, data RNG
+    ck = torch.load(CKPT, weights_only=False)
+    model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+    step, train.rng.bit_generator.state = ck["step"], ck["rng"]
+    print(f"resumed at step {step}")
+
+@torch.no_grad()
+def evaluate(n_batches=10):
+    model.eval()
+    val.rng = np.random.default_rng(1)                 # the same validation windows every time
+    losses = [F.cross_entropy(model(x).flatten(0, 1), y.flatten()).item()
+              for x, y in (val.batch() for _ in range(n_batches))]
+    model.train()
+    return sum(losses) / len(losses)
+
+amp = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device == "cuda" \
+    else torch.autocast(device_type="cpu", enabled=False)
+print(f"step {step}: val loss {evaluate():.4f}  (ln V = {math.log(4096):.4f})")
+t0 = time.time()
+while step < MAX_STEPS:
+    for g in opt.param_groups:
+        g["lr"] = lr_at(step)
+    for _ in range(ACCUM):
+        x, y = train.batch()
+        with amp:
+            logits = model(x)
+        loss = F.cross_entropy(logits.float().flatten(0, 1), y.flatten())
+        (loss / ACCUM).backward()                       # equal token counts per micro-batch, so /ACCUM is exact
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step(); opt.zero_grad(set_to_none=True)
+    step += 1
+    if step % 25 == 0:
+        tok_s = 25 * B * T * ACCUM / (time.time() - t0); t0 = time.time()
+        print(f"step {step:4d}  loss {loss.item():.4f}  grad norm {gnorm:.3f}  "
+              f"lr {lr_at(step - 1):.2e}  {tok_s:,.0f} tok/s")
+    if step % EVAL_EVERY == 0 or step == MAX_STEPS:
+        print(f"step {step}: val loss {evaluate():.4f}")
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step,
+                    "rng": train.rng.bit_generator.state}, CKPT)
+```
+
+The log of the full run:
+
+```text
+step 0: val loss 8.3759  (ln V = 8.3178)
+step   25  loss 5.5916  grad norm 3.020  lr 2.50e-03  503 tok/s
+step   50  loss 4.7070  grad norm 1.117  lr 2.99e-03  535 tok/s
+step   75  loss 4.1226  grad norm 0.796  lr 2.96e-03  664 tok/s
+step  100  loss 3.8564  grad norm 0.567  lr 2.90e-03  621 tok/s
+step 100: val loss 3.8933
+step  125  loss 3.7120  grad norm 0.629  lr 2.82e-03  472 tok/s
+step  150  loss 3.5791  grad norm 0.604  lr 2.72e-03  793 tok/s
+step  175  loss 3.3758  grad norm 0.530  lr 2.60e-03  790 tok/s
+step  200  loss 3.5729  grad norm 0.672  lr 2.46e-03  1,068 tok/s
+step 200: val loss 3.3476
+step  225  loss 3.2564  grad norm 0.582  lr 2.30e-03  1,162 tok/s
+step  250  loss 3.1988  grad norm 0.525  lr 2.13e-03  1,380 tok/s
+step  275  loss 3.0633  grad norm 0.537  lr 1.95e-03  1,589 tok/s
+step  300  loss 3.0390  grad norm 0.513  lr 1.77e-03  1,615 tok/s
+step 300: val loss 3.0714
+step  325  loss 3.1084  grad norm 0.518  lr 1.58e-03  1,307 tok/s
+step  350  loss 2.9346  grad norm 0.534  lr 1.40e-03  1,097 tok/s
+step  375  loss 2.8313  grad norm 0.576  lr 1.22e-03  1,754 tok/s
+step  400  loss 2.8016  grad norm 0.504  lr 1.05e-03  2,113 tok/s
+step 400: val loss 2.8713
+step  425  loss 3.0477  grad norm 0.545  lr 8.87e-04  1,194 tok/s
+step  450  loss 2.8340  grad norm 0.518  lr 7.41e-04  1,607 tok/s
+step  475  loss 2.7662  grad norm 0.500  lr 6.13e-04  1,614 tok/s
+step  500  loss 2.6353  grad norm 0.525  lr 5.04e-04  2,076 tok/s
+step 500: val loss 2.7505
+step  525  loss 2.7285  grad norm 0.511  lr 4.17e-04  1,612 tok/s
+step  550  loss 2.5670  grad norm 0.496  lr 3.53e-04  1,858 tok/s
+step  575  loss 2.8034  grad norm 0.545  lr 3.14e-04  1,241 tok/s
+step  600  loss 2.5832  grad norm 0.542  lr 3.00e-04  1,444 tok/s
+step 600: val loss 2.6804
+```
+
+How to read it, using the [loss curve page](./1-llm-training-objective.mdx):
+
+- **Start.** The first validation loss is 8.38, almost exactly $\ln 4096 = 8.32$: the initialization is healthy, predicting nearly uniformly.
+- **Fast phase.** Within 100 steps (410k tokens) the loss falls to 3.89: the model has learned token frequencies and common word pairs.
+- **Slow phase.** From step 100 to 600 the validation loss keeps falling, to 3.35, 3.07, 2.87, 2.75 and 2.68 at each evaluation, by smaller and smaller amounts. It has not flattened, which confirms that the run is data- and compute-limited, as the budget predicted.
+- **Stability.** The gradient norm starts at 3.0 during warmup, then settles near 0.5 and stays there; no spikes. The training loss (one batch) jumps around by about 0.2 from one log line to the next, which is batch noise; the validation loss, computed on fixed batches, decreases at every evaluation.
+- **No overfitting.** Validation loss tracks training loss closely, as expected when no token has been seen twice.
+
+The final 2.68 nats per token is a perplexity of $e^{2.68} \approx 14.6$, or $2.68 / \ln 2 / 3.96 \approx 0.98$ bits per byte. Running `python train.py` a second time prints `resumed at step 600` and the identical validation loss of 2.6804, which confirms that the checkpoint restores the model exactly. (Throughput in the log varies from 470 to 2,100 tokens per second only because other jobs shared the server.)
+
+## Step 4: Generate Text
+
+`sample.py` loads the checkpoint and samples with temperature 0.8 and top-k 50, stopping each sample at the first end-of-text token.
+
+```python
+"""Step 4: load the checkpoint and generate text."""
+import torch
+from tokenizers import Tokenizer
+from model import GPT, Config
+
+torch.manual_seed(0)
+tok = Tokenizer.from_file("tokenizer.json")
+model = GPT(Config())
+model.load_state_dict(torch.load("ckpt.pt", weights_only=False)["model"])
+model.eval()
+
+for prompt in ["Once upon a time, there was a little dog named", "Lily wanted to"]:
+    idx = torch.tensor([tok.encode(prompt).ids])                  # (1, prompt_len)
+    out = model.generate(idx, n_new=60, temperature=0.8, top_k=50)
+    text = tok.decode(out[0].tolist(), skip_special_tokens=False)
+    print(text.split("<|endoftext|>")[0].replace("\n", " "), "\n")
+```
+
+```text
+Once upon a time, there was a little dog named Tom. Tom was very smart. He loved to play with his friends. One sunny day, Tom went to the park to play with his toys. But when he got there, he found a big, red ball on the ground. Max tried to climb the tree, but the big fish did 
+
+Lily wanted to play with her ball, so she felt better. She looked at the ball and saw her sad face. Lily said, "Mom, can you help me? I can't play with you. I want to play with your ball." She started to cry. She looked at the ball. She 
+```
+
+After only 2.46M tokens the model writes grammatical English with the vocabulary and rhythm of a children's story, quotation marks and dialogue included. Its weaknesses are just as visible: the dog called Tom turns into "Max" within three sentences, and a fish appears from nowhere. Keeping track of characters and plot over many sentences is a long-range skill that comes with more tokens and larger models; the TinyStories paper reports clearly better consistency from models trained far longer on the full dataset.
+
+## Scaling It Up
+
+Everything on this page carries over to larger runs; only the numbers change.
+
+**On one GPU.** The same script runs with BF16 autocast. Wrap the model with `torch.compile(model)` for fused kernels, raise the batch to 64 or more sequences, and train on the full TinyStories training file (about 2.2 GB of text) instead of the validation file. With 8 layers of width 512 (and $d_\mathrm{ff} = 1376$) the model has about 27M parameters, and 20 tokens per parameter is 540M tokens, roughly one pass over that file. At $6ND = 6 \times 2.7 \times 10^7 \times 5.4 \times 10^8 \approx 8.7 \times 10^{16}$ FLOPs and an achieved 100 TFLOPS, that is about 15 minutes.
+
+**On a GPU node.** Use `torchrun --nproc_per_node=8`, give each rank its own data stream (a different seed, or a strided slice of a token file as in the [data loading page](./1-llm-training-objective.mdx)), and wrap each block with `fully_shard` as on the [distributed training page](./5-llm-distributed-training.mdx). Keep the global batch fixed in tokens when you change the GPU count by adjusting gradient accumulation.
+
+**Experiments worth running at this scale.** Each one takes the training script plus a few lines:
+
+1. Replace the cosine schedule with warmup-stable-decay and compare the final validation loss at equal steps.
+2. Train the 2D hidden matrices with `torch.optim.Muon` and everything else with AdamW.
+3. Sweep the peak learning rate over 1e-3, 3e-3 and 1e-2 and watch the gradient norm log for instability at the high end.
+4. Add z-loss and a document mask (with per-document position ids) and measure whether either changes the loss.
+5. Train three model widths for the same compute and see which gives the lowest loss: a tiny IsoFLOP experiment.
+
+## Common Mistakes
+
+- Training the tokenizer on all the data, including validation; the validation loss is then slightly optimistic.
+- Splitting train and validation by tokens rather than by documents, so the same story appears on both sides.
+- Using a 50k vocabulary for a model this small; most parameters end up in the embedding table.
+- Forgetting to put the model in `eval()` mode and `torch.no_grad()` for evaluation; harmless here (no dropout) but expensive in memory and wrong for models with dropout.
+- Changing `STEPS` between a run and its resume. The cosine schedule depends on the total, so the learning rate jumps.
+- Reading too much into one run. At this scale differences under about 0.02 in validation loss are within seed-to-seed noise; repeat with two or three seeds before believing a comparison.
+- Comparing this model's loss with published numbers for other tokenizers; compare bits per byte instead.
+
+## Summary
+
+- A complete pretraining pipeline has the same stages at every scale: data preparation and deduplication, tokenizer training, offline tokenization to binary files, a model, a training loop with an optimizer and schedule, evaluation, checkpoints and sampling.
+- Budget first: parameters, tokens and $6ND$ compute tell you what the run can achieve and whether it is under- or over-trained.
+- Small models need small vocabularies; tie embeddings to save parameters.
+- AdamW with $\beta_2 = 0.95$, weight decay on matrices only, warmup plus cosine decay and clipping at 1.0 is a robust default.
+- Save the optimizer and data loader state with the weights so a run can resume exactly.
+
+## Further Reading
+
+- [TinyStories (Eldan and Li, 2023)](https://arxiv.org/abs/2305.07759) - the dataset and evidence that very small models can learn fluent English.
+- [TinyStories dataset on Hugging Face](https://huggingface.co/datasets/roneneldan/TinyStories) - the files used on this page.
+- [nanoGPT](https://github.com/karpathy/nanoGPT) - a minimal GPT training codebase that inspired the structure of `train.py`.
+- [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) - a speedrun of GPT-2 small training with Muon and many modern tricks.
+- [Hugging Face Tokenizers documentation](https://huggingface.co/docs/tokenizers/index) - BPE training and byte-level pre-tokenization.
+- [torchtitan](https://github.com/pytorch/torchtitan) - the same ideas at production scale in PyTorch.
+- [The Llama 3 Herd of Models (Grattafiori et al., 2024)](https://arxiv.org/abs/2407.21783) - a full frontier pretraining recipe to compare with this one.

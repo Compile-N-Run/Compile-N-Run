@@ -1,0 +1,353 @@
+---
+title: "Direct Preference Optimization and Its Variants"
+description: "Derive the DPO loss from the RLHF objective, implement it on a real model in PyTorch, and compare IPO, KTO, SimPO and ORPO with their trade-offs."
+---
+
+# Direct Preference Optimization and Its Variants
+
+## Introduction
+
+PPO-based RLHF works, but it is a lot of machinery: a reward model, a value model, a frozen reference, online generation and a dozen interacting hyperparameters. In 2023 Rafailov, Sharma, Mitchell, Ermon, Manning and Finn published "Direct Preference Optimization: Your Language Model is Secretly a Reward Model". They showed that the KL-regularized objective RLHF optimizes has a closed-form solution, and that by rewriting the reward in terms of that solution, you can train the policy directly on preference pairs with a loss that looks like logistic regression. No reward model, no sampling, no RL.
+
+DPO spread quickly. Zephyr (Tunstall et al., 2023) used it to align Mistral-7B on AI-labeled UltraFeedback data, Tulu 2 and 3 used it, and Llama 3 replaced PPO with DPO for its final preference stage, reporting that DPO needed less compute and did better on instruction following. Dozens of variants followed, each fixing a specific weakness.
+
+By the end of this page you will be able to:
+
+- Derive the DPO loss step by step from the RLHF objective and explain its gradient.
+- Verify numerically that DPO recovers the RLHF optimal policy, and see what it does to responses absent from the data.
+- Implement DPO for a real Hugging Face model in plain PyTorch.
+- Explain IPO, KTO, SimPO and ORPO: what each changes, why, and when to pick it.
+- Configure TRL's `DPOTrainer` and read its logged metrics.
+
+## Deriving the DPO Loss
+
+Start from the result on the RLHF page. For a reward function $r(x, y)$ and reference policy $\pi_{\mathrm{ref}}$, the policy that maximizes $\mathbb{E}[r] - \beta\, \mathbb{D}_{\mathrm{KL}}[\pi \Vert \pi_{\mathrm{ref}}]$ is
+
+$$
+\pi^*(y \mid x) = \frac{1}{Z(x)}\, \pi_{\mathrm{ref}}(y \mid x) \exp\!\left(\frac{r(x, y)}{\beta}\right)
+$$
+
+The partition function $Z(x)$ is intractable, which is why RLHF uses RL instead of this formula. DPO's trick is to read the equation backward. Take logs and solve for the reward:
+
+$$
+r(x, y) = \beta \log \frac{\pi^*(y \mid x)}{\pi_{\mathrm{ref}}(y \mid x)} + \beta \log Z(x)
+$$
+
+Every reward function corresponds to an optimal policy, and every policy defines the reward for which it is optimal. Now plug this expression into the Bradley-Terry model of preferences. Only the difference of two rewards for the *same* prompt appears, so the troublesome $\beta \log Z(x)$ cancels:
+
+$$
+P(y_w \succ y_l \mid x) = \sigma\!\left(\beta \log \frac{\pi^*(y_w \mid x)}{\pi_{\mathrm{ref}}(y_w \mid x)} - \beta \log \frac{\pi^*(y_l \mid x)}{\pi_{\mathrm{ref}}(y_l \mid x)}\right)
+$$
+
+The preference probability is now written in terms of the policy alone. Replace $\pi^*$ with a trainable $\pi_\theta$ and fit it by maximum likelihood on the preference data, exactly as we fit the reward model on page 2:
+
+$$
+\mathcal{L}_{\mathrm{DPO}}(\theta) = -\,\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}}\left[\log \sigma\!\left(\beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\mathrm{ref}}(y_w \mid x)} - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\mathrm{ref}}(y_l \mid x)}\right)\right]
+$$
+
+That is the paper's subtitle: the language model *is* the reward model. The quantity $\hat{r}_\theta(x, y) = \beta \log \pi_\theta(y \mid x) / \pi_{\mathrm{ref}}(y \mid x)$ is called the *implicit reward*. DPO trains it with the reward-model loss, and because it is defined through the policy, training it trains the policy.
+
+Each $\log \pi(y \mid x)$ is a sum of token log-probabilities over the response only, never the prompt. Computing the loss for a batch therefore takes four forward passes: policy and reference, each on the chosen and the rejected response. The reference terms are constants and can be precomputed once.
+
+**The gradient.** Differentiating gives
+
+$$
+\nabla_\theta \mathcal{L}_{\mathrm{DPO}} = -\beta\, \mathbb{E}\Big[\underbrace{\sigma\big(\hat{r}_\theta(x, y_l) - \hat{r}_\theta(x, y_w)\big)}_{\text{weight}}\,\big(\nabla_\theta \log \pi_\theta(y_w \mid x) - \nabla_\theta \log \pi_\theta(y_l \mid x)\big)\Big]
+$$
+
+The update raises the likelihood of the chosen response and lowers that of the rejected one, weighted by how wrong the implicit reward currently is. Pairs already ranked correctly by a wide margin get a weight near 0. This weight is what distinguishes DPO from the naive "SFT on chosen, unlikelihood on rejected" approach, which the DPO authors found degenerates.
+
+**Numeric example.** At the start of training $\pi_\theta = \pi_{\mathrm{ref}}$, so both log-ratios are 0, the loss is $-\log \sigma(0) = \log 2 = 0.693$ and the weight is $\sigma(0) = 0.5$. Suppose after some steps the chosen response's log-probability has risen by 5 nats relative to the reference and the rejected one is unchanged. With $\beta = 0.1$ the implicit reward margin is $0.1 \times 5 = 0.5$, the loss is $-\log \sigma(0.5) = 0.474$, and the weight has fallen to $\sigma(-0.5) = 0.378$.
+
+**What $\beta$ does.** As in RLHF, $\beta$ is the strength of the KL anchor. A larger $\beta$ means a given change in log-ratio produces a larger implicit reward margin, so the loss saturates after smaller moves and the policy stays closer to the reference. Typical values are 0.01 to 0.5; 0.1 is TRL's default and the value Llama 3 reported.
+
+## Checking DPO Against the RLHF Optimum
+
+The derivation claims that with enough data, DPO finds the same policy as RLHF. We can check that with the five-response toy from page 2. The script computes the *expected* DPO loss when preferences follow Bradley-Terry under a hidden reward, so it measures the infinite-data limit:
+
+```python
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+pi_ref = torch.tensor([0.40, 0.30, 0.15, 0.10, 0.05])   # reference (SFT) policy
+reward = torch.tensor([0.0, 1.0, 2.0, 0.5, 3.0])          # hidden true reward
+beta = 1.0
+
+def dpo_expected_loss(logits, pairs):
+    """Exact expected DPO loss when labels follow Bradley-Terry on `reward`."""
+    logp = torch.log_softmax(logits, 0)
+    h = beta * ((logp - pi_ref.log())[:, None] - (logp - pi_ref.log())[None, :])  # h[i, j]
+    p_ij = torch.sigmoid(reward[:, None] - reward[None, :])                      # P(i beats j)
+    loss = 0.0
+    for i, j in pairs:   # each unordered pair; i wins with prob p_ij[i, j]
+        loss = loss - p_ij[i, j] * F.logsigmoid(h[i, j]) - p_ij[j, i] * F.logsigmoid(h[j, i])
+    return loss / len(pairs)
+
+def train(pairs):
+    logits = pi_ref.log().clone().requires_grad_(True)
+    opt = torch.optim.Adam([logits], lr=0.05)
+    for _ in range(4000):
+        loss = dpo_expected_loss(logits, pairs)
+        opt.zero_grad(); loss.backward(); opt.step()
+    return torch.softmax(logits, 0).detach()
+
+target = pi_ref * torch.exp(reward / beta); target /= target.sum()
+all_pairs = [(i, j) for i in range(5) for j in range(i + 1, 5)]
+pi = train(all_pairs)
+print("RLHF optimum      ", target.numpy().round(3))
+print("DPO, all pairs    ", pi.numpy().round(3))
+implicit = beta * (pi.log() - pi_ref.log())
+print("implicit reward   ", (implicit - implicit[0]).numpy().round(2), " (true:", reward.numpy(), ")")
+
+# Now the data never compares response 4 with anything.
+partial = [(i, j) for (i, j) in all_pairs if 4 not in (i, j)]
+pi2 = train(partial)
+print("DPO, no pairs with response 4:", pi2.numpy().round(3))
+```
+
+```text
+RLHF optimum       [0.115 0.233 0.317 0.047 0.288]
+DPO, all pairs     [0.115 0.233 0.317 0.047 0.288]
+implicit reward    [0.  1.  2.  0.5 3. ]  (true: [0.  1.  2.  0.5 3. ] )
+DPO, no pairs with response 4: [0.146 0.297 0.403 0.06  0.094]
+```
+
+With every pair covered, DPO lands exactly on $\pi_{\mathrm{ref}} \exp(r/\beta) / Z$, and its implicit reward recovers the true reward up to a constant. That is the theorem in action.
+
+The last line shows the catch. When response 4 never appears in a comparison, the loss depends only on differences between the logits of responses 0 to 3, so response 4's logit receives no gradient at all. Its final probability, 0.094, is not a judgment about its quality; it is whatever is left after the other four rearranged themselves. For a real LLM, almost every possible response is "response 4": absent from the preference data. DPO constrains the ratios between the sequences it sees and says nothing directly about the rest, which is one reason DPO policies can drift in unexpected directions, such as toward longer outputs or out-of-distribution text. RLHF with online sampling does not have this blind spot, because the policy is scored on whatever it actually generates.
+
+## DPO on a Real Model in PyTorch
+
+The script below implements DPO from scratch for SmolLM2-135M-Instruct, with the policy initialized from the model and the reference a frozen copy. It runs on CPU; eight steps on two pairs keep it small.
+
+```python
+import copy, torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+torch.manual_seed(0)
+name = "HuggingFaceTB/SmolLM2-135M-Instruct"
+tok = AutoTokenizer.from_pretrained(name)
+policy = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
+ref = copy.deepcopy(policy).eval()                     # frozen reference = starting policy
+for p in ref.parameters():
+    p.requires_grad_(False)
+
+pairs = [  # (prompt, chosen, rejected)
+    ("Give me one tip for writing clean Python.",
+     "Use descriptive variable names so the code explains itself.",
+     "Just write code, nobody reads it anyway."),
+    ("How do I reverse a list in Python?",
+     "Use my_list[::-1] for a reversed copy, or my_list.reverse() to reverse in place.",
+     "You cannot reverse a list in Python."),
+]
+
+def encode(prompt, answer):
+    p = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                tokenize=False, add_generation_prompt=True)
+    p_ids = tok(p, add_special_tokens=False)["input_ids"]
+    a_ids = tok(answer + tok.eos_token, add_special_tokens=False)["input_ids"]
+    return torch.tensor([p_ids + a_ids]), len(p_ids)
+
+def seq_logprob(model, ids, n_prompt):
+    """Sum of log pi(y_t | x, y_<t) over response tokens only."""
+    logits = model(ids).logits[:, :-1, :]                  # (1, T-1, V)
+    targets = ids[:, 1:]                                   # (1, T-1)
+    logp = torch.log_softmax(logits, -1).gather(-1, targets[..., None]).squeeze(-1)
+    return logp[:, n_prompt - 1:].sum()                    # positions predicting response tokens
+
+batch = [(encode(p, c), encode(p, r)) for p, c, r in pairs]
+with torch.no_grad():                                       # reference log-probs are constants
+    ref_lp = [(seq_logprob(ref, *c), seq_logprob(ref, *r)) for c, r in batch]
+
+beta = 0.1
+opt = torch.optim.AdamW(policy.parameters(), lr=5e-6)
+for step in range(8):
+    losses, margins, ch, rj = [], [], [], []
+    for (c, r), (rc, rr) in zip(batch, ref_lp):
+        pc, pr = seq_logprob(policy, *c), seq_logprob(policy, *r)
+        reward_c, reward_r = beta * (pc - rc), beta * (pr - rr)      # implicit rewards
+        losses.append(-F.logsigmoid(reward_c - reward_r))
+        margins.append((reward_c - reward_r).item()); ch.append(pc.item()); rj.append(pr.item())
+    loss = torch.stack(losses).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+    print(f"step {step}  loss {loss.item():.4f}  margin {sum(margins)/2:+.3f}"
+          f"  logp(chosen) {sum(ch)/2:7.2f}  logp(rejected) {sum(rj)/2:7.2f}")
+```
+
+```text
+step 0  loss 0.6931  margin +0.000  logp(chosen)  -55.94  logp(rejected)  -29.07
+step 1  loss 0.4499  margin +0.587  logp(chosen)  -51.15  logp(rejected)  -30.16
+step 2  loss 0.3033  margin +1.108  logp(chosen)  -47.21  logp(rejected)  -31.43
+step 3  loss 0.2111  margin +1.566  logp(chosen)  -44.03  logp(rejected)  -32.83
+step 4  loss 0.1503  margin +1.969  logp(chosen)  -41.49  logp(rejected)  -34.32
+step 5  loss 0.1089  margin +2.327  logp(chosen)  -39.47  logp(rejected)  -35.88
+step 6  loss 0.0801  margin +2.649  logp(chosen)  -37.84  logp(rejected)  -37.47
+step 7  loss 0.0598  margin +2.942  logp(chosen)  -36.51  logp(rejected)  -39.06
+```
+
+Step 0 checks the derivation: with policy equal to reference, the loss is exactly $\log 2 = 0.6931$ and the margin is zero. Over eight steps the margin grows to about 2.9 and the loss falls to 0.06. Here the two log-probabilities move in opposite directions, the chosen answers from $-55.9$ to $-36.5$ nats and the rejected ones from $-29.1$ to $-39.1$, which is the healthy pattern. Note that the chosen answers start with *lower* log-probability than the rejected ones simply because they are longer: DPO compares each response with its own reference value, so raw likelihoods of different-length answers never compete directly. On a real dataset with thousands of pairs and many steps, you will often see both log-probabilities fall instead, discussed below.
+
+The index arithmetic in `seq_logprob` is the part most often gotten wrong. Logits at position $t$ predict token $t+1$, so after shifting, the prediction of the first response token sits at index `n_prompt - 1`. Summing from there covers exactly the response tokens, including the end-of-turn token, which matters: it teaches the model where to stop.
+
+## Known Failure Modes of DPO
+
+Several weaknesses have been documented, and most variants target one of them.
+
+- **Overfitting to deterministic preferences.** If a pair is always labeled the same way, the Bradley-Terry likelihood keeps improving as the margin grows without bound, and the $\beta$-weighted KL anchor no longer holds the policy back. Azar et al. (2023) proved this and proposed IPO.
+- **Both likelihoods fall.** In practice, DPO often lowers $\log \pi_\theta(y_w)$ as well as $\log \pi_\theta(y_l)$; the margin grows because the rejected response falls faster. Probability mass leaks to responses outside the data, the "response 4" effect above. Llama 3 added an NLL term on the chosen response with coefficient 0.2 to counter this, a fix also proposed as RPO by Pang et al. (2024).
+- **Length exploitation.** Summed log-ratios grow with length, and preference data often favors longer answers, so DPO models tend to get verbose (Park et al., 2024).
+- **Off-policy data.** Pairs generated by a different model describe a different distribution. Tajwar et al. (2024) and others found that on-policy pairs, sampled from the model being trained and then labeled, work markedly better. Iterative or online DPO, which regenerates pairs every round as Llama 3 did, recovers much of the gap to PPO; Xu et al. (2024) showed that a well-tuned PPO can still beat offline DPO.
+
+## The Variants: IPO, KTO, SimPO and ORPO
+
+Write $h = \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\mathrm{ref}}(y_w \mid x)} - \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\mathrm{ref}}(y_l \mid x)}$ for the log-ratio difference. DPO's loss is $-\log \sigma(\beta h)$.
+
+**IPO** (Identity Preference Optimization; Azar et al., 2023, "A General Theoretical Paradigm to Understand Learning from Human Preferences") replaces the log-sigmoid with a squared error toward a fixed target margin:
+
+$$
+\mathcal{L}_{\mathrm{IPO}} = \left(h - \frac{1}{2\tau}\right)^2
+$$
+
+Because the loss has a minimum at $h = 1/(2\tau)$ instead of improving forever, it cannot overfit deterministic preferences. TRL exposes it as `loss_type="ipo"` with `beta` playing the role of $\tau$.
+
+**KTO** (Kahneman-Tversky Optimization; Ethayarajh et al., 2024) does not need pairs at all, only responses labeled desirable or undesirable, like a thumbs-up button. Inspired by prospect theory, it compares each response's implicit reward with a reference point $z_0$, an estimate of the KL between policy and reference:
+
+$$
+v(x, y) = \begin{cases} \lambda_D\, \sigma\big(\beta (r_\theta(x, y) - z_0)\big) & \text{if } y \text{ is desirable} \\ \lambda_U\, \sigma\big(\beta (z_0 - r_\theta(x, y))\big) & \text{if } y \text{ is undesirable} \end{cases}
+\qquad
+\mathcal{L}_{\mathrm{KTO}} = \mathbb{E}\big[\lambda_y - v(x, y)\big]
+$$
+
+with $r_\theta = \log \pi_\theta(y \mid x) / \pi_{\mathrm{ref}}(y \mid x)$. In practice $z_0$ is estimated from mismatched prompt-response pairs in the batch, clamped at zero, and not backpropagated through. The weights $\lambda_D$ and $\lambda_U$ handle imbalance; the authors recommend keeping $\lambda_D n_D / (\lambda_U n_U)$ between 1 and 1.5, where $n_D$ and $n_U$ count the desirable and undesirable examples. KTO is the natural choice when your feedback is binary rather than comparative. TRL has a `KTOTrainer`.
+
+**SimPO** (Simple Preference Optimization; Meng, Xia and Chen, 2024) removes the reference model and uses the *average* token log-probability as the reward, with a target margin $\gamma$:
+
+$$
+\mathcal{L}_{\mathrm{SimPO}} = -\log \sigma\!\left(\frac{\beta}{\lvert y_w \rvert} \log \pi_\theta(y_w \mid x) - \frac{\beta}{\lvert y_l \rvert} \log \pi_\theta(y_l \mid x) - \gamma\right)
+$$
+
+Length normalization attacks the verbosity problem, and the average log-probability is also what decoding effectively optimizes, so training and generation agree. With no reference model, it saves memory and compute. The paper reports gains over DPO of up to 6.4 points on AlpacaEval 2 and 7.5 on Arena-Hard, with $\beta$ around 2.0 to 2.5 and $\gamma$ around 0.5 to 1.5. The trade-off is that without a reference there is no explicit anchor, so the learning rate and number of steps must do that job.
+
+**ORPO** (Odds Ratio Preference Optimization; Hong, Lee and Thorne, 2024) merges SFT and preference optimization into one stage with no reference model. It adds to the usual SFT loss on the chosen response a penalty based on the odds ratio between chosen and rejected:
+
+$$
+\mathcal{L}_{\mathrm{ORPO}} = \mathcal{L}_{\mathrm{SFT}}(y_w) - \lambda \log \sigma\!\left(\log \frac{\mathrm{odds}_\theta(y_w \mid x)}{\mathrm{odds}_\theta(y_l \mid x)}\right), \qquad \mathrm{odds}_\theta(y \mid x) = \frac{P_\theta(y \mid x)}{1 - P_\theta(y \mid x)}
+$$
+
+where $P_\theta(y \mid x)$ is the length-normalized likelihood, the exponential of the mean token log-probability. Starting from a base model, one ORPO run replaces SFT followed by DPO. In TRL 1.x it lives in `trl.experimental.orpo`.
+
+The script compares the four losses on one pair as the policy moves. Log-probabilities are in nats (natural-log units):
+
+```python
+import torch
+import torch.nn.functional as F
+
+def dpo_loss(pc, pr, rc, rr, beta=0.1):
+    """pc/pr: policy log-probs of chosen/rejected (summed over tokens), rc/rr: reference."""
+    h = (pc - rc) - (pr - rr)
+    return -F.logsigmoid(beta * h)
+
+def ipo_loss(pc, pr, rc, rr, tau=0.1):
+    h = (pc - rc) - (pr - rr)
+    return (h - 1 / (2 * tau)) ** 2
+
+def simpo_loss(pc, pr, len_c, len_r, beta=2.0, gamma=1.0):
+    return -F.logsigmoid(beta * pc / len_c - beta * pr / len_r - gamma)
+
+def orpo_or_term(pc, pr, len_c, len_r):
+    # ORPO uses length-normalized likelihoods P = exp(mean token log-prob)
+    lc, lr = pc / len_c, pr / len_r
+    log_odds = lambda lp: lp - torch.log1p(-torch.exp(lp))      # log(P / (1 - P))
+    return -F.logsigmoid(log_odds(lc) - log_odds(lr))
+
+# One preference pair, numbers in nats.
+ref_c, ref_r = torch.tensor(-40.0), torch.tensor(-42.0)          # reference log-probs
+len_c, len_r = 20, 25
+for name, (pc, pr) in {"policy = reference": (ref_c, ref_r),
+                       "chosen up 5 nats":   (ref_c + 5, ref_r),
+                       "rejected down 5":    (ref_c, ref_r - 5),
+                       "both down, gap +5":  (ref_c - 10, ref_r - 15)}.items():
+    print(f"{name:<20} DPO {dpo_loss(pc, pr, ref_c, ref_r).item():.4f}"
+          f"  IPO {ipo_loss(pc, pr, ref_c, ref_r).item():7.2f}"
+          f"  SimPO {simpo_loss(pc, pr, len_c, len_r).item():.4f}"
+          f"  ORPO-OR {orpo_or_term(pc, pr, len_c, len_r).item():.4f}")
+```
+
+```text
+policy = reference   DPO 0.6931  IPO   25.00  SimPO 1.8173  ORPO-OR 0.9016
+chosen up 5 nats     DPO 0.4741  IPO    0.00  SimPO 1.4175  ORPO-OR 0.7367
+rejected down 5      DPO 0.4741  IPO    0.00  SimPO 1.4942  ORPO-OR 0.7657
+both down, gap +5    DPO 0.4741  IPO    0.00  SimPO 1.6526  ORPO-OR 0.8216
+```
+
+Read the table row by row. DPO and IPO depend only on $h$, so all three moves that widen the gap by 5 nats score identically, including "both down", where the model became *less* likely to produce the chosen answer. With $\tau = 0.1$, IPO's target margin is $1/(2 \times 0.1) = 5$, so it is exactly satisfied at $h = 5$ and would push back if $h$ grew further. SimPO and ORPO use absolute likelihoods, so they prefer raising the chosen response over lowering everything: "both down" is their worst row among the three moves. That difference is the practical reason to consider them when you see both log-probabilities falling in a DPO run.
+
+| Method | Needs reference model | Data | Key change | Main benefit |
+|---|---|---|---|---|
+| DPO | Yes | Pairs | Implicit reward, logistic loss | Simple, stable, well understood |
+| IPO | Yes | Pairs | Squared loss to a target margin | Does not overfit deterministic labels |
+| KTO | Yes | Single responses with good or bad labels | Prospect-theory value with KL reference point | Works with thumbs-up and thumbs-down data |
+| SimPO | No | Pairs | Length-normalized reward, margin $\gamma$ | Less verbosity, lower memory |
+| ORPO | No | Pairs | SFT loss plus odds-ratio penalty | One stage from a base model |
+
+## Using TRL's DPOTrainer
+
+In practice you would use TRL, which handles chat templates, batching, reference log-probabilities and logging. The dataset needs `prompt`, `chosen` and `rejected` columns, in plain text or conversational form. This configuration is typical for a 1B to 8B model and needs a GPU:
+
+```python
+from datasets import load_dataset
+from trl import DPOConfig, DPOTrainer
+
+dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
+
+args = DPOConfig(
+    output_dir="qwen3-dpo",
+    beta=0.1,                    # KL strength (default 0.1)
+    learning_rate=5e-7,          # DPO needs far smaller rates than SFT (TRL default 1e-6)
+    loss_type=["sigmoid"],       # "ipo", "sigmoid_norm" (length-normalized), "robust", ... also exist
+    max_length=1024,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,
+    num_train_epochs=1,
+)
+trainer = DPOTrainer(model="Qwen/Qwen3-0.6B", args=args, train_dataset=dataset)
+trainer.train()
+```
+
+TRL can combine losses with weights, for example `loss_type=["sigmoid", "sft"]` and `loss_weights=[1.0, 0.2]` to reproduce Llama 3's DPO plus NLL. The logged metrics are worth learning to read: `rewards/chosen` and `rewards/rejected` are the mean implicit rewards, `rewards/margins` their difference, `rewards/accuracies` the fraction of pairs with a positive margin, and `logps/chosen` the raw log-probability of the chosen responses. A healthy run shows the margin rising and accuracy climbing well above 0.5; a falling `logps/chosen` is the "both down" warning sign.
+
+:::tip
+Before tuning $\beta$, check the data. Remove pairs where chosen and rejected are identical or differ only in whitespace, balance the lengths of chosen and rejected answers where you can, and prefer pairs sampled from your own SFT model. Data hygiene moves results more than the choice among DPO variants.
+:::
+
+## Common Mistakes
+
+- Starting DPO from a base model instead of an SFT model. DPO assumes the reference is already a reasonable assistant; the KL anchor ties the result to it.
+- Using an SFT-sized learning rate. DPO with 2e-5 on a full model usually collapses; values from 5e-7 to 5e-6 are common for full fine-tuning.
+- Including prompt tokens in the sequence log-probabilities. The prompt is shared and should cancel, but with truncation or template differences it does not, and it adds noise.
+- Training several epochs on the same pairs. DPO overfits quickly; one epoch is typical, and the margin will keep growing long after quality stops improving.
+- Judging a run by `rewards/accuracies` alone. It reaches 1.0 easily on training data; evaluate generations with a held-out judge or human comparison.
+- Forgetting the end-of-turn token in chosen and rejected responses, which leaves the model unsure where to stop.
+
+## Summary
+
+- DPO inverts the closed-form RLHF optimum to express the reward as $\beta \log \pi_\theta / \pi_{\mathrm{ref}}$ plus a term that cancels in comparisons, giving a logistic loss on preference pairs.
+- Its gradient raises the chosen and lowers the rejected response, weighted by how wrongly the implicit reward ranks them.
+- With full coverage DPO recovers the RLHF optimum exactly; responses missing from the data are unconstrained, which explains some of its drift.
+- IPO bounds the margin, KTO works with binary feedback, SimPO drops the reference and normalizes by length, ORPO folds preference learning into SFT.
+- On-policy, iterative preference data and an NLL term on chosen responses close much of the gap to PPO in practice.
+
+## Further Reading
+
+- [Direct Preference Optimization: Your Language Model is Secretly a Reward Model (Rafailov et al., 2023)](https://arxiv.org/abs/2305.18290): the DPO paper.
+- [A General Theoretical Paradigm to Understand Learning from Human Preferences (Azar et al., 2023)](https://arxiv.org/abs/2310.12036): the IPO analysis and loss.
+- [KTO: Model Alignment as Prospect Theoretic Optimization (Ethayarajh et al., 2024)](https://arxiv.org/abs/2402.01306): preference learning from binary feedback.
+- [SimPO: Simple Preference Optimization with a Reference-Free Reward (Meng et al., 2024)](https://arxiv.org/abs/2405.14734): length-normalized, reference-free.
+- [ORPO: Monolithic Preference Optimization without Reference Model (Hong et al., 2024)](https://arxiv.org/abs/2403.07691): SFT and preference learning in one loss.
+- [Zephyr: Direct Distillation of LM Alignment (Tunstall et al., 2023)](https://arxiv.org/abs/2310.16944): DPO on AI-labeled UltraFeedback.
+- [Is DPO Superior to PPO for LLM Alignment? (Xu et al., 2024)](https://arxiv.org/abs/2404.10719): a careful comparison of the two.
+- [Iterative Reasoning Preference Optimization (Pang et al., 2024)](https://arxiv.org/abs/2404.19733): DPO plus an NLL term on chosen responses.
+- [The Llama 3 Herd of Models (Grattafiori et al., 2024)](https://arxiv.org/abs/2407.21783): DPO at scale with masking and NLL regularization.
+- [TRL DPOTrainer documentation](https://huggingface.co/docs/trl/main/en/dpo_trainer): loss types, metrics and configuration.

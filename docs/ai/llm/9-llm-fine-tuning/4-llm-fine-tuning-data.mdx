@@ -1,0 +1,287 @@
+---
+title: "Preparing Fine-Tuning Data"
+description: "Build a fine-tuning dataset that works: formats and schemas, sourcing and synthetic data, cleaning and deduplication, chat-template checks, splits and decontamination."
+---
+
+# Preparing Fine-Tuning Data
+
+## Introduction
+
+The training script on the [previous page](./3-llm-fine-tuning-with-hf.mdx) is about 60 lines and the same for every project. The data is what makes a fine-tune good or bad, and it is where most of the work goes. A model trained on 1,000 clean, consistent, diverse examples usually beats one trained on 50,000 noisy ones, and no hyperparameter can fix examples that teach the wrong behavior.
+
+This page walks through building a dataset step by step:
+
+- choosing a format and a schema that match how the model will be used,
+- sourcing examples from humans, logs and stronger models, and the trade-offs of each,
+- a cleaning pipeline with exact and near-duplicate removal, length filters and eval-set decontamination, in runnable code,
+- verifying the chat template and the loss mask token by token,
+- splitting the data so the evaluation tells the truth.
+
+## The Principle: The Model Learns Everything in the Data
+
+Supervised fine-tuning minimizes cross-entropy on your examples (see [Supervised Fine-Tuning and Chat Templates](../8-llm-post-training/1-llm-supervised-fine-tuning.mdx)):
+
+$$
+\mathcal{L}(\theta) = -\frac{1}{\sum_i \lvert y^{(i)} \rvert} \sum_i \sum_{t=1}^{\lvert y^{(i)} \rvert} \log p_\theta\!\left(y^{(i)}_t \mid x^{(i)}, y^{(i)}_{<t}\right)
+$$
+
+Here $x^{(i)}$ is the prompt of example $i$ and $y^{(i)}$ its response. The loss treats every response token as a target to imitate. That has blunt consequences:
+
+- If 10 percent of your responses start with "Sure! Here is", the model learns to start 10 percent of its answers that way.
+- If some responses are wrong, the model learns to be wrong in those situations, with the same confidence as everywhere else.
+- If all responses are short, the model learns to be brief, even where it should not be.
+- If a fact appears in the responses that the model did not know, it learns to state such facts confidently, which Gekhman et al. (2024) linked to more hallucination (see [When to Fine-Tune](./0-llm-when-to-fine-tune.mdx)).
+
+The normalization in the formula also matters: the sum over tokens means long responses carry more weight than short ones. A few very long examples can dominate a small dataset.
+
+Think of the dataset as a specification written in examples. Every pattern in it, intended or not, is part of the spec.
+
+## Choosing the Format and Schema
+
+Store data as JSON Lines (one JSON object per line) in one of the formats TRL understands. For assistant-style tasks, use the conversational prompt-completion form, because it gives completion-only loss with any chat template:
+
+```json
+{
+  "prompt": [
+    {"role": "system", "content": "You extract support ticket fields as JSON."},
+    {"role": "user", "content": "Order 48213: my printer arrived with a cracked screen."}
+  ],
+  "completion": [
+    {"role": "assistant", "content": "{\"order_id\": 48213, \"product\": \"printer\", \"sentiment\": \"negative\"}"}
+  ]
+}
+```
+
+Decisions to make before collecting anything:
+
+- **The system prompt.** Use the exact system prompt you will use in production, or none at all, consistently. A model fine-tuned with one system prompt and deployed with another sees inputs unlike its training data.
+- **Single-turn or multi-turn.** If users have conversations, include multi-turn examples, with earlier assistant turns in the prompt and only the final turn as the completion (or use `messages` with `assistant_only_loss=True` to train on all assistant turns).
+- **The output contract.** For structured outputs, fix the schema, key order and formatting. Ambiguity in the examples ("sometimes `product`, sometimes `item`") becomes ambiguity in the model.
+- **Refusals and "I don't know".** Decide when the model should decline, and include those cases. A dataset with no negative examples teaches the model that every question has an answer.
+- **Tool calls.** If the model calls functions, represent calls and tool results the way the model's chat template expects (many templates have a `tools` argument and a `tool` role).
+
+## Where the Examples Come From
+
+| Source | Quality | Cost | Main risk |
+|---|---|---|---|
+| Expert-written | Highest | Highest per example | Too few; narrow style of a few writers |
+| Production logs + human corrections | High, realistic | Medium | Privacy; logs reflect old system's errors |
+| Existing public datasets | Varies | Free | License; contamination with benchmarks; mismatched style |
+| Synthetic from a stronger model | Medium to high | Low | Copies the teacher's errors and verbosity; terms of service |
+| Synthetic + automatic verification | High where verifiable | Low | Only works for checkable tasks (code, math, extraction) |
+
+**Synthetic data** is now the most common source. Self-Instruct (Wang et al., 2022) showed that a model can generate instructions and responses to train itself from a small seed set. Stanford's Alpaca (2023) applied the idea with text-davinci-003 to create 52K instruction-response pairs for under 500 US dollars and fine-tuned LLaMA 7B on them. Since then, generating with a large model and training a small one has become standard practice; it is a form of [sequence-level distillation](../8-llm-post-training/5-llm-distillation.mdx). Check the terms of service of the model you generate with: some providers restrict using outputs to train competing models.
+
+**Verification beats generation.** The best synthetic pipelines generate several candidates and keep only those that pass a check: the code runs and passes tests, the math answer matches, the JSON parses and matches the source text. This is called rejection sampling. For extraction tasks, a simple check is that every extracted value appears in the input.
+
+**Quality filtering pays off.** AlpaGasus (Chen et al., 2023) used ChatGPT to score the 52K Alpaca examples and kept about 9K high-scoring ones. The model trained on the 9K subset was rated better than the one trained on all 52K, and training was about 5.7 times faster. LIMA (Zhou et al., 2023) made the same point with 1,000 hand-curated examples. These are research results on general chat; for narrow tasks, coverage of the real input distribution matters as much as polish.
+
+## A Cleaning Pipeline in Code
+
+Raw examples from any source need cleaning. The script below runs the checks that catch most problems in practice, in order of cost:
+
+1. **Empty or broken responses.**
+2. **Boilerplate** you do not want the model to learn ("As an AI language model ...").
+3. **Length outliers**, measured in tokens of the target model's tokenizer, not characters.
+4. **Exact duplicates** after normalization (case, punctuation, whitespace), via a hash.
+5. **Near duplicates**, via MinHash signatures over word 3-grams.
+6. **Overlap with the evaluation set**, via shared 8-grams, so the test stays honest.
+
+**MinHash in brief.** The Jaccard similarity of two sets of word $n$-grams (shingles) $S_1$ and $S_2$ is $J = \lvert S_1 \cap S_2 \rvert / \lvert S_1 \cup S_2 \rvert$. For a random hash function $h$, the probability that $\min_{s \in S_1} h(s) = \min_{s \in S_2} h(s)$ equals exactly $J$, because the minimum over the union lands in the intersection with that probability. With $k$ independent hash functions, the fraction of matching minima is an unbiased estimate of $J$ with standard error $\sqrt{J(1-J)/k}$. Each document is summarized by $k$ integers instead of its full shingle set. At scale you add locality-sensitive hashing (banding) to avoid comparing all pairs; the same technique deduplicates pretraining corpora (see [Pretraining Data](../6-llm-pretraining/0-llm-pretraining-data.mdx)).
+
+```python
+import hashlib, random, re, statistics
+from transformers import AutoTokenizer
+
+random.seed(0)
+tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
+
+raw = [
+    {"prompt": "How do I reset my router?", "response": "Hold the reset button for 10 seconds, then wait for the lights to settle."},
+    {"prompt": "How do I reset my router? ", "response": "Hold the reset button for 10 seconds, then wait for the lights to settle."},
+    {"prompt": "how do i reset my ROUTER?", "response": "Hold the reset button for ten seconds, then wait for the lights to settle."},
+    {"prompt": "Can I return a laptop after 30 days?", "response": "Returns are accepted within 30 days of delivery with the receipt."},
+    {"prompt": "What is your phone number?", "response": ""},
+    {"prompt": "Printer offline", "response": "As an AI language model, I cannot access your printer."},
+    {"prompt": "Why is my monitor flickering?", "response": "Check the cable first. " * 120},
+    {"prompt": "Does the warranty cover water damage?", "response": "No. The standard warranty covers manufacturing defects only."},
+]
+eval_set = ["Can I return a laptop after 30 days of delivery?"]
+
+def normalize(s):
+    s = re.sub(r"[^\w\s]", " ", s.lower())       # drop punctuation
+    return re.sub(r"\s+", " ", s).strip()
+
+def shingles(s, n=3):
+    w = normalize(s).split()
+    return {" ".join(w[i:i + n]) for i in range(max(1, len(w) - n + 1))}
+
+def minhash(sh, num_perm=64):
+    # one salted hash per "permutation"; keep the minimum over the shingles
+    return [min(int(hashlib.md5(f"{i}:{x}".encode()).hexdigest()[:8], 16) for x in sh)
+            for i in range(num_perm)]
+
+def est_jaccard(a, b):
+    return sum(x == y for x, y in zip(a, b)) / len(a)
+
+kept, seen_exact, sigs, report = [], set(), [], []
+eval_ngrams = set().union(*(shingles(e, 8) for e in eval_set))
+for ex in raw:
+    text = ex["prompt"] + " " + ex["response"]
+    n_tok = len(tok(ex["response"])["input_ids"])
+    key = hashlib.sha256(normalize(text).encode()).hexdigest()
+    sig = minhash(shingles(text))
+    if not ex["response"].strip():
+        report.append(("empty response", ex["prompt"])); continue
+    if "as an ai language model" in normalize(ex["response"]):
+        report.append(("boilerplate refusal", ex["prompt"])); continue
+    if n_tok > 400:
+        report.append((f"too long ({n_tok} tokens)", ex["prompt"])); continue
+    if key in seen_exact:
+        report.append(("exact duplicate", ex["prompt"])); continue
+    if any(est_jaccard(sig, s) > 0.7 for s in sigs):
+        report.append(("near duplicate", ex["prompt"])); continue
+    if shingles(text, 8) & eval_ngrams:
+        report.append(("overlaps eval set", ex["prompt"])); continue
+    seen_exact.add(key); sigs.append(sig); kept.append(ex)
+
+for reason, p in report:
+    print(f"drop  {reason:<22} {p!r}")
+print(f"kept {len(kept)} of {len(raw)}")
+lens = [len(tok(e["response"])["input_ids"]) for e in kept]
+print("response tokens: min", min(lens), "median", statistics.median(lens), "max", max(lens))
+```
+
+```text
+drop  exact duplicate        'How do I reset my router? '
+drop  near duplicate         'how do i reset my ROUTER?'
+drop  overlaps eval set      'Can I return a laptop after 30 days?'
+drop  empty response         'What is your phone number?'
+drop  boilerplate refusal    'Printer offline'
+drop  too long (601 tokens)  'Why is my monitor flickering?'
+kept 2 of 8
+response tokens: min 10 median 14.0 max 18
+```
+
+Each check caught exactly one planted problem. A few details are worth noting:
+
+- The second router example differs only by a trailing space; normalization makes it an exact duplicate. The third differs in case and "10" versus "ten"; its exact hash differs, but its MinHash similarity is far above the 0.7 threshold.
+- The decontamination check normalizes punctuation too. Before that fix (an earlier version of this script), "30 days?" and "30 days of" did not share an 8-gram because of the question mark, and the overlap slipped through. Normalize the same way on both sides.
+- The thresholds (400 tokens, Jaccard 0.7, 8-grams) are illustrative. Choose them by looking at what each filter removes on your data: print 20 dropped examples per rule and check that they deserve to go.
+
+The order matters for reporting, not correctness: a real pipeline logs how many examples each rule removed, so you notice when a rule suddenly drops 40 percent of a new batch.
+
+## Checking the Chat Template and the Loss Mask
+
+The single most common silent bug in fine-tuning is a mismatch between how training text is rendered and how inference text is rendered. Render one example by hand with the model's own template, build the label mask, and look at the tokens at the boundary:
+
+```python
+import torch
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
+prompt = [{"role": "user", "content": "Capital of France?"}]
+completion = [{"role": "assistant", "content": "Paris."}]
+
+# transformers v5 returns a BatchEncoding (return_dict=True is the default)
+prompt_ids = tok.apply_chat_template(prompt, add_generation_prompt=True)["input_ids"]
+full_ids = tok.apply_chat_template(prompt + completion)["input_ids"]
+
+# The prompt rendering must be an exact prefix of the full rendering.
+assert full_ids[: len(prompt_ids)] == prompt_ids, "template is not prefix-stable"
+
+labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+print(repr(tok.decode(full_ids)))
+print(f"{len(full_ids)} tokens, {sum(l != -100 for l in labels)} carry loss")
+for t, l in list(zip(full_ids, labels))[-10:]:
+    print(f"{tok.decode([t])!r:>14}  {'loss' if l != -100 else '-'}")
+```
+
+```text
+'<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\nParis.<|im_end|>\n'
+38 tokens, 4 carry loss
+  '<|im_end|>'  -
+          '\n'  -
+'<|im_start|>'  -
+         'ass'  -
+      'istant'  -
+          '\n'  -
+       'Paris'  loss
+           '.'  loss
+  '<|im_end|>'  loss
+          '\n'  loss
+```
+
+Three lessons from these few lines:
+
+1. **The template added a system prompt we never wrote.** SmolLM2's template inserts a default system message when none is given. Many templates do something similar (Qwen3's template has its own conventions around reasoning blocks). Your training data and your production requests must go through the same template with the same system prompt, or you train on one distribution and serve another.
+2. **The end-of-turn token carries loss.** `<|im_end|>` is part of the completion, so the model learns to stop. If your pipeline strips it, or masks it, the fine-tuned model may ramble past the answer.
+3. **The prefix check matters.** The labels are built by assuming the prompt rendering is a prefix of the full rendering. Some templates change earlier text depending on what follows (for example, by removing reasoning content from earlier turns), which breaks that assumption. The assert catches it; TRL performs a similar check and refuses templates it cannot handle.
+
+## Length, Splits and Decontamination
+
+**Length.** Tokenize the whole dataset with the target tokenizer and look at the distribution of prompt and completion lengths. Set `max_length` around the 95th to 99th percentile of total length, then count how many examples would be truncated. With TRL's default `truncation_mode="keep_start"`, a truncated example loses the end of its completion, which often is the most important part (the final answer, the closing brace). It is better to drop such examples or shorten their prompts on purpose.
+
+**Balance.** Count examples per class, per task type and per source. If 80 percent of tickets are "negative", the model will lean that way when unsure. Down-sample the majority or up-sample rare but important cases (refusals, edge cases), and record what you did.
+
+**Splits.** Hold out a test set before any training or tuning, and never look at it while iterating. Split by the unit that could leak:
+
+- by **user or customer** if the same person writes many similar tickets,
+- by **time** if the model will see future data (train on January to September, test on October),
+- by **source document** if several examples are generated from one document.
+
+A random split over near-duplicate examples puts copies of training examples in the test set and inflates every score.
+
+**Decontamination.** If you will report results on a public benchmark, check your training data for overlap with it (as the script above does with 8-grams). Synthetic data from a strong model is a common contamination path, because the teacher may have memorized the benchmarks. [Benchmark Contamination and Honest Evaluation](../12-llm-evaluation/5-llm-contamination.mdx) covers detection methods in depth.
+
+## How Much Data Do You Need?
+
+There is no formula, but there is an experiment that answers it for your task: the **learning curve**. Train on 12.5, 25, 50 and 100 percent of your data with otherwise identical settings and plot the test metric against dataset size on a log axis.
+
+- If the curve is still rising steeply at 100 percent, more data will help; collect more before tuning anything else.
+- If it has flattened, more of the same data will not help; improve quality, coverage of hard cases, or the base model.
+
+Rough ranges from practice (not research guarantees): a few hundred examples can set a format or style; 1,000 to 10,000 cover a narrow task well; teaching broad new skills or a new language takes far more and approaches continued pretraining.
+
+## A Worked Scenario: From Logs to a Ticket Dataset
+
+Return to the ticket-triage task from [When to Fine-Tune](./0-llm-when-to-fine-tune.mdx). The team has 200,000 historical tickets with routing labels that agents assigned by hand, but no JSON.
+
+1. **Sample for coverage.** Take 6,000 tickets stratified by product and month, including the 2 percent that agents marked "unclear".
+2. **Draft with a strong model.** Ask a large model for the JSON, with the schema in the prompt and structured output enforced.
+3. **Verify automatically.** Keep drafts whose `order_id` appears verbatim in the ticket and whose product matches the agent's routing label. About 85 percent pass; the rest go to humans.
+4. **Review by humans.** Agents correct the failed 15 percent plus a random 5 percent of passed drafts to estimate the automatic check's error rate.
+5. **Clean.** Remove near-duplicates (template emails from the same customer are common), strip personal data that is not needed for the task, drop tickets longer than the length cutoff.
+6. **Split by customer and time.** Test set: 500 tickets from the most recent month, from customers not present in training.
+7. **Write down the spec.** A short data card: sources, filters and how many examples each removed, label distribution, known gaps.
+
+The result is perhaps 4,500 training examples whose every pattern was intended. Training on them takes minutes; building them took days. That ratio is normal.
+
+## Common Mistakes
+
+- **Different system prompts in training and production**, including default system prompts injected by the chat template.
+- **Stripping or masking the end-of-turn token**, so the model never learns to stop.
+- **Random splits over near-duplicates**, which leak training examples into the test set.
+- **Teaching facts that change**, such as prices or policies, instead of retrieving them at inference time.
+- **Copying a teacher's habits.** Synthetic data inherits verbosity, hedging and "Certainly!" openers unless you filter or rewrite them.
+- **Truncating completions silently** with a `max_length` below the long tail of the data.
+- **Not reading the data.** Before training, read 50 random examples end to end. It finds problems no filter anticipated.
+
+## Summary
+
+- The model imitates every pattern in its responses, intended or not; treat the dataset as a specification written in examples.
+- Use the conversational prompt-completion format with the exact production system prompt, a fixed output schema, and explicit refusal cases.
+- Synthetic data from a stronger model is standard; verify it automatically where possible and filter for quality, as AlpaGasus and LIMA showed.
+- Clean in stages: empty, boilerplate, length, exact duplicates, MinHash near-duplicates, eval overlap; log how many each rule removes.
+- Render examples with the real chat template, check the prompt-prefix property and the loss mask, and keep the end-of-turn token in the loss.
+- Split by user, time or source, decontaminate against benchmarks, and use a learning curve to decide whether you need more data.
+
+## Further Reading
+
+- [LIMA: Less Is More for Alignment (Zhou et al., 2023)](https://arxiv.org/abs/2305.11206) - 1,000 curated examples.
+- [AlpaGasus: Training a Better Alpaca with Fewer Data (Chen et al., 2023)](https://arxiv.org/abs/2307.08701) - LLM-scored filtering of instruction data.
+- [Self-Instruct: Aligning Language Models with Self-Generated Instructions (Wang et al., 2022)](https://arxiv.org/abs/2212.10560) - generating instruction data from a seed set.
+- [Stanford Alpaca (Taori et al., 2023)](https://crfm.stanford.edu/2023/03/13/alpaca.html) - 52K synthetic examples and the recipe that popularized it.
+- [On the Resemblance and Containment of Documents (Broder, 1997)](https://doi.org/10.1109/SEQUEN.1997.666900) - the MinHash idea.
+- [TRL dataset formats](https://huggingface.co/docs/trl/dataset_formats) - the column layouts `SFTTrainer` accepts.
+- [Transformers chat templating guide](https://huggingface.co/docs/transformers/chat_templating) - rendering, generation prompts and `generation` markers.

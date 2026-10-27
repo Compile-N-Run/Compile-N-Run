@@ -1,0 +1,256 @@
+---
+title: "The Quadratic Cost of Attention"
+description: "Derive attention's FLOPs and memory as functions of sequence length and compute real numbers for an 8B model at 8k, 128k and 1M tokens of context."
+---
+
+# The Quadratic Cost of Attention
+
+## Introduction
+
+Every token attends to every earlier token. Double the context and each token has twice as many keys to compare against, and there are twice as many tokens: four times the work. This **quadratic** growth is the most quoted limitation of the Transformer, and the reason long context windows (128k tokens, 1 million tokens) took years of engineering to become practical.
+
+But "attention is quadratic" is only part of the story. At short contexts attention is a small fraction of an LLM's compute; most FLOPs go to the weight matrices of the projections and MLPs. The quadratic term takes over only past a crossover length that depends on the model width. And during generation the problem is not FLOPs at all but the **linear** growth of the KV cache that must be read for every token.
+
+On this page you will:
+
+- Derive the FLOPs of attention and of the rest of the layer, and find the crossover length where attention dominates.
+- Derive the memory of the score matrix, the training activations and the KV cache.
+- Compute concrete numbers for Llama 3.1 8B at 8k, 128k and 1M tokens.
+- Measure the crossover on a CPU and compare with the formula.
+- Map each cost to the technique that attacks it: FlashAttention, GQA and MLA, sliding windows, sparse attention, context parallelism and linear-time alternatives.
+
+## Counting FLOPs
+
+We count a multiply-add as 2 FLOPs, the usual convention. Take one layer with $h$ heads of dimension $d_h$, attention width $d_{\text{attn}} = h d_h$, and a sequence of $T$ tokens.
+
+**Scores.** For each head, $QK^\top$ multiplies a $T \times d_h$ matrix by a $d_h \times T$ matrix: $T^2$ dot products of length $d_h$, so $2 T^2 d_h$ FLOPs.
+
+**Weighted values.** $PV$ multiplies $T \times T$ by $T \times d_h$: another $2 T^2 d_h$ FLOPs.
+
+Over all heads, full (non-causal) attention costs
+
+$$
+F_{\text{attn}} = 4\, T^2\, d_{\text{attn}} \quad \text{FLOPs per layer}
+$$
+
+Softmax and scaling add $O(T^2 h)$ elementwise operations, negligible next to this. GQA does not change this count: the number of **query** heads sets the work. (MLA in its absorbed form increases it, as the [previous page](./6-llm-mla.mdx) showed.)
+
+**Causal attention** only needs the lower triangle. Token $t$ (counting from 1) attends to $t$ keys, so the total is $\sum_{t=1}^{T} 4 t\, d_{\text{attn}} \approx 2 T^2 d_{\text{attn}}$, half of the full count. Fused kernels such as FlashAttention realize most of that saving by skipping blocks above the diagonal. Per token, averaged over the sequence, causal attention costs
+
+$$
+\frac{2 T^2 d_{\text{attn}}}{T} = 2\, T\, d_{\text{attn}} \quad \text{FLOPs per token per layer}
+$$
+
+**The rest of the layer** is matrix multiplications with weights, which cost 2 FLOPs per weight per token, independent of $T$. For a classic layer with $d_{\text{attn}} = d$ and an MLP of width $4d$, the weights are $4d^2$ (attention projections) plus $8d^2$ (MLP), so $24 d^2$ FLOPs per token.
+
+### The Crossover Length
+
+The fraction of per-token FLOPs spent in attention is
+
+$$
+\frac{2 T d}{2 T d + 24 d^2} = \frac{T}{T + 12 d}
+$$
+
+Attention matches the weight FLOPs when $T = 12d$. For a model with $d = 4096$ that is about 49,000 tokens; below that, the "quadratic" part is the smaller one. Kaplan et al. (2020, "Scaling Laws for Neural Language Models") include the same context-dependent term, $2 n_{\text{layer}} n_{\text{ctx}} d_{\text{attn}}$ FLOPs per token, in their compute accounting and note that it is a small fraction of the total when $d_{\text{model}}$ is large compared with $n_{\text{ctx}} / 12$. The familiar $6N$ FLOPs-per-token rule for training (see [Counting Parameters, FLOPs and Memory](../3-llm-transformer/6-llm-parameter-and-flop-counting.mdx)) ignores this term, which is accurate for short contexts and increasingly wrong for long ones.
+
+## Counting Memory
+
+There are three different memory costs, and they scale differently.
+
+**1. The score matrix.** A naive implementation materializes $P$ with $T^2$ entries per head. In bf16 that is $2T^2$ bytes per head per layer: 128 MiB at 8k tokens, 32 GiB at 128k. That is per head, before multiplying by the number of heads and the batch size.
+
+**2. Training activations.** For the backward pass, autograd keeps $P$ (or its pre-softmax scores) for every layer, so naive training stores $B \cdot h \cdot T^2$ values per layer. This is what made long-context training impossible before FlashAttention, which recomputes $P$ block by block in the backward pass instead of storing it. With FlashAttention the extra memory is $O(T)$ per head (the softmax statistics), and the score matrix never exists in GPU main memory. See [FlashAttention Explained](../5-llm-flash-attention/2-llm-flash-attention.mdx).
+
+**3. The KV cache.** At inference each layer stores keys and values for all previous tokens:
+
+$$
+\text{KV bytes} = 2 \cdot L \cdot h_{kv} \cdot d_h \cdot b \cdot T
+$$
+
+This grows **linearly** in $T$, but it has to be read in full for every generated token, which makes it the dominant cost of long-context serving. [MQA and GQA](./5-llm-mqa-gqa.mdx) and [MLA](./6-llm-mla.mdx) shrink its per-token size; [The KV Cache](../10-llm-inference/2-llm-kv-cache.mdx) covers its management.
+
+| Cost | Scaling in $T$ | Fixed by |
+| --- | --- | --- |
+| Attention FLOPs (prefill, training) | $T^2$ | sparsity, sliding windows, linear attention |
+| Score matrix memory | $T^2$ | FlashAttention (never materialized) |
+| KV cache size | $T$ | GQA, MLA, KV quantization, sliding windows |
+| KV cache read per decoded token | $T$ | same as above, plus sparse attention |
+
+## Real Numbers: Llama 3.1 8B at 8k, 128k and 1M
+
+Llama 3.1 8B (from its config.json: 32 layers, `hidden_size` 4096, 32 query heads and 8 KV heads of dimension 128, `intermediate_size` 14336, vocabulary 128,256 with an untied output layer) supports a 128k context. The next script computes, per token and for a full prefill, the weight FLOPs, the causal attention FLOPs, the size of one naive score matrix and the KV cache:
+
+```python
+# Attention cost for Llama-3.1-8B (config.json: 32 layers, d_model 4096, 32 query heads,
+# 8 KV heads, head_dim 128, intermediate_size 14336, vocab 128256, untied embeddings).
+L, d, h, h_kv, hd, ff, V = 32, 4096, 32, 8, 128, 14336, 128_256
+d_attn = h * hd                                                     # 4096
+
+# Weight-matrix FLOPs per token: 2 FLOPs (multiply + add) per weight.
+per_layer = d * d_attn * 2 + d * h_kv * hd * 2 + 3 * d * ff         # Wq, Wo, Wk, Wv, SwiGLU
+weight_flops = 2 * (L * per_layer + d * V)                          # + LM head
+print(f"weight FLOPs per token: {weight_flops / 1e9:.1f} GFLOP")
+
+GiB, TiB = 2**30, 2**40
+print(f"{'context':>8} {'attn GFLOP/tok':>15} {'attn share':>11} {'prefill PFLOP':>14} "
+      f"{'scores/head/layer':>18} {'KV cache':>10}")
+for T in [8_192, 131_072, 1_048_576]:
+    # Causal: token t attends to t keys; QK^T and PV cost 2*t*d_attn FLOPs each.
+    # Averaged over the sequence that is 2 * T * d_attn per layer per token.
+    attn_flops = 2 * T * d_attn * L
+    prefill = T * (weight_flops + attn_flops)
+    scores = T * T * 2                                              # one bf16 T x T matrix
+    kv = 2 * L * h_kv * hd * 2 * T                                  # K and V, bf16
+    fmt = lambda b: f"{b / TiB:.1f} TiB" if b >= TiB else f"{b / GiB:.2f} GiB"
+    print(f"{T:>8} {attn_flops / 1e9:15.1f} {attn_flops / (attn_flops + weight_flops):11.0%} "
+          f"{prefill / 1e15:14.2f} {fmt(scores):>18} {fmt(kv):>10}")
+```
+
+```text
+weight FLOPs per token: 15.0 GFLOP
+ context  attn GFLOP/tok  attn share  prefill PFLOP  scores/head/layer   KV cache
+    8192             2.1         13%           0.14           0.12 GiB   1.00 GiB
+  131072            34.4         70%           6.47          32.00 GiB  16.00 GiB
+ 1048576           274.9         95%         303.97            2.0 TiB 128.00 GiB
+```
+
+(The 1M row is hypothetical for this model, whose window is 128k; it shows where the trend goes.)
+
+What the table says:
+
+- **At 8k tokens, attention is 13% of the compute.** Optimizing the MLPs and projections matters more. The quadratic term is real but small.
+- **At 128k, attention is 70%.** Prefilling a full 128k prompt costs 6.5 PFLOP. On an H100 at its peak dense bf16 rate of about 989 TFLOP/s that is 6.5 seconds of pure compute; real kernels reach a fraction of peak, so expect 10 seconds or more before the first output token on one GPU.
+- **At 1M, attention is 95%.** The prefill grows to 304 PFLOP, about 5 minutes at peak on one GPU. Going from 128k to 1M multiplied the context by 8 and the prefill cost by 47.
+- **A naive score matrix is impossible beyond short contexts.** 32 GiB per head per layer at 128k, 2 TiB at 1M. Without FlashAttention-style kernels, long context could not be trained or served at all.
+- **The KV cache is linear but large.** 16 GiB per sequence at 128k with GQA, already the size of the model's bf16 weights (about 16 GB). At 1M it is 128 GiB, more than one 80 GB GPU holds.
+
+### Decoding: Linear per Token, but Memory-Bound
+
+For each generated token at context length $T$, attention does $4 T d_{\text{attn}} L$ FLOPs (one query against $T$ keys), small compared with prefill. But it must **read** the whole KV cache. At 128k tokens that is 16 GiB per token per sequence; at 3.35 TB/s of H100 memory bandwidth that alone takes about 5 ms, about as long as reading all the model weights (16 GB). The weights are shared by every sequence in a batch, but each sequence has its own cache, so at long context the cache reads dominate and limit how many requests fit and how fast each one goes. This is the memory-bound regime analyzed on the [MQA and GQA page](./5-llm-mqa-gqa.mdx) and in [How LLM Inference Works](../10-llm-inference/0-llm-inference-overview.mdx).
+
+## Experiment: Watching the Crossover
+
+The formula $T / (T + 12d)$ predicts what fraction of a layer's time attention should take. Let us check it on a CPU with a small layer, $d = 256$, so the crossover should be near $12 \times 256 = 3{,}072$ tokens. We time the weight matrices (QKV, output projection and an MLP of width $4d$) separately from the causal attention computation:
+
+```python
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+torch.set_num_threads(4)
+d, h = 256, 4                                        # d_model and heads of a small layer
+qkv, proj = nn.Linear(d, 3 * d), nn.Linear(d, d)
+mlp = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+
+
+def timed(fn, reps=3):
+    fn()
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    return (time.perf_counter() - t0) / reps * 1e3
+
+
+print(f"{'T':>6} {'linear ms':>10} {'attention ms':>13} {'attn share':>11} {'theory':>7}")
+with torch.no_grad():
+    for T in [256, 1024, 4096, 8192]:
+        x = torch.randn(1, T, d)
+        q, k, v = qkv(x).view(1, T, 3, h, d // h).permute(2, 0, 3, 1, 4)   # each (1, h, T, d/h)
+        t_lin = timed(lambda: (qkv(x), proj(x), mlp(x)))
+        t_att = timed(lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True))
+        theory = T / (T + 12 * d)                     # causal attention FLOPs / all FLOPs
+        print(f"{T:>6} {t_lin:10.1f} {t_att:13.1f} {t_att / (t_att + t_lin):11.0%} {theory:7.0%}")
+```
+
+```text
+     T  linear ms  attention ms  attn share  theory
+   256        3.6           0.4         10%      8%
+  1024       10.8           3.1         22%     25%
+  4096       43.5          43.2         50%     57%
+  8192       86.0         209.9         71%     73%
+```
+
+The linear part grows in proportion to $T$ (3.6 ms to 86 ms over a 32-fold increase); the attention part grows roughly with $T^2$ (0.4 ms to 210 ms). The measured share of time tracks the FLOP formula closely, and the two costs cross between 3k and 4k tokens as predicted. Absolute times depend on your CPU; the shape does not, as long as the machine is otherwise idle. Background load makes the short timings noisy, so rerun a few times if the numbers look erratic.
+
+## Is the Quadratic Cost Unavoidable?
+
+For **exact** softmax attention, essentially yes. Keles, Wijewardena and Hegde (2023, "On The Computational Complexity of Self-Attention") proved that computing self-attention in time significantly below $T^2$ would contradict the Strong Exponential Time Hypothesis, a standard assumption in complexity theory, and that this holds even for approximate computation within a small error. So every sub-quadratic method changes **what** is computed, not just how.
+
+The approaches the field uses, roughly in order of how much they change the model:
+
+| Approach | What changes | Cost | Used by |
+| --- | --- | --- | --- |
+| FlashAttention | nothing, exact; tiled computation | FLOPs still $T^2$, memory $O(T)$ | essentially every modern stack |
+| GQA, MLA | fewer cached bytes per token | KV cache smaller, FLOPs unchanged | Llama 3, Qwen3, DeepSeek-V3 |
+| Sliding window in some layers | local layers see only $w$ recent tokens | $O(T w)$ in those layers | Mistral 7B (4096), Gemma 3 (1024, 5 local per global), gpt-oss (128, alternating) |
+| Learned sparse selection | each query attends to top-$k$ chosen tokens | $O(T k)$ main attention plus a cheap indexer | DeepSeek-V3.2-Exp ($k$ = 2048) |
+| Context parallelism | split the sequence across GPUs | same FLOPs, spread out | long-context training and serving |
+| Linear attention, state space models | replace softmax attention in some or all layers | $O(T)$ | hybrid models |
+
+Sliding windows are worth a quick calculation, because they show why the hybrid local/global pattern is popular. Take the same 8B-sized model but let 5 of every 6 layers attend only to the last 1,024 tokens, like Gemma 3:
+
+```python
+# Same Llama-3.1-8B-sized model, but 5 of every 6 layers use a 1,024-token sliding window
+# (the local:global pattern of Gemma 3). Attention FLOPs per token and KV cache at 128k tokens.
+L, d_attn, kv_bytes_per_layer_token = 32, 4096, 2 * 8 * 128 * 2
+T, window = 131_072, 1_024
+n_global, n_local = 6, 26                       # about one layer in six stays global
+
+full = 2 * T * d_attn * L
+mixed = 2 * T * d_attn * n_global + 2 * window * d_attn * n_local
+kv_full = kv_bytes_per_layer_token * T * L
+kv_mixed = kv_bytes_per_layer_token * (T * n_global + window * n_local)
+print(f"global layers: {n_global}, local layers: {n_local}")
+print(f"attention GFLOP/token: all global {full / 1e9:.1f}  mixed {mixed / 1e9:.1f}")
+print(f"KV cache GiB:          all global {kv_full / 2**30:.1f}  mixed {kv_mixed / 2**30:.2f}")
+```
+
+```text
+global layers: 6, local layers: 26
+attention GFLOP/token: all global 34.4  mixed 6.7
+KV cache GiB:          all global 16.0  mixed 3.10
+```
+
+Attention FLOPs drop five-fold and the KV cache from 16 GiB to 3.1 GiB, while the global layers keep the ability to retrieve information from anywhere in the context. The quadratic term is still there in the 6 global layers, just with a smaller constant. The details of sliding windows, attention sinks and learned sparsity are in [Sliding Window, Sparse and Linear Attention](../5-llm-flash-attention/5-llm-sparse-and-linear-attention.mdx); splitting a sequence across GPUs is in [Ring Attention and Context Parallelism](../5-llm-flash-attention/6-llm-ring-attention.mdx); and linear-time layers are in [State Space Models and Mamba](../13-llm-advanced-architectures/1-llm-state-space-models.mdx) and [Hybrid Models](../13-llm-advanced-architectures/2-llm-hybrid-models.mdx).
+
+## Worked Scenario: Answering a Question About a 1M-Token Codebase
+
+Suppose someone wants to paste a whole codebase, 1 million tokens, into a model with the shape of Llama 3.1 8B extended to a 1M context, and ask one question. What does it take?
+
+1. **Prefill compute.** From the table, about 304 PFLOP, 95% of it attention. On one H100 at a realistic 40% of peak (about 400 TFLOP/s) that is roughly 760 seconds, almost 13 minutes, before the first answer token. Eight GPUs with context parallelism bring it to under 2 minutes, if the communication overlaps well.
+2. **KV cache.** 128 GiB in bf16, larger than an 80 GB GPU. It must be split across GPUs, quantized (8-bit halves it, see [KV Cache Compression and Quantization](../11-llm-quantization/4-llm-kv-cache-quantization.mdx)), or reduced by architecture.
+3. **Decode.** Each answer token reads the whole 128 GiB cache: about 40 ms per token at the bandwidth of one H100, so a 500-token answer takes 20 seconds or more. Spreading the cache over 8 GPUs divides the read time by 8 but adds communication at every step.
+4. **Training.** To be good at 1M tokens, the model must have seen such lengths during training, where the quadratic cost is paid again in the forward and backward passes for every long sequence. This is why long-context training is usually a short final stage on top of short-context pretraining (see [Extending Context](../4-llm-positional-encoding/6-llm-context-extension.mdx)).
+
+Every number in this list is dominated by attention. A model with MLA would shrink step 2 and step 3 by an order of magnitude; a model with mostly sliding-window layers would shrink steps 1 to 3. That is why the architecture of long-context models is, to a large extent, the architecture of their attention.
+
+## Common Mistakes
+
+- **Saying attention dominates LLM compute at every length.** Below about $12 d$ tokens the weight matrices cost more. For an 8B model at 4k tokens attention is a small slice.
+- **Forgetting the factor of 2 for causal masking**, or assuming it is realized automatically. A naive implementation computes the full matrix and masks it afterwards; fused kernels skip the masked blocks.
+- **Using the $6N$ rule at long context.** It omits the attention term, which is 70% of compute at 128k for an 8B model.
+- **Confusing FlashAttention's savings.** It removes the $T^2$ **memory** and speeds things up through fewer memory transfers, but the FLOPs stay quadratic.
+- **Counting GQA as a FLOP reduction.** It reduces the KV cache, not the attention arithmetic, which is set by the number of query heads.
+- **Ignoring decode.** At long context the cost per generated token is set by reading the KV cache, which grows linearly and is not shared across the batch.
+- **Believing a sub-quadratic trick is free.** Exact attention cannot be computed in sub-quadratic time under standard assumptions; every faster method changes what the model can attend to.
+
+## Summary
+
+- Full attention costs $4 T^2 d_{\text{attn}}$ FLOPs per layer; causal attention about half, or $2 T d_{\text{attn}}$ per token on average.
+- Weight matrices cost about $24 d^2$ FLOPs per token per layer, so attention dominates only beyond $T \approx 12 d$ (about 49k tokens for $d = 4096$).
+- For Llama 3.1 8B, attention is 13% of compute at 8k, 70% at 128k and 95% at 1M; a 1M-token prefill costs about 304 PFLOP.
+- A naive score matrix needs $2T^2$ bytes per head per layer (32 GiB at 128k), which FlashAttention avoids by never materializing it; the FLOPs remain quadratic.
+- The KV cache grows linearly (128 KiB per token for Llama 3.1 8B, 16 GiB at 128k) and must be read for every generated token, which makes decoding memory-bound.
+- Exact attention is quadratic under standard complexity assumptions; practical models combine FlashAttention, GQA or MLA, sliding windows, learned sparsity, context parallelism and linear-time layers.
+
+## Further Reading
+
+- [Attention Is All You Need (Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762): table 1 compares the per-layer complexity of self-attention, recurrence and convolution.
+- [Scaling Laws for Neural Language Models (Kaplan et al., 2020)](https://arxiv.org/abs/2001.08361): table 1 counts parameters and FLOPs, including the context-dependent attention term.
+- [On The Computational Complexity of Self-Attention (Keles, Wijewardena, Hegde, 2023)](https://arxiv.org/abs/2209.04881): the conditional quadratic lower bound.
+- [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness (Dao et al., 2022)](https://arxiv.org/abs/2205.14135): removing the $T^2$ memory cost.
+- [Gemma 3 Technical Report (Gemma Team, 2025)](https://arxiv.org/abs/2503.19786): the 5:1 local-to-global layer pattern with 1,024-token windows.
+- [Mistral 7B (Jiang et al., 2023)](https://arxiv.org/abs/2310.06825): sliding window attention in an open model.
+- [NVIDIA H100 Tensor Core GPU](https://www.nvidia.com/en-us/data-center/h100/): the compute and bandwidth figures used on this page.

@@ -1,0 +1,346 @@
+---
+title: "Mixed Precision: FP32, BF16, FP16 and FP8 Training"
+description: "How floating-point formats work, why LLMs train in BF16 with FP32 master weights, loss scaling for FP16, and how FP8 training with fine-grained scaling works."
+---
+
+# Mixed Precision: FP32, BF16, FP16 and FP8 Training
+
+## Introduction
+
+Every large language model trained since about 2020 does most of its arithmetic in 16-bit numbers, and the newest ones use 8 bits. The reason is simple: on an NVIDIA H100, dense BF16 matrix multiplication peaks at about 989 TFLOPS, FP8 at about twice that, while plain FP32 math on the non-tensor-core units is more than ten times slower. Halving the bytes per number also halves memory traffic and communication volume.
+
+Lower precision is not free. A 16-bit number has fewer bits for the exponent (range) or the mantissa (precision), and training breaks in specific, predictable ways when values underflow, overflow or get rounded away. This page explains the formats bit by bit, shows each failure mode in a few lines of PyTorch, and then walks through the standard recipes: FP16 with loss scaling, BF16 with FP32 master weights through `torch.autocast`, and FP8 training with fine-grained scaling as used by DeepSeek-V3.
+
+## How Floating-Point Formats Work
+
+A floating-point number stores a sign bit $s$, an exponent $e$ with $E$ bits and a mantissa (fraction) $f$ with $M$ bits. For normal numbers its value is
+
+$$
+x = (-1)^s \cdot 2^{\,e - \mathrm{bias}} \cdot \left(1 + \frac{f}{2^M}\right)
+$$
+
+The exponent bits set the **range**: the largest and smallest magnitudes you can represent. The mantissa bits set the **precision**: the gap between neighboring numbers relative to their size. That relative gap is the machine epsilon, $2^{-M}$: the distance from 1.0 to the next representable number.
+
+| Format | Sign, exponent, mantissa bits | Max value | Epsilon | Typical use |
+| --- | --- | --- | --- | --- |
+| FP32 | 1, 8, 23 | $3.4 \times 10^{38}$ | $1.2 \times 10^{-7}$ | master weights, optimizer states, reductions |
+| TF32 | 1, 8, 10 (stored as 32 bits) | same as FP32 | $9.8 \times 10^{-4}$ | tensor core matmul input mode for FP32 code |
+| FP16 | 1, 5, 10 | 65,504 | $9.8 \times 10^{-4}$ | older mixed precision (V100 era) |
+| BF16 | 1, 8, 7 | $3.4 \times 10^{38}$ | $7.8 \times 10^{-3}$ | standard LLM training format |
+| FP8 E4M3 | 1, 4, 3 | 448 | 0.125 | forward activations and weights |
+| FP8 E5M2 | 1, 5, 2 | 57,344 | 0.25 | gradients (in many recipes) |
+
+BF16 ("brain floating point", from Google Brain) is FP32 with the mantissa cut from 23 to 7 bits. It keeps FP32's full range and gives up precision. FP16 makes the opposite trade: three more mantissa bits, but a range that tops out at 65,504 and has its smallest normal value at about $6 \times 10^{-5}$. For training, range turns out to matter more than precision, which is why BF16 won.
+
+The FP8 formats were standardized in "FP8 Formats for Deep Learning" (Micikevicius et al., 2022). E4M3 squeezes out extra range by not representing infinity and keeping only one NaN pattern, which raises its maximum from 240 to 448.
+
+```python
+import torch
+
+fmts = [("float32", torch.float32), ("float16", torch.float16), ("bfloat16", torch.bfloat16),
+        ("float8_e4m3fn", torch.float8_e4m3fn), ("float8_e5m2", torch.float8_e5m2)]
+print(f"{'dtype':14s} {'bits':>4s} {'max':>11s} {'smallest normal':>16s} {'eps':>10s}")
+for name, dt in fmts:
+    f = torch.finfo(dt)
+    print(f"{name:14s} {f.bits:4d} {f.max:11.4g} {f.smallest_normal:16.4g} {f.eps:10.4g}")
+
+# 1) Precision: how close to 1.0 can a number be and still differ from 1.0?
+x = torch.tensor(1.0 + 1e-3)
+print("\n1 + 0.001 stored as fp16:", x.half().item(), " as bf16:", x.bfloat16().item())
+
+# 2) Range: a small gradient underflows to zero in fp16 but not in bf16.
+g = torch.tensor(1e-8)
+print("gradient 1e-8 as fp16:", g.half().item(), " as bf16:", g.bfloat16().item())
+print("70000 as fp16:", torch.tensor(70000.0).half().item(), " as bf16:", torch.tensor(70000.0).bfloat16().item())
+
+# 3) Accumulation: adding many small updates to a weight stored in low precision.
+w32, w16 = torch.tensor(1.0), torch.tensor(1.0, dtype=torch.bfloat16)
+for _ in range(1000):
+    w32 += 1e-4
+    w16 += torch.tensor(1e-4, dtype=torch.bfloat16)
+print(f"1.0 + 1000 * 1e-4: fp32 weight {w32.item():.4f}, bf16 weight {w16.item():.4f}")
+```
+
+```text
+dtype          bits         max  smallest normal        eps
+float32          32   3.403e+38        1.175e-38  1.192e-07
+float16          16    6.55e+04        6.104e-05  0.0009766
+bfloat16         16    3.39e+38        1.175e-38   0.007812
+float8_e4m3fn     8         448          0.01562      0.125
+float8_e5m2       8   5.734e+04        6.104e-05       0.25
+
+1 + 0.001 stored as fp16: 1.0009765625  as bf16: 1.0
+gradient 1e-8 as fp16: 0.0  as bf16: 1.0011717677116394e-08
+70000 as fp16: inf  as bf16: 70144.0
+1.0 + 1000 * 1e-4: fp32 weight 1.1000, bf16 weight 1.0000
+```
+
+Each line shows a failure mode:
+
+1. **Rounding.** BF16 has only 7 mantissa bits, so near 1.0 the next number is $1 + 2^{-7} = 1.0078$; adding 0.001 rounds back to exactly 1.0. FP16 keeps it.
+2. **Underflow and overflow.** A gradient of $10^{-8}$ becomes 0 in FP16, and 70,000 becomes infinity. BF16 handles both (with a coarse rounding of 70,000 to 70,144).
+3. **Swamping.** A weight of 1.0 stored in BF16 never changes when you add $10^{-4}$ a thousand times, because each addition is rounded away. In FP32 the weight correctly reaches 1.1. This is the reason optimizers keep an FP32 copy of the weights: individual updates of size learning rate times gradient are usually much smaller than the weight itself.
+
+## Mixed Precision: The Original FP16 Recipe
+
+Micikevicius et al. ("Mixed Precision Training", 2017) established the recipe that every framework still follows in some form. It has three parts.
+
+**FP32 master weights.** The optimizer holds the weights in FP32. Before each forward pass a 16-bit copy is made for the matrix multiplications. The update is applied to the FP32 copy, so small updates accumulate correctly (failure mode 3 above).
+
+**FP32 accumulation.** Matrix multiplications multiply 16-bit inputs but sum the products in FP32 inside the tensor cores. Reductions such as softmax sums, layer norm statistics and the loss are computed in FP32.
+
+**Loss scaling.** Many gradient values are smaller than FP16's smallest normal number and would underflow to zero (failure mode 2). Multiply the loss by a large factor $S$ before the backward pass; by the chain rule every gradient is multiplied by $S$ too, which lifts them into FP16's range. Divide the gradients by $S$ before the optimizer step. **Dynamic** loss scaling starts with a large $S$, halves it whenever a gradient overflows to infinity or NaN (and skips that step), and doubles it again after a run of good steps. PyTorch's `GradScaler` starts at $S = 65{,}536$, halves on overflow and doubles after 2,000 clean steps.
+
+```python
+import torch
+
+torch.manual_seed(0)
+# Runs on a CUDA GPU. FP16 autocast needs a GradScaler; BF16 does not.
+model = torch.nn.Linear(1024, 1024).cuda()
+opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+scaler = torch.amp.GradScaler("cuda")             # init_scale=65536, growth_interval=2000
+
+x = torch.randn(32, 1024, device="cuda")
+for step in range(10):
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        out = model(x)                            # matmul runs in fp16
+        loss = out.pow(2).mean()                  # pow and mean are autocast to fp32
+    opt.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()                 # gradients are multiplied by the scale
+    scaler.unscale_(opt)                          # divide back before clipping
+    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(opt)                              # skipped if any gradient is inf or nan
+    scaler.update()                               # adjust the scale for the next step
+    if step in (0, 9):
+        print(f"step {step}: out {out.dtype}, loss {loss.dtype} {loss.item():.4f}, "
+              f"grad norm {gnorm.item():.4f}, scale {scaler.get_scale():.0f}")
+print(f"weights stay {model.weight.dtype}; peak memory {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
+```
+
+Measured on an NVIDIA RTX 4060 Ti (8 GB, Ada, sm_89) with PyTorch 2.14:
+
+```text
+step 0: out torch.float16, loss torch.float32 0.3290, grad norm 0.2056, scale 65536
+step 9: out torch.float16, loss torch.float32 0.1981, grad norm 0.1582, scale 65536
+weights stay torch.float32; peak memory 36 MiB
+```
+
+The matmul output is FP16 while autocast computes the loss in FP32, the master weights stay FP32, and the scale stays at 65,536 because no gradient overflowed in these 10 steps. If one had, `scaler.step` would have skipped that update and `scaler.update` would have halved the scale.
+
+FP16 training of large Transformers was fragile even with all three parts. Activations in some layers grow past 65,504, loss-scale overflows skip steps, and hand-tuned exceptions pile up. Several early large models trained in FP16 reported instabilities, and the field moved to BF16 as soon as hardware supported it (Google TPUs, then NVIDIA A100 in 2020).
+
+## BF16 Training with Autocast
+
+BF16 has FP32's exponent, so gradients do not underflow and loss scaling is unnecessary. The remaining issue is precision, handled by the same FP32 master weights and FP32 reductions. In PyTorch this is `torch.autocast`: weights stay FP32 in the model, and inside the context each operation runs in the dtype that PyTorch's op lists assign to it. Matrix multiplications and convolutions run in BF16; operations that need range or precision, such as softmax, `log_softmax`, layer norm, losses and large sums, run in FP32.
+
+Autocast works on CPU too, so the comparison below runs anywhere. It trains the same MLP three ways: FP32, BF16 autocast with FP32 weights, and "pure" BF16 where weights, gradients and Adam states are all BF16:
+
+```python
+import torch
+import torch.nn as nn
+
+def train(precision, steps=300):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, 256), nn.GELU(), nn.Linear(256, 10))
+    if precision == "pure_bf16":
+        model = model.to(torch.bfloat16)            # weights, grads and Adam states all in bf16
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    gen = torch.Generator().manual_seed(1)
+    x = torch.randn(512, 64, generator=gen)
+    y = (x[:, :10].argmax(dim=1))                   # a simple learnable rule
+    for step in range(steps):
+        if precision == "autocast_bf16":
+            # fp32 master weights; matmuls run in bf16; loss computed in fp32
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                logits = model(x)
+            loss = nn.functional.cross_entropy(logits.float(), y)
+        else:
+            inp = x.to(next(model.parameters()).dtype)
+            loss = nn.functional.cross_entropy(model(inp).float(), y)
+        opt.zero_grad(); loss.backward(); opt.step()
+    if precision == "autocast_bf16":
+        print("  inside autocast the logits dtype is", logits.dtype, "; weights stay", model[0].weight.dtype)
+    return loss.item()
+
+for p in ["fp32", "autocast_bf16", "pure_bf16"]:
+    print(f"{p:14s} final loss {train(p):.4f}")
+```
+
+```text
+fp32           final loss 0.0006
+  inside autocast the logits dtype is torch.bfloat16 ; weights stay torch.float32
+autocast_bf16  final loss 0.0006
+pure_bf16      final loss 0.0032
+```
+
+Autocast matches FP32 exactly here, while pure BF16 is clearly worse: its weight updates are partly rounded away. On a large run the gap can grow into a real loss difference or stall progress late in training, when learning rates and updates are small.
+
+The memory picture for one parameter in standard BF16 mixed-precision training with AdamW:
+
+| Item | Bytes per parameter |
+| --- | --- |
+| BF16 weights used in forward and backward | 2 |
+| BF16 gradients | 2 |
+| FP32 master weights | 4 |
+| FP32 Adam first moment | 4 |
+| FP32 Adam second moment | 4 |
+| **Total** | **16** |
+
+Implementations vary: PyTorch autocast keeps FP32 weights and casts them per operation, while FSDP's `MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)` gathers BF16 parameters and reduces gradients in FP32. The 16-bytes-per-parameter total is the number the ZeRO paper uses, and the [distributed training page](./5-llm-distributed-training.mdx) builds on it. A 7B model needs 112 GB for these states alone, before any activations.
+
+Where can you save more? Some recipes keep the Adam moments in BF16 (DeepSeek-V3 does) or use 8-bit optimizer states, and some use stochastic rounding or Kahan-compensated summation so that a BF16 master copy can still accumulate small updates. These are research-grade choices; FP32 master weights remain the default.
+
+## FP8 Training
+
+FP8 halves the bytes again and, on Hopper and Blackwell GPUs, doubles matmul throughput over BF16. With only 3 mantissa bits (E4M3) or 2 (E5M2) and a narrow range, though, raw casting destroys information. The solution is **scaling**: before casting, divide each tensor (or block of a tensor) by a scale factor so its largest magnitude lands near the format's maximum, and multiply the scale back after the matmul.
+
+$$
+\hat x = \mathrm{fp8}\!\left(\frac{x}{s}\right) \cdot s, \qquad s = \frac{\max \lvert x \rvert}{448}
+$$
+
+The question is how many values share one scale. One scale per tensor is cheap but fragile: LLM activations contain rare outliers that are hundreds or thousands of times larger than typical values. With a per-tensor scale, one outlier pushes every other value down into FP8's subnormal range, where only a few bits of precision remain. Per-block scaling confines the damage to the block that contains the outlier:
+
+```python
+import torch
+
+torch.manual_seed(0)
+E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max          # 448
+
+def fp8_roundtrip(x, scale):
+    """Quantize x / scale to E4M3, then dequantize: what an FP8 matmul input really sees."""
+    return (x / scale).to(torch.float8_e4m3fn).to(torch.float32) * scale
+
+def per_tensor(x):
+    scale = x.abs().max() / E4M3_MAX                       # one scale for the whole tensor
+    return fp8_roundtrip(x, scale)
+
+def per_tile(x, tile=128):
+    """DeepSeek-V3 style for activations: one scale per 1 x 128 slice of each row."""
+    t = x.view(x.shape[0], -1, tile)                       # (rows, n_tiles, 128)
+    scale = t.abs().amax(dim=-1, keepdim=True) / E4M3_MAX  # (rows, n_tiles, 1)
+    return fp8_roundtrip(t, scale).view_as(x)
+
+x = torch.randn(64, 1024)                                   # (tokens, channels) activations
+x[3, 17] = 200_000.0                                        # one huge outlier in token 3
+
+def rel_err(a, b):
+    return ((a - b).norm() / b.norm()).item()
+
+rest = slice(4, None)                                       # tokens that have no outlier
+print(f"per-tensor scale {x.abs().max().item() / E4M3_MAX:.1f}: "
+      f"error on the other tokens {rel_err(per_tensor(x)[rest], x[rest]):.4f}")
+print(f"per 1x128 tile scales:  error on the other tokens {rel_err(per_tile(x)[rest], x[rest]):.4f}")
+clean = x.clone(); clean[3, 17] = 0.0
+print(f"no outlier at all, per-tensor: error {rel_err(per_tensor(clean), clean):.4f}")
+```
+
+```text
+per-tensor scale 446.4: error on the other tokens 0.2518
+per 1x128 tile scales:  error on the other tokens 0.0257
+no outlier at all, per-tensor: error 0.0265
+```
+
+Without outliers, per-tensor E4M3 has a relative error of about 2.6%, which is just the 3-bit mantissa. One outlier of 200,000 raises the error on every other token to 25%; with one scale per 128 values the other tokens keep their 2.6%.
+
+### Three Generations of FP8 Recipes
+
+**Per-tensor delayed scaling.** NVIDIA's Transformer Engine (2022, with H100) computes each tensor's scale from a history of the maximum absolute values seen in previous iterations, so no extra pass over the data is needed. It used E4M3 for forward tensors and E5M2 for gradients, which need more range.
+
+**Fine-grained scaling (DeepSeek-V3, 2024).** DeepSeek-V3 was the first widely documented frontier-scale model trained with FP8 matmuls. Its recipe:
+
+- activations are scaled per $1 \times 128$ tile (per token, per 128 channels), weights per $128 \times 128$ block;
+- E4M3 for all tensors, including gradients, made possible by the small blocks;
+- higher-precision accumulation: H800 tensor cores keep only about 14 bits when accumulating FP8 products, so partial sums are promoted to FP32 registers every 128 elements of the inner dimension;
+- the embedding, output head, MoE gating, normalization and attention stay in BF16 or FP32; master weights, weight gradients and optimizer states are kept in higher precision (the Adam moments in BF16).
+
+DeepSeek reported that the loss of the FP8 model stayed within 0.25% of a BF16 baseline.
+
+**Microscaling (MX) formats.** Blackwell GPUs support block scaling in hardware with the Open Compute Project MX formats: blocks of 32 elements share one power-of-two scale stored as an 8-bit exponent (E8M0). MXFP8 makes DeepSeek-style fine-grained scaling cheap enough to be the default. The 4-bit variants (MXFP4 and NVIDIA's NVFP4) are covered in [FP8, MXFP4 and NVFP4](../11-llm-quantization/3-llm-fp8-and-fp4.mdx).
+
+In PyTorch, `torchao` provides FP8 training for `nn.Linear` layers:
+
+```python
+# Needs an FP8-capable GPU (sm_89 Ada or newer: RTX 40xx, L4, H100, B200) and torchao.
+import copy
+import torch
+from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+
+torch.manual_seed(0)
+d, d_ff, tokens = 2048, 8192, 8192
+base = torch.nn.Sequential(torch.nn.Linear(d, d_ff, bias=False), torch.nn.SiLU(),
+                           torch.nn.Linear(d_ff, d, bias=False)).cuda().to(torch.bfloat16)
+
+def run(model, name, steps=30):
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    model = torch.compile(model)                             # needed for competitive speed
+    torch.manual_seed(1)
+    x = torch.randn(tokens, d, device="cuda", dtype=torch.bfloat16)
+    y = torch.randn(tokens, d, device="cuda", dtype=torch.bfloat16)
+    for step in range(steps):
+        loss = (model(x).float() - y.float()).pow(2).mean()
+        loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
+    print(f"{name:16s} loss after {steps} steps {loss.item():.5f}  "
+          f"peak memory {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+
+run(copy.deepcopy(base), "bf16")
+torch.cuda.reset_peak_memory_stats()
+for recipe in ["tensorwise", "rowwise"]:
+    fp8 = copy.deepcopy(base)
+    convert_to_float8_training(fp8, config=Float8LinearConfig.from_recipe_name(recipe),
+                               module_filter_fn=lambda mod, fqn: mod.in_features % 16 == 0
+                                                                 and mod.out_features % 16 == 0)
+    run(fp8, f"fp8 {recipe}")
+    torch.cuda.reset_peak_memory_stats()
+print("first layer is now", type(fp8[0]).__name__)
+```
+
+Measured on an NVIDIA RTX 4060 Ti (8 GB, Ada, sm_89) with PyTorch 2.14 and torchao 0.18. FP8 training works on this consumer GPU: Ada's tensor cores support FP8 matmuls, as do Hopper and Blackwell.
+
+```text
+bf16             loss after 30 steps 0.86865  peak memory 0.89 GiB
+fp8 tensorwise   loss after 30 steps 0.87003  peak memory 0.78 GiB
+fp8 rowwise      loss after 30 steps 0.86956  peak memory 0.98 GiB
+first layer is now Float8Linear
+```
+
+Both FP8 recipes track the BF16 loss to within about 0.2% after 30 steps, and the linear layers have been swapped for torchao's `Float8Linear`. The script reports no timings on purpose: the GPU was shared with other jobs while it ran, so step times varied by more than the FP8 speedup. Benchmark on a dedicated GPU and with realistic layer sizes before drawing conclusions. Small matmuls gain little, because the cost of computing scales and casting is fixed per tensor.
+
+The torchao documentation reports end-to-end pretraining speedups of up to 1.5 times at 405B scale on 512 GPUs and up to 1.25 times at 8B scale on 8 GPUs, measured through torchtitan. The gain is less than the 2 times matmul peak because attention, norms, communication and the quantization overhead do not speed up.
+
+## Worked Scenario: Choosing a Precision Plan
+
+Suppose you are training a 7B dense model on 64 H100 GPUs.
+
+**Baseline: BF16 autocast with FP32 master weights.** This is the safe default. Model states take 16 bytes per parameter, 112 GB, which you shard across GPUs with FSDP. Expect a model FLOPs utilization of roughly 40%; Llama 3 405B reported 38% to 43% BF16 MFU on up to 16,384 H100s.
+
+**FP8 linears.** Converting the large linear layers to FP8 (rowwise or blockwise scaling) can raise throughput by 1.2 to 1.5 times. Keep the embedding, output head, norms, softmax and router in BF16. Run a few thousand steps in both precisions from the same checkpoint and compare loss curves before committing; the difference should be within run-to-run noise.
+
+**What not to do.** Do not drop the FP32 master weights to save 4 bytes per parameter without adding stochastic rounding or compensated summation; do not train in FP16 unless your hardware lacks BF16; and do not use per-tensor FP8 scaling on activations of a model known to develop large outliers.
+
+## Common Mistakes
+
+- Training in FP16 without a `GradScaler`, so gradients underflow to zero and the loss stops falling.
+- Computing the loss, softmax or layer norm statistics in BF16. Autocast handles this, but hand-written kernels and `.half()` or `.bfloat16()` on the whole model do not.
+- Casting the whole model to BF16 with `model.to(torch.bfloat16)` and using a standard optimizer: weights then accumulate updates in BF16 and small updates vanish.
+- Calling `clip_grad_norm_` before `scaler.unscale_(optimizer)` in FP16 training, which clips the scaled gradients with the wrong threshold.
+- Comparing an FP8 run against a BF16 run with different seeds or data order and drawing conclusions from small loss differences.
+- Expecting FP8 to double end-to-end speed. Only the matmuls get faster; plan for 1.2 to 1.5 times.
+
+## Summary
+
+- Exponent bits set range, mantissa bits set precision; BF16 keeps FP32's range with 7 mantissa bits, FP16 has more precision but a range that ends at 65,504.
+- Mixed precision computes in 16 bits but keeps FP32 master weights and FP32 accumulation; FP16 also needs dynamic loss scaling.
+- `torch.autocast` with BF16 is the standard: matmuls in BF16, sensitive ops in FP32, about 16 bytes of model state per parameter with AdamW.
+- FP8 needs scaling; fine-grained per-tile and per-block scales (DeepSeek-V3, MX formats) survive activation outliers that break per-tensor scaling.
+- FP8 linears give 1.2 to 1.5 times end-to-end speedups when sensitive layers stay in higher precision.
+
+## Further Reading
+
+- [Mixed Precision Training (Micikevicius et al., 2017)](https://arxiv.org/abs/1710.03740) - FP32 master weights and loss scaling.
+- [A Study of BFLOAT16 for Deep Learning Training (Kalamkar et al., 2019)](https://arxiv.org/abs/1905.12322) - evidence that BF16 trains without loss scaling.
+- [FP8 Formats for Deep Learning (Micikevicius et al., 2022)](https://arxiv.org/abs/2209.05433) - the E4M3 and E5M2 definitions.
+- [DeepSeek-V3 Technical Report (DeepSeek-AI, 2024)](https://arxiv.org/abs/2412.19437) - section 3.3 describes fine-grained FP8 training.
+- [OCP Microscaling Formats (MX) specification](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf) - MXFP8, MXFP6 and MXFP4 block formats.
+- [PyTorch automatic mixed precision](https://docs.pytorch.org/docs/stable/amp.html) - autocast op lists and GradScaler.
+- [torchao quantized training](https://docs.pytorch.org/ao/stable/workflows/training.html) - FP8 training recipes for PyTorch.
+- [NVIDIA Transformer Engine](https://github.com/NVIDIA/TransformerEngine) - FP8 and MXFP8 layers with delayed and block scaling.

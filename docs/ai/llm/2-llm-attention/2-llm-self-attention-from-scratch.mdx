@@ -1,0 +1,353 @@
+---
+title: "Implementing Self-Attention from Scratch in PyTorch"
+description: "Build a self-attention layer in PyTorch from Q, K and V projections, then verify outputs, masks and gradients against F.scaled_dot_product_attention."
+---
+
+# Implementing Self-Attention from Scratch in PyTorch
+
+## Introduction
+
+The [previous page](./1-llm-scaled-dot-product-attention.mdx) derived $\mathrm{softmax}(QK^\top/\sqrt{d_k})V$ on paper. Now we turn it into a PyTorch layer that takes token vectors in and returns token vectors out, the way it sits inside a real LLM.
+
+Writing it yourself is worth the effort even though PyTorch ships an optimized version. Every model file in Hugging Face `transformers`, every inference engine and every paper's pseudocode is a variation of the twenty lines you will write here. Once you have written them and **tested them against the library**, you can read any of those with confidence.
+
+On this page you will:
+
+- Build the query, key and value projections and see why each token gets three different vectors.
+- Implement attention with batches, masks and a custom scale, annotating every tensor shape.
+- Verify outputs **and gradients** against `torch.nn.functional.scaled_dot_product_attention` (SDPA).
+- See which kernel SDPA picks, measure the speed difference, and switch Hugging Face models between implementations.
+
+All code runs on a CPU in seconds. If PyTorch modules and autograd are new to you, start with the [PyTorch tutorial](/docs/library/pytorch).
+
+## From Token Vectors to Queries, Keys and Values
+
+A layer of an LLM receives a tensor `x` of shape `(batch, seq_len, d_model)`: one $d_{\text{model}}$-dimensional vector per token, coming from the [embedding layer](../1-llm-tokenization/4-llm-embeddings.mdx) or the previous block.
+
+Self-attention needs a query, a key and a value for every token. It gets them with three learned linear maps:
+
+$$
+Q = X W_Q, \qquad K = X W_K, \qquad V = X W_V
+$$
+
+with $X \in \mathbb{R}^{T \times d_{\text{model}}}$, $W_Q, W_K \in \mathbb{R}^{d_{\text{model}} \times d_k}$ and $W_V \in \mathbb{R}^{d_{\text{model}} \times d_v}$. (PyTorch's `nn.Linear` stores the transposed matrix, shape `(out_features, in_features)`, and computes `x @ weight.T`.)
+
+Why three projections instead of using $X$ directly for all roles?
+
+- **Asymmetry.** If $Q = K = X$, the score $x_i \cdot x_j$ is symmetric (token $i$ likes $j$ exactly as much as $j$ likes $i$), and each token tends to score high against itself, because $x_i \cdot x_i$ is its squared length. With separate $W_Q$ and $W_K$, the score $x_i^\top W_Q W_K^\top x_j$ is a learned bilinear form: token $i$ can look for something different from what it offers.
+- **Separate content.** $W_V$ decides what information a token passes on once it is selected, independently of how it is found. A verb might be found by its role ("I am a verb") and pass along its meaning ("I am about running").
+- **Dimension control.** $d_k$ and $d_v$ can be smaller than $d_{\text{model}}$, which is what makes multiple heads affordable on the [Multi-Head Attention](./4-llm-multi-head-attention.mdx) page.
+
+Most modern LLMs (Llama, Mistral, Gemma) use projections **without bias**. Some do add one: Qwen2 and Qwen2.5 put a bias on the query, key and value projections, and GPT-2 has biases everywhere. Many implementations also fuse the three matrices into one, a single `Linear(d_model, 3 * d_model)` followed by a split (GPT-2's `c_attn`, Phi-3's `qkv_proj`). Fusing is purely an efficiency trick, as this check shows:
+
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+d_model = 16
+x = torch.randn(2, 5, d_model)                         # (batch, seq_len, d_model)
+
+W_q, W_k, W_v = (nn.Linear(d_model, d_model, bias=False) for _ in range(3))
+qkv = nn.Linear(d_model, 3 * d_model, bias=False)      # one matrix for all three
+with torch.no_grad():
+    qkv.weight.copy_(torch.cat([W_q.weight, W_k.weight, W_v.weight], dim=0))
+
+q, k, v = qkv(x).split(d_model, dim=-1)                # each (batch, seq_len, d_model)
+print(all(torch.allclose(a, b(x)) for a, b in [(q, W_q), (k, W_k), (v, W_v)]))
+```
+
+```text
+True
+```
+
+One large matrix multiplication keeps the hardware busier than three small ones, and it reads `x` from memory once instead of three times.
+
+## The Attention Function and the Layer
+
+Here is the complete layer. The attention function is written for any number of leading dimensions, so the same code later works with a head dimension added.
+
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+
+def attention(q, k, v, mask=None):
+    # q: (..., T_q, d_k)  k: (..., T_k, d_k)  v: (..., T_k, d_v)
+    d_k = q.size(-1)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(d_k)   # (..., T_q, T_k)
+    if mask is not None:                                 # mask: True = keep
+        scores = scores.masked_fill(~mask, float("-inf"))
+    weights = torch.softmax(scores, dim=-1)              # rows sum to 1
+    return weights @ v, weights                          # (..., T_q, d_v)
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, d_model, d_k, d_v):
+        super().__init__()
+        self.W_q = nn.Linear(d_model, d_k, bias=False)
+        self.W_k = nn.Linear(d_model, d_k, bias=False)
+        self.W_v = nn.Linear(d_model, d_v, bias=False)
+
+    def forward(self, x, mask=None):
+        # x: (batch, seq_len, d_model)
+        q = self.W_q(x)                                  # (batch, seq_len, d_k)
+        k = self.W_k(x)                                  # (batch, seq_len, d_k)
+        v = self.W_v(x)                                  # (batch, seq_len, d_v)
+        return attention(q, k, v, mask)
+
+
+batch, seq_len, d_model = 2, 5, 16
+x = torch.randn(batch, seq_len, d_model)
+layer = SelfAttention(d_model, d_k=8, d_v=8)
+out, w = layer(x)
+print("out:", tuple(out.shape), " weights:", tuple(w.shape))
+print("weights[0] rows sum to:", w[0].sum(-1))
+
+# Same q, k, v through PyTorch's fused function.
+q, k, v = layer.W_q(x), layer.W_k(x), layer.W_v(x)
+ref = F.scaled_dot_product_attention(q, k, v)
+print("max abs diff vs SDPA:", (out - ref).abs().max().item())
+print("allclose:", torch.allclose(out, ref, atol=1e-6))
+```
+
+```text
+out: (2, 5, 8)  weights: (2, 5, 5)
+weights[0] rows sum to: tensor([1.0000, 1.0000, 1.0000, 1.0000, 1.0000], grad_fn=<SumBackward1>)
+max abs diff vs SDPA: 1.1920928955078125e-07
+allclose: True
+```
+
+Walk through the shapes once, because almost every attention bug is a shape bug:
+
+1. `x` is `(2, 5, 16)`: 2 sequences, 5 tokens, 16 features.
+2. Each projection maps the last dimension 16 to 8: `q`, `k`, `v` are `(2, 5, 8)`.
+3. `k.transpose(-2, -1)` is `(2, 8, 5)`. The batched matrix multiplication `(2, 5, 8) @ (2, 8, 5)` gives scores `(2, 5, 5)`: for each sequence, every query against every key.
+4. `softmax(dim=-1)` normalizes over keys, so each of the 5 rows sums to 1 (the printout confirms it).
+5. `(2, 5, 5) @ (2, 5, 8)` gives the output `(2, 5, 8)`: one new vector per token.
+
+The difference from SDPA is about $10^{-7}$, the size of float32 rounding error. The two implementations add the same numbers in a different order, so exact equality is not expected; `allclose` with a small tolerance is the right test.
+
+Notice what the layer **does not** do yet: there is no causal mask (every token sees the future), no multiple heads and no output projection. Those come in the next two pages. The `mask` argument is already there, following SDPA's convention that `True` means "may attend".
+
+## Testing Masks, Scale and Gradients
+
+Matching one forward pass is a start. A trustworthy implementation must also agree on masks, on a non-default scale and on **gradients**, since training uses the backward pass. Using float64 makes the comparison sharp: differences should be near $10^{-16}$.
+
+```python
+import math
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+
+def attention(q, k, v, mask=None, scale=None):
+    scale = 1 / math.sqrt(q.size(-1)) if scale is None else scale
+    scores = q @ k.transpose(-2, -1) * scale
+    if mask is not None:
+        if mask.dtype == torch.bool:                     # True = keep
+            scores = scores.masked_fill(~mask, float("-inf"))
+        else:                                            # float mask = additive bias
+            scores = scores + mask
+    return torch.softmax(scores, dim=-1) @ v
+
+
+B, T, d = 2, 6, 8
+q, k, v = (torch.randn(B, T, d, dtype=torch.float64, requires_grad=True) for _ in range(3))
+
+# 1. A boolean mask and the equivalent additive float mask.
+keep = torch.rand(T, T) > 0.3
+keep.fill_diagonal_(True)                                # every row keeps at least one key
+bias = torch.zeros(T, T, dtype=torch.float64).masked_fill(~keep, float("-inf"))
+for name, m in [("bool mask", keep), ("float mask", bias)]:
+    ours = attention(q, k, v, m)
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=m)
+    print(f"{name:10}: max diff {(ours - ref).abs().max():.1e}")
+
+# 2. A custom scale (keyword-only in SDPA).
+ours = attention(q, k, v, scale=0.5)
+ref = F.scaled_dot_product_attention(q, k, v, scale=0.5)
+print(f"scale=0.5 : max diff {(ours - ref).abs().max():.1e}")
+
+# 3. Gradients agree too.
+g = torch.randn(B, T, d, dtype=torch.float64)
+gq1, gk1, gv1 = torch.autograd.grad((attention(q, k, v) * g).sum(), (q, k, v))
+gq2, gk2, gv2 = torch.autograd.grad((F.scaled_dot_product_attention(q, k, v) * g).sum(), (q, k, v))
+print("grad diffs:", [f"{(a - b).abs().max():.1e}" for a, b in [(gq1, gq2), (gk1, gk2), (gv1, gv2)]])
+
+# 4. Our function passes autograd's finite-difference check.
+print("gradcheck:", torch.autograd.gradcheck(attention, (q, k, v)))
+```
+
+```text
+bool mask : max diff 3.3e-16
+float mask: max diff 3.3e-16
+scale=0.5 : max diff 4.4e-16
+grad diffs: ['1.0e-15', '7.2e-16', '4.4e-16']
+gradcheck: True
+```
+
+Four lessons are packed into this test:
+
+- **Two mask types.** SDPA accepts a boolean mask (`True` keeps a position) or a float mask that is **added** to the scores. A float mask with 0 for "keep" and $-\infty$ for "drop" is equivalent to the boolean one. A float mask can also hold any other bias, which is how ALiBi and T5-style relative positions plug in (see [Relative Positions, T5 Bias and ALiBi](../4-llm-positional-encoding/2-llm-relative-position-and-alibi.mdx)).
+- **Masks broadcast.** The `(T, T)` mask was applied to a `(B, T, T)` score tensor. Masks of shape `(B, 1, T, T)` or `(1, 1, T, T)` broadcast over heads the same way.
+- **The scale is keyword-only.** `F.scaled_dot_product_attention(q, k, v, scale=0.5)`; passing it positionally would land in another parameter.
+- **Gradients come for free.** Because our function uses only differentiable PyTorch operations, autograd derives the backward pass. `gradcheck` compares it against finite differences and passes. The fused kernels inside SDPA implement the backward pass by hand, which is why matching them is a meaningful test.
+
+:::warning
+`F.scaled_dot_product_attention` applies dropout whenever `dropout_p > 0`, even in `model.eval()` mode, because it is a function and does not know about training mode. Pass `dropout_p=self.attn_dropout if self.training else 0.0`. Most modern LLMs train with attention dropout 0 anyway.
+:::
+
+## What SDPA Does Under the Hood
+
+`F.scaled_dot_product_attention` is not a single algorithm. It is a dispatcher that picks one of several **backends** based on the device, dtype, shapes and arguments. The available choices are listed in `torch.nn.attention.SDPBackend`:
+
+| Backend | What it is | Where it runs |
+| --- | --- | --- |
+| `FLASH_ATTENTION` | FlashAttention-2 style fused, tiled kernel | CUDA (fp16/bf16), and a CPU flash kernel |
+| `EFFICIENT_ATTENTION` | memory-efficient attention (from xFormers) | CUDA, supports more dtypes and masks |
+| `CUDNN_ATTENTION` | NVIDIA cuDNN fused attention | recent NVIDIA GPUs |
+| `MATH` | plain PyTorch operations, like our code | everywhere, supports float64 |
+
+The fused kernels never build the full `(T_q, T_k)` score matrix; they process keys in blocks and keep a running softmax. That idea is the subject of the whole [FlashAttention section](../5-llm-flash-attention/2-llm-flash-attention.mdx). You can see which kernel ran with the profiler, and restrict the choice with the `sdpa_kernel` context manager:
+
+```python
+import contextlib
+import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.profiler import profile
+
+torch.manual_seed(0)
+q, k, v = (torch.randn(1, 8, 1024, 64) for _ in range(3))   # (batch, heads, seq, head_dim)
+
+for label, ctx in [("default", contextlib.nullcontext()),
+                   ("MATH only", sdpa_kernel([SDPBackend.MATH]))]:
+    with ctx, profile() as prof:
+        F.scaled_dot_product_attention(q, k, v)
+    ops = [e.key for e in prof.key_averages() if "attention" in e.key]
+    print(f"{label:9} -> {ops}")
+```
+
+```text
+default   -> ['aten::scaled_dot_product_attention', 'aten::_scaled_dot_product_flash_attention_for_cpu']
+MATH only -> ['aten::scaled_dot_product_attention', 'aten::_scaled_dot_product_attention_math']
+```
+
+Even on a CPU, PyTorch dispatches to a tiled flash-style kernel by default (output from PyTorch 2.14 on Linux). The `MATH` backend is useful as a reference: it is the one to use when you need float64 or want results that do not depend on the hardware's fused kernel.
+
+## Experiment: How Much Faster Is the Fused Kernel?
+
+Let us time our naive function against SDPA for growing sequence lengths, with 8 heads of dimension 64 (shapes `(1, 8, T, 64)`), and also print how much memory the naive version spends on the score matrix.
+
+```python
+import math
+import time
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+torch.set_num_threads(4)
+
+
+def attention(q, k, v):
+    scores = q @ k.transpose(-2, -1) / math.sqrt(q.size(-1))
+    return torch.softmax(scores, dim=-1) @ v
+
+
+def bench(fn, *args, reps=5):
+    fn(*args)                                            # warm-up
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn(*args)
+    return (time.perf_counter() - t0) / reps * 1e3       # milliseconds
+
+
+B, H, d = 1, 8, 64
+print(f"{'T':>5} {'naive ms':>9} {'SDPA ms':>8} {'score matrix MiB':>17}")
+for T in [512, 1024, 2048, 4096]:
+    q, k, v = (torch.randn(B, H, T, d) for _ in range(3))
+    with torch.no_grad():
+        t_naive = bench(attention, q, k, v)
+        t_sdpa = bench(F.scaled_dot_product_attention, q, k, v)
+    mib = B * H * T * T * 4 / 2**20                      # float32 scores the naive code stores
+    print(f"{T:>5} {t_naive:9.1f} {t_sdpa:8.1f} {mib:17.0f}")
+```
+
+```text
+    T  naive ms  SDPA ms  score matrix MiB
+  512       4.3      1.6                 8
+ 1024      19.0      6.0                32
+ 2048      77.0     25.1               128
+ 4096     308.5    110.4               512
+```
+
+Your timings will differ with hardware and with whatever else the machine is doing (measure on an idle machine), but two patterns are robust:
+
+- **Doubling $T$ multiplies the time by about 4** for both versions. Fused kernels make attention faster; they do not change its $O(T^2)$ arithmetic. See [The Quadratic Cost of Attention](./7-llm-attention-complexity.mdx).
+- **The naive version's memory also grows by 4x**: 512 MiB of scores for a single layer at 4,096 tokens, and that is just 8 heads in float32. During training autograd also keeps those weights for the backward pass. The fused kernels avoid storing them at all, which matters even more than the speed-up.
+
+## Switching Implementations in Hugging Face Transformers
+
+Hugging Face models expose the same choice through the `attn_implementation` argument. `"eager"` is a plain PyTorch implementation like ours, `"sdpa"` calls `F.scaled_dot_product_attention`, and `"flash_attention_2"` calls the external `flash-attn` package (CUDA only; see [Using FlashAttention in PyTorch, Hugging Face and vLLM](../5-llm-flash-attention/4-llm-using-flash-attention.mdx)). In transformers v5 the precision argument is `dtype` (the older `torch_dtype` name is deprecated).
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+torch.manual_seed(0)
+name = "openai-community/gpt2"
+tok = AutoTokenizer.from_pretrained(name)
+ids = tok("Attention lets every token look at every other token.", return_tensors="pt").input_ids
+
+eager = AutoModelForCausalLM.from_pretrained(name, attn_implementation="eager", dtype=torch.float32)
+sdpa = AutoModelForCausalLM.from_pretrained(name, attn_implementation="sdpa", dtype=torch.float32)
+
+with torch.no_grad():
+    out_e = eager(ids, output_attentions=True)
+    out_s = sdpa(ids)
+print("implementations:", eager.config._attn_implementation, sdpa.config._attn_implementation)
+print("max logit difference:", (out_e.logits - out_s.logits).abs().max().item())
+print("attention weights per layer:", tuple(out_e.attentions[0].shape))   # (batch, heads, T, T)
+```
+
+```text
+implementations: eager sdpa
+max logit difference: 9.1552734375e-05
+attention weights per layer: (1, 12, 11, 11)
+```
+
+This was run with transformers 5.21; it downloads GPT-2 small (about 550 MB) on first use. The logits agree to within $10^{-4}$, normal for 12 layers of float32 arithmetic summed in different orders. Note the trade-off: only the eager path can return the attention weights (`output_attentions=True`), because fused kernels never materialize them. When you want to look at attention patterns, load the model with `"eager"`.
+
+## Common Mistakes
+
+- **Using `nn.MultiheadAttention` mask conventions with SDPA.** In SDPA a boolean `True` means "attend"; in `nn.MultiheadAttention` masks `True` means "block". Mixing them inverts your mask silently.
+- **Testing with `==` instead of `allclose`.** Floating-point sums in different orders differ in the last bits. Compare with a tolerance, and use float64 when you want a strict comparison.
+- **Testing only the forward pass.** A custom kernel or a manual optimization can produce correct outputs and wrong gradients. Compare gradients and run `torch.autograd.gradcheck` in float64.
+- **Forgetting `dropout_p=0.0` at inference** when calling SDPA directly.
+- **Expecting attention weights from the SDPA path.** Fused kernels do not return them. Use the eager implementation for analysis.
+- **Building a mask with the wrong dtype.** A float mask full of zeros and ones is added to the scores; it does not mask anything. Use `torch.bool`, or a float mask with `-inf` for blocked positions.
+- **Calling `.view` on a non-contiguous tensor** after a transpose. Use `.reshape`, or `.contiguous().view(...)`.
+
+## Summary
+
+- Self-attention projects each token vector three times, $Q = XW_Q$, $K = XW_K$, $V = XW_V$, so tokens can look for, advertise and pass on different information.
+- Fusing the three projections into one `Linear(d_model, 3 * d_model)` is an efficiency trick with identical results.
+- The core function is four lines: scores with `q @ k.transpose(-2, -1)`, scale, optional mask, row softmax, multiply by `v`.
+- Our implementation matches `F.scaled_dot_product_attention` to float rounding for outputs, boolean and float masks, custom scales and gradients.
+- SDPA dispatches to fused backends (flash, memory-efficient, cuDNN) or to a `MATH` reference; `torch.nn.attention.sdpa_kernel` restricts the choice.
+- Fused kernels are faster and avoid storing the $T \times T$ matrix, but the cost still grows four-fold when the sequence doubles.
+- In Hugging Face, `attn_implementation="eager"` gives you attention weights; `"sdpa"` gives you speed.
+
+## Further Reading
+
+- [torch.nn.functional.scaled_dot_product_attention](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html): signature, mask semantics and the reference implementation.
+- [torch.nn.attention.sdpa_kernel](https://docs.pytorch.org/docs/stable/generated/torch.nn.attention.sdpa_kernel.html): selecting SDPA backends.
+- [PyTorch tutorial: Scaled Dot Product Attention](https://docs.pytorch.org/tutorials/intermediate/scaled_dot_product_attention_tutorial.html): official walkthrough of the fused kernels.
+- [Hugging Face: Attention interface](https://huggingface.co/docs/transformers/main/en/attention_interface): how `attn_implementation` selects eager, SDPA and FlashAttention code paths.
+- [Attention Is All You Need (Vaswani et al., 2017)](https://arxiv.org/abs/1706.03762): the original definition of self-attention.

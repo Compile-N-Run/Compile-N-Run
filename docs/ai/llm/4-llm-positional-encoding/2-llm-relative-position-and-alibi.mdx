@@ -1,0 +1,285 @@
+---
+title: "Relative Positions, T5 Bias and ALiBi"
+description: "Learn how relative position methods work: Shaw et al. embeddings, T5 bucketed biases, ALiBi linear penalties and NoPE layers, with PyTorch code for each."
+---
+
+# Relative Positions, T5 Bias and ALiBi
+
+## Introduction
+
+Absolute position embeddings answer the question "where is this token?" Language mostly asks a different question: "how far is that token from me?" An adjective modifies the noun right after it, whether the pair sits at positions 3 and 4 or at 9,003 and 9,004. A model built on absolute positions has to learn the same pattern separately for every location, while a model that sees distances directly gets this translation invariance for free.
+
+This page covers the methods that put the distance $j - i$ between a query at position $i$ and a key at position $j$ straight into the attention score:
+
+- **relative position representations** of Shaw et al. (2018), learned vectors per clipped distance,
+- the **T5 relative bias** (Raffel et al., 2019), one learned scalar per distance bucket and head,
+- **ALiBi** (Press et al., 2021), a fixed linear penalty with no parameters at all,
+- **NoPE**, using no explicit position at all and relying on the causal mask, now used in some layers of hybrid models.
+
+You will implement the T5 bucketing function (and check it against Hugging Face), build ALiBi biases and run them through PyTorch's `scaled_dot_product_attention`, and learn the trade-offs that made RoPE the eventual winner. If you have not yet seen why position is needed at all, start with [Why Transformers Need Positional Information](./0-llm-why-position-matters.mdx).
+
+## From Absolute to Relative
+
+Recall the four-term expansion from the [previous page](./1-llm-sinusoidal-and-learned.mdx). With absolute embeddings $p_i$ added to token embeddings $e_i$, the pre-softmax score is
+
+$$
+s_{ij} = (e_i + p_i)\,W_Q W_K^\top\,(e_j + p_j)^\top .
+$$
+
+The goal of relative methods is a score of the form
+
+$$
+s_{ij} = f\big(e_i,\ e_j,\ j - i\big),
+$$
+
+where positions enter only through their difference. Then shifting the whole sequence by any amount leaves every score unchanged. There are two natural places to put $j - i$:
+
+1. **Into the key (and value) vectors**, as a learned vector per distance: Shaw et al., then Transformer-XL.
+2. **Into the score**, as a scalar bias added after the dot product: T5 and ALiBi.
+
+RoPE, covered on the [next page](./3-llm-rope.mdx), finds a third way: it rotates the query and key so that their dot product itself depends on $j - i$.
+
+## Shaw et al.: Learned Relative Embeddings
+
+Shaw, Uszkoreit and Vaswani (2018) proposed learning one vector $a^K_r \in \mathbb{R}^{d}$ for each relative distance $r$, and adding it to the key inside the score:
+
+$$
+s_{ij} = \frac{x_i W_Q \left(x_j W_K + a^K_{\mathrm{clip}(j-i,\,k)}\right)^\top}{\sqrt{d}},
+\qquad \mathrm{clip}(r, k) = \max(-k, \min(k, r)).
+$$
+
+A second set $a^V_r$ is added to the values. Distances beyond $\pm k$ share one vector: the authors assumed that the exact distance stops mattering past some point, and used $k = 16$ in their translation experiments, with $2k + 1$ learned vectors per layer. Clipping also gives a form of length generalization, since a distance of 5,000 maps to the same vector as distance 16.
+
+The cost is that the score is no longer a single matrix product. The extra term $x_i W_Q (a^K_{j-i})^\top$ needs a different vector for every $(i, j)$ pair, which is awkward to batch and memory-hungry, $O(n^2 d)$ if materialized naively. Transformer-XL (Dai et al., 2019) reorganized the four-term expansion with sinusoidal relative encodings and two learned global bias vectors, mainly to support its segment-level recurrence. Both designs were influential but are rarely used in today's decoder-only LLMs.
+
+## T5: A Learned Scalar per Distance Bucket
+
+T5 simplified the idea drastically. Instead of a vector per distance, each head learns a **single scalar** per distance bucket, added to the logit:
+
+$$
+s_{ij} = \frac{q_i \cdot k_j}{\sqrt{d}} + b_h\big(\mathrm{bucket}(j - i)\big).
+$$
+
+Details from the T5 paper: 32 buckets, bucket widths that grow logarithmically up to a distance of 128, every distance beyond 128 shares the last bucket, a separate table per head, and the tables are shared across all layers. One layer cannot tell 200 from 2,000 tokens, but stacked layers can combine local information to cover longer ranges.
+
+The bucketing function is easier to understand in code. Half of the buckets (for each direction) are exact; the other half cover distances from that point up to `max_distance` on a log scale:
+
+```python
+import math
+import torch
+
+def t5_bucket(rel, bidirectional=True, num_buckets=32, max_distance=128):
+    """Map relative position (key_pos - query_pos) to a bucket id, as in T5 / Mesh TensorFlow."""
+    buckets = torch.zeros_like(rel)
+    if bidirectional:
+        num_buckets //= 2                          # half the buckets for each direction
+        buckets += (rel > 0).long() * num_buckets  # keys to the right get the upper half
+        n = rel.abs()
+    else:
+        n = (-rel).clamp(min=0)                    # decoder: only look back
+    max_exact = num_buckets // 2                   # small distances get their own bucket
+    is_small = n < max_exact
+    large = max_exact + (
+        torch.log(n.float().clamp(min=1) / max_exact)
+        / math.log(max_distance / max_exact)
+        * (num_buckets - max_exact)
+    ).long()
+    large = large.clamp(max=num_buckets - 1)
+    return buckets + torch.where(is_small, n, large)
+
+dist = torch.tensor([0, 1, 2, 7, 8, 12, 16, 32, 64, 127, 128, 500, 10_000])
+print("causal (look back by d):", dict(zip(dist.tolist(), t5_bucket(-dist, bidirectional=False).tolist())))
+print("bidirectional, key to the right:", dict(zip(dist.tolist(), t5_bucket(dist).tolist())))
+```
+
+```text
+causal (look back by d): {0: 0, 1: 1, 2: 2, 7: 7, 8: 8, 12: 12, 16: 16, 32: 21, 64: 26, 127: 31, 128: 31, 500: 31, 10000: 31}
+bidirectional, key to the right: {0: 0, 1: 17, 2: 18, 7: 23, 8: 24, 12: 25, 16: 26, 32: 28, 64: 30, 127: 31, 128: 31, 500: 31, 10000: 31}
+```
+
+In the causal (decoder) case all 32 buckets point backward: distances 0 to 15 are exact, then 16 to 127 are spread over 16 log-spaced buckets, and everything from 128 on lands in bucket 31. In the bidirectional (encoder) case 16 buckets look left and 16 look right, so only distances 0 to 7 are exact. Running this function and `transformers.models.t5.modeling_t5.T5Attention._relative_position_bucket` on every distance from -3,000 to 3,000 gives identical bucket ids in both modes.
+
+The model then looks up `bias_table[bucket]`, a `(num_buckets, n_heads)` embedding, and adds the result to the scores. For the 8 heads of T5-small that is only $32 \times 8 = 256$ parameters per stack (encoder and decoder each have one table).
+
+**Trade-offs.** The T5 bias extrapolates well: in the ALiBi paper's experiments it was the best of the pre-ALiBi methods at handling inputs longer than the training length. But it is slow. The bias depends on $(i, j)$, so a naive implementation materializes an $n \times n$ bias per head, and the ALiBi paper measured T5-bias training as noticeably slower than sinusoidal embeddings, with more memory. Fused attention kernels like FlashAttention avoid storing the full score matrix, and an arbitrary learned bias matrix does not fit that design well.
+
+## ALiBi: A Fixed Linear Penalty
+
+Press, Smith and Lewis (2021) asked how simple a relative bias could get. Their answer, Attention with Linear Biases (ALiBi), drops position embeddings entirely and adds a penalty proportional to distance:
+
+$$
+s_{ij} = \frac{q_i \cdot k_j}{\sqrt{d}} - m_h \cdot (i - j), \qquad j \le i .
+$$
+
+$m_h$ is a fixed, head-specific slope; it is not learned. For $n$ heads (a power of 2) the slopes are the geometric sequence that starts at $2^{-8/n}$ and has that same value as its ratio. With 8 heads this is $1/2, 1/4, \dots, 1/256$. The authors tried trainable slopes and found they did not extrapolate as well.
+
+The intuition: each head has a built-in recency preference of a different strength. A head with $m = 1/2$ subtracts 50 logits from a token 100 positions back, which effectively blinds it beyond a few dozen tokens. A head with $m = 1/256$ subtracts only 0.4, so it can look across the whole context. Together they form a spectrum of receptive fields, a bit like the multi-frequency clocks of the sinusoidal encoding.
+
+```python
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+
+def alibi_slopes(n_heads):
+    """Geometric sequence starting at 2^(-8/n) with ratio 2^(-8/n) (Press et al. 2021), n a power of 2."""
+    start = 2 ** (-8 / n_heads)
+    return torch.tensor([start ** (h + 1) for h in range(n_heads)])
+
+def alibi_bias(n_heads, seq_len):
+    pos = torch.arange(seq_len)
+    rel = pos[None, :] - pos[:, None]                 # (T, T): j - i, negative for past keys
+    bias = alibi_slopes(n_heads)[:, None, None] * rel  # (H, T, T); -m * distance for j <= i
+    causal = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
+    return bias.masked_fill(~causal, float("-inf"))     # future keys are masked
+
+print("slopes for 8 heads:", [f"1/{int(round(1 / s))}" for s in alibi_slopes(8).tolist()])
+print("head 0 bias, 5 tokens:\n", alibi_bias(8, 5)[0])
+
+# ALiBi plugs into PyTorch SDPA as an additive float mask.
+B, H, T, D = 2, 8, 16, 32
+q, k, v = (torch.randn(B, H, T, D) for _ in range(3))   # (batch, heads, seq_len, head_dim)
+bias = alibi_bias(H, T)                                   # (H, T, T), broadcast over batch
+out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+ref = torch.softmax(q @ k.transpose(-2, -1) / D**0.5 + bias, dim=-1) @ v
+print("SDPA with ALiBi mask matches manual:", torch.allclose(out, ref, atol=1e-5))
+
+# How much attention can a head give to a token 100 positions back, all else equal?
+for h, m in enumerate(alibi_slopes(8).tolist()):
+    if h in (0, 3, 7):
+        print(f"head {h}: slope {m:.4f}, logit penalty at distance 100 = {m * 100:.1f}")
+```
+
+```text
+slopes for 8 heads: ['1/2', '1/4', '1/8', '1/16', '1/32', '1/64', '1/128', '1/256']
+head 0 bias, 5 tokens:
+ tensor([[ 0.0000,    -inf,    -inf,    -inf,    -inf],
+        [-0.5000,  0.0000,    -inf,    -inf,    -inf],
+        [-1.0000, -0.5000,  0.0000,    -inf,    -inf],
+        [-1.5000, -1.0000, -0.5000,  0.0000,    -inf],
+        [-2.0000, -1.5000, -1.0000, -0.5000,  0.0000]])
+SDPA with ALiBi mask matches manual: True
+head 0: slope 0.5000, logit penalty at distance 100 = 50.0
+head 3: slope 0.0625, logit penalty at distance 100 = 6.2
+head 7: slope 0.0039, logit penalty at distance 100 = 0.4
+```
+
+Passing a float `attn_mask` to `F.scaled_dot_product_attention` adds it to the scaled scores, so ALiBi is a one-line change on top of SDPA. The catch is the same as for T5: a dense float mask usually rules out the fastest SDPA backend. Because the ALiBi bias is a simple function of $(i, j)$ and one slope per head, though, a kernel can compute it on the fly. The `flash-attn` package accepts an `alibi_slopes` argument of shape `(nheads,)` for exactly this reason, and FlexAttention in PyTorch can express ALiBi as a `score_mod` function.
+
+### What the ALiBi Paper Found
+
+- A 1.3B-parameter model trained on 1,024 tokens with ALiBi reached the perplexity of a sinusoidal model trained on 2,048 tokens, while training 11% faster and using 11% less memory.
+- ALiBi models kept stable perplexity when evaluated on inputs many times longer than the training length, while sinusoidal models degraded after a few dozen extra tokens.
+- The best perplexity came at about twice the training length (for example the $L = 512$ model was best at 1,012 tokens). Beyond that, perplexity stayed flat rather than improving.
+- In the appendix the authors trace most of ALiBi's advantage to avoiding the **early token curse**: with nonoverlapping evaluation, tokens near the start of each window have little context, and longer windows mean fewer such tokens. They explicitly leave "more efficiently exploiting longer histories" to future work.
+
+That last point is the important caveat. ALiBi's flat perplexity at 10x the training length does not mean the model uses information 10x farther away; the steep heads ignore it, and even the gentlest head penalizes it. ALiBi extrapolates gracefully because it acts like a soft sliding window. For retrieval from far back in the context, which is what long-context applications need, that is not enough. BLOOM (BigScience, 2022) is the best-known large model trained with ALiBi; the field then converged on RoPE.
+
+## NoPE: No Position Encoding at All
+
+The [first page of this section](./0-llm-why-position-matters.mdx) showed that a causal mask leaks position: a head with uniform attention outputs $1/(t+1)$ at position $t$. Two papers made this practical:
+
+- **Haviv et al. (2022)** trained causal language models with no position encoding and found them competitive with models that had one, while masked (bidirectional) models without positions performed much worse.
+- **Kazemnejad et al. (2023)**, "The Impact of Positional Encoding on Length Generalization in Transformers", compared NoPE, ALiBi, RoPE, T5 bias and absolute embeddings on small decoder-only models and synthetic reasoning tasks. NoPE generalized to longer lengths best, and the authors proved that NoPE can represent both absolute and relative encodings in principle.
+
+These are results on small models and synthetic tasks, not proof that NoPE wins at scale. What industry adopted is a **hybrid**: most layers keep RoPE for precise local order, and some layers drop it so that they can attend to any distance without the rotation getting in the way. The config.json files show it directly:
+
+```json
+{
+  "_comment": "HuggingFaceTB/SmolLM3-3B config.json (excerpt)",
+  "max_position_embeddings": 65536,
+  "rope_theta": 5000000.0,
+  "no_rope_layer_interval": 4,
+  "no_rope_layers": [1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, "... 36 entries in total"]
+}
+```
+
+A `1` means the layer uses RoPE and a `0` means it does not, so every fourth layer is a NoPE layer. The Hugging Face SmolLM3 blog credits this design to Yang et al. (2025), "RoPE to NoRoPE and Back Again". Llama 4 Scout's config.json has the same `no_rope_layers` pattern (48 entries, every fourth one 0) plus `"attn_temperature_tuning": true`, `"floor_scale": 8192` and `"attn_scale": 0.1`. In the Hugging Face implementation, the NoPE layers multiply their queries by
+
+$$
+1 + 0.1 \cdot \ln\!\left(1 + \left\lfloor \frac{t + 1}{8192} \right\rfloor\right)
+$$
+
+at position $t$, which slowly sharpens attention as the context grows, so that softmax does not spread too thin over hundreds of thousands of keys. Meta calls the overall design iRoPE (interleaved RoPE).
+
+## Comparing the Methods
+
+| Method | Parameters | Extrapolation | Fused-kernel friendly | Long-range retrieval | Notable models |
+|---|---|---|---|---|---|
+| Shaw et al. relative | $(2k+1) \times d$ per layer | Clipped, moderate | No | Limited by clip | Early MT models |
+| T5 bias | 32 per head, shared over layers | Good (ALiBi paper) | Hard (dense bias) | Limited past 128 per layer | T5, Flan-T5 |
+| ALiBi | None | Stable perplexity | Yes (`alibi_slopes`) | Weak: soft window | BLOOM |
+| NoPE | None | Strong on small synthetic tasks | Yes (nothing to do) | Possible, but imprecise | Every 4th layer in SmolLM3, Llama 4 |
+| RoPE | None | Poor without scaling | Yes (rotate Q, K first) | Good with large base or scaling | Llama, Qwen, Mistral, Gemma, DeepSeek |
+
+The last row is a preview. RoPE does not extrapolate well on its own (Press et al. measured it as only slightly better than sinusoidal), yet it won because it is a precise relative encoding that costs nothing inside the attention kernel, and because its frequency base and scaling turned out to be adjustable after pretraining. The pages on [RoPE theta](./5-llm-rope-theta.mdx) and [context extension](./6-llm-context-extension.mdx) explain how.
+
+```mermaid
+flowchart LR
+    A["2017: sinusoidal and learned absolute"] --> B["2018: Shaw et al. relative embeddings"]
+    B --> C["2019: Transformer-XL and T5 bias"]
+    C --> D["2021: ALiBi and RoPE"]
+    D --> E["2022: NoPE for causal LMs"]
+    E --> F["2023: RoPE base changes and position interpolation"]
+    F --> G["2025: hybrid RoPE and NoPE layers"]
+```
+
+## Experiment: Watch ALiBi Ignore the Past
+
+You can see the soft-window behavior without training anything. Using `alibi_bias` from above, set all query and key vectors equal (so content scores are all zero), take the last row of the softmax for a 1,024-token sequence, and measure how much attention mass each head puts on the first 512 tokens:
+
+```python
+import torch
+
+def alibi_slopes(n_heads):
+    start = 2 ** (-8 / n_heads)
+    return torch.tensor([start ** (h + 1) for h in range(n_heads)])
+
+T, H = 1024, 8
+dist = torch.arange(T - 1, -1, -1).float()            # distance from the last token to each key
+logits = -alibi_slopes(H)[:, None] * dist[None, :]     # (H, T): content scores are all zero
+w = logits.softmax(-1)
+far = w[:, : T // 2].sum(-1)                           # mass on the first half of the context
+for h in range(H):
+    print(f"head {h}: slope 1/{2 ** (h + 1):<4d} mass on tokens >512 back = {far[h].item():.2e}")
+```
+
+```text
+head 0: slope 1/2    mass on tokens >512 back = 0.00e+00
+head 1: slope 1/4    mass on tokens >512 back = 0.00e+00
+head 2: slope 1/8    mass on tokens >512 back = 1.60e-28
+head 3: slope 1/16   mass on tokens >512 back = 1.27e-14
+head 4: slope 1/32   mass on tokens >512 back = 1.13e-07
+head 5: slope 1/64   mass on tokens >512 back = 3.35e-04
+head 6: slope 1/128  mass on tokens >512 back = 1.80e-02
+head 7: slope 1/256  mass on tokens >512 back = 1.19e-01
+```
+
+The two steepest heads underflow to exactly zero in float32. Only the two gentlest heads put any meaningful weight on the far half, and even head 7 gives it about 12% of its mass when content is neutral. A strong content match can overcome the penalty (a logit gap of 2 or 3 is enough for head 7), but for most heads, distant tokens are effectively invisible. That is why ALiBi models extrapolate smoothly in perplexity yet struggle with needle-in-a-haystack retrieval far back in the context.
+
+## Common Mistakes
+
+- **Using the wrong sign for ALiBi.** The bias must be negative for past tokens ($-m(i - j)$). A positive bias makes the model prefer the most distant token and wrecks training.
+- **Computing ALiBi slopes for a non-power-of-two head count with the simple formula.** The paper only defines the sequence for powers of two. The authors' reference code takes the slopes for the nearest lower power of two and fills the remaining heads with every other slope from the next power of two; reuse that code for 12 or 40 heads rather than improvising.
+- **Treating T5 bias as per-layer.** T5 shares one bias table (per head) across all layers, and only the first layer computes it in the Hugging Face implementation (`has_relative_attention_bias`). Porting it as a per-layer table changes the parameter count and the model.
+- **Passing a dense float mask and expecting FlashAttention speed.** A materialized `(T, T)` bias forces a slower SDPA path at long lengths; use kernel-level ALiBi support or FlexAttention instead.
+- **Reading flat perplexity as long-context ability.** ALiBi and many other methods keep perplexity flat while ignoring distant tokens. Test with retrieval tasks, as described in [Long Context in Practice](./7-llm-long-context-evaluation.mdx).
+
+## Summary
+
+- Relative methods make attention depend on the distance $j - i$ rather than absolute positions, giving translation invariance.
+- Shaw et al. add a learned vector per clipped distance to keys and values; Transformer-XL reorganizes the same idea; both are costly and now rare.
+- T5 adds one learned scalar per head and log-spaced bucket (32 buckets up to distance 128, shared across layers); it extrapolates reasonably but needs a dense bias.
+- ALiBi adds a fixed penalty $-m_h (i - j)$ with geometric slopes $2^{-8/n}, 2^{-16/n}, \dots$; it is parameter-free and extrapolates in perplexity but behaves like a soft sliding window.
+- NoPE relies on the causal mask; modern hybrids such as SmolLM3 and Llama 4 drop RoPE in every fourth layer while keeping it elsewhere.
+
+## Further Reading
+
+- [Self-Attention with Relative Position Representations (Shaw et al., 2018)](https://arxiv.org/abs/1803.02155): learned relative embeddings with clipping.
+- [Transformer-XL (Dai et al., 2019)](https://arxiv.org/abs/1901.02860): relative sinusoidal encodings with segment recurrence.
+- [Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer (Raffel et al., 2019)](https://arxiv.org/abs/1910.10683): the T5 paper; Section 2.1 describes the bucketed relative bias.
+- [Train Short, Test Long: Attention with Linear Biases (Press et al., 2021)](https://arxiv.org/abs/2108.12409): ALiBi, its slopes and extrapolation experiments.
+- [Transformer Language Models without Positional Encodings Still Learn Positional Information (Haviv et al., 2022)](https://arxiv.org/abs/2203.16634): NoPE for causal LMs.
+- [The Impact of Positional Encoding on Length Generalization in Transformers (Kazemnejad et al., 2023)](https://arxiv.org/abs/2305.19466): NoPE versus explicit encodings.
+- [SmolLM3 blog post (Hugging Face)](https://huggingface.co/blog/smollm3): the every-fourth-layer NoPE design and its long-context training.
+- [flash-attention README](https://github.com/Dao-AILab/flash-attention): the `alibi_slopes` argument of `flash_attn_func`.

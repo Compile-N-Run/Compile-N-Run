@@ -80,6 +80,7 @@ import lokiLogo from '@site/static/img/observability-logo/loki_logo.png';
 import prometheusLogo from '@site/static/img/observability-logo/prometheus_logo.png';
 import terraformLogo from '@site/static/img/devops-logo/terraform_logo.png';
 import agentsLogo from '@site/static/img/ai-logo/agents_logo.png';
+import llmLogo from '@site/static/img/ai-logo/llm_logo.png';
 import architectureLogo from '@site/static/img/fundamentals-logo/architecture_logo.png';
 import securityLogo from '@site/static/img/fundamentals-logo/security_logo.png';
 import jenkinsLogo from '@site/static/img/devops-logo/jenkins_logo.png';
@@ -598,6 +599,15 @@ const databaseList = [
 ];
 
 const aiList = [
+    {
+        title: "Large Language Models",
+        Icon: (alt) => {
+            return <Image img={llmLogo} className={styles.featureImage} alt={alt.alt}/>;
+        },
+        url: "/docs/ai/llm",
+        description: <>How LLMs work inside: tokenization, attention, the Transformer, RoPE, FlashAttention, training,
+            fine-tuning, inference and quantization, with the math and PyTorch code.</>,
+    },
     {
         title: "AI Agents",
         Icon: (alt) => {

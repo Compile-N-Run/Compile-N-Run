@@ -1,0 +1,379 @@
+---
+title: "Optimizers, Learning Rate Schedules and Training Stability"
+description: "AdamW from scratch, warmup plus cosine and WSD schedules, the Muon optimizer, loss spikes, z-loss, QK-norm, gradient clipping and muP for LLM pretraining."
+---
+
+# Optimizers, Learning Rate Schedules and Training Stability
+
+## Introduction
+
+The optimizer turns gradients into weight updates. In a pretraining run it decides how fast the loss falls, how much memory the run needs, and whether the run survives to the end or blows up in a loss spike at step 200,000. Almost every large model from GPT-3 to DeepSeek-V3 used the same optimizer, AdamW, with nearly the same hyperparameters. Since 2024 that consensus has been challenged by Muon, and the classic cosine schedule by warmup-stable-decay.
+
+This page builds AdamW from its equations and checks it against PyTorch, explains each hyperparameter with the values real models use, implements cosine and WSD schedules, shows what Muon's Newton-Schulz step does to a gradient, and then covers the stability toolbox: gradient clipping, z-loss, QK-norm and the $\mu$P parametrization that lets you tune a learning rate on a small model and reuse it on a large one.
+
+## From SGD to AdamW
+
+Plain stochastic gradient descent updates parameters $\theta$ with the gradient $g_t$ of the loss at step $t$ and learning rate $\eta$:
+
+$$
+\theta_t = \theta_{t-1} - \eta\, g_t
+$$
+
+It works poorly for Transformers. Gradient scales differ by orders of magnitude across parameters (embeddings that appear rarely, layer norm gains, attention projections), so one learning rate is too big for some and too small for others.
+
+**Adam** (Kingma and Ba, 2014) keeps two running averages per parameter, the mean of the gradient $m_t$ and the mean of its square $v_t$, and divides one by the square root of the other:
+
+$$
+m_t = \beta_1 m_{t-1} + (1 - \beta_1)\, g_t, \qquad
+v_t = \beta_2 v_{t-1} + (1 - \beta_2)\, g_t^2
+$$
+
+$$
+\hat m_t = \frac{m_t}{1 - \beta_1^t}, \qquad
+\hat v_t = \frac{v_t}{1 - \beta_2^t}, \qquad
+\theta_t = \theta_{t-1} - \eta\, \frac{\hat m_t}{\sqrt{\hat v_t} + \epsilon}
+$$
+
+The division normalizes each coordinate: a parameter whose gradients are consistently small gets the same step size as one whose gradients are large. The bias corrections $1 - \beta^t$ undo the fact that $m_0 = v_0 = 0$. At step 1, $\hat m_1 = g_1$ and $\hat v_1 = g_1^2$, so the update is exactly $\eta \cdot \mathrm{sign}(g_1)$: every parameter moves by the full learning rate, whatever its gradient. Keep that in mind; it is one reason for warmup.
+
+**AdamW** (Loshchilov and Hutter, "Decoupled Weight Decay Regularization", 2017) fixed how weight decay interacts with Adam. Adding $\lambda \theta$ to the gradient (L2 regularization) means the decay also gets divided by $\sqrt{\hat v_t}$, so parameters with large gradients are barely regularized. AdamW applies decay directly to the weights, separate from the adaptive step:
+
+$$
+\theta_t = \theta_{t-1} - \eta \lambda\, \theta_{t-1} - \eta\, \frac{\hat m_t}{\sqrt{\hat v_t} + \epsilon}
+$$
+
+Here is AdamW written out by hand next to `torch.optim.AdamW`:
+
+```python
+import torch
+
+torch.manual_seed(0)
+lr, beta1, beta2, eps, wd = 1e-2, 0.9, 0.95, 1e-8, 0.1
+
+w_ref = torch.randn(4, 3, requires_grad=True)           # updated by torch.optim.AdamW
+w_own = w_ref.detach().clone()                           # updated by our loop
+m = torch.zeros_like(w_own)                              # first moment (mean of gradients)
+v = torch.zeros_like(w_own)                              # second moment (mean of squared gradients)
+opt = torch.optim.AdamW([w_ref], lr=lr, betas=(beta1, beta2), eps=eps, weight_decay=wd)
+
+x, y = torch.randn(16, 4), torch.randn(16, 3)
+for t in range(1, 6):
+    loss = ((x @ w_ref - y) ** 2).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+
+    g = 2 * x.T @ (x @ w_own - y) / y.numel()           # same gradient, computed by hand
+    w_own *= 1 - lr * wd                                 # decoupled weight decay
+    m = beta1 * m + (1 - beta1) * g
+    v = beta2 * v + (1 - beta2) * g * g
+    m_hat = m / (1 - beta1 ** t)                         # bias correction
+    v_hat = v / (1 - beta2 ** t)
+    w_own -= lr * m_hat / (v_hat.sqrt() + eps)
+    print(f"step {t}: loss {loss.item():.4f}  max diff vs torch {(w_own - w_ref).abs().max().item():.2e}")
+    if t == 1:  # at step 1, m_hat = g and v_hat = g*g, so the step is lr * sign(g)
+        print("  step 1 update / lr:", (m_hat / (v_hat.sqrt() + eps))[0].round(decimals=3).tolist())
+```
+
+```text
+step 1: loss 5.4452  max diff vs torch 0.00e+00
+  step 1 update / lr: [1.0, -1.0, -1.0]
+step 2: loss 5.3577  max diff vs torch 0.00e+00
+step 3: loss 5.2713  max diff vs torch 1.49e-08
+step 4: loss 5.1860  max diff vs torch 1.49e-08
+step 5: loss 5.1017  max diff vs torch 2.98e-08
+```
+
+The two agree to float32 rounding, and the first update is the sign of the gradient, as predicted.
+
+## AdamW Hyperparameters in Practice
+
+The values used by large models are remarkably consistent:
+
+| Setting | Typical LLM value | Why |
+| --- | --- | --- |
+| $\beta_1$ | 0.9 | momentum over about 10 steps |
+| $\beta_2$ | 0.95 (not the default 0.999) | second moment adapts in about 20 steps instead of 1,000, so a sudden gradient increase is noticed quickly; more stable at large batch sizes |
+| $\epsilon$ | 1e-8 (Llama 2 used 1e-5) | must be smaller than typical $\sqrt{v}$, or it silently lowers the learning rate |
+| weight decay $\lambda$ | 0.1 | applied to matrices; usually not to norms and biases, sometimes not to embeddings |
+| gradient clipping | global norm 1.0 | caps the damage from a single bad batch |
+| peak learning rate | 6e-4 for GPT-3 125M; 3e-4 for Llama 2 7B and 1.5e-4 for 70B; 8e-5 for Llama 3 405B | larger models need smaller steps |
+
+Some published recipes: Llama 2 used $\beta_2 = 0.95$, $\epsilon = 10^{-5}$, weight decay 0.1, clipping at 1.0, 2,000 warmup steps and cosine decay to 10% of the peak. Llama 3 405B used a peak of $8 \times 10^{-5}$, 8,000 warmup steps and cosine decay to $8 \times 10^{-7}$ over 1.2 million steps. DeepSeek-V3 used $\beta_1 = 0.9$, $\beta_2 = 0.95$, weight decay 0.1 and clipping at 1.0 with a peak of $2.2 \times 10^{-4}$. OLMo 2 (2024) lowered $\epsilon$ from $10^{-5}$ to $10^{-8}$ and found that the gradient norm settled faster and stayed lower.
+
+AdamW's memory cost matters at scale: two extra float32 values per parameter, 8 bytes, on top of the weights and gradients. That is why the [distributed training page](./5-llm-distributed-training.mdx) shards optimizer states first.
+
+## Learning Rate Schedules: Warmup, Cosine and WSD
+
+**Warmup.** At the start, Adam's $\hat v_t$ is estimated from very few gradients, the weights are random and the first updates move every parameter by the full learning rate. Ramping the learning rate linearly from near zero over the first few thousand steps keeps those early updates small until the statistics settle. Warmup length is usually 0.1% to 1% of the run, or a fixed 1,000 to 8,000 steps.
+
+**Cosine decay.** After warmup, the most common schedule follows half a cosine from the peak $\eta_\mathrm{max}$ to a floor $\eta_\mathrm{min}$ (often 10% of the peak) at the final step $S$:
+
+$$
+\eta(s) = \eta_\mathrm{min} + \tfrac{1}{2}\left(\eta_\mathrm{max} - \eta_\mathrm{min}\right)\left(1 + \cos\frac{\pi (s - W)}{S - W}\right)
+$$
+
+where $W$ is the number of warmup steps. Chinchilla showed the cosine cycle should match the training length: a cycle set much longer than the actual run leaves the model under-trained, because the learning rate never decays.
+
+That is also cosine's weakness. The schedule depends on the final step, so you must fix the token budget in advance, and you cannot extend a finished run without rewarming the learning rate.
+
+**Warmup-stable-decay (WSD).** MiniCPM (Hu et al., 2024) proposed holding the learning rate constant after warmup and decaying it only at the end, over about 10% of the run. The plateau can continue as long as you like, and you can branch off a short decay from any checkpoint to get a finished model at that token count. That makes scaling-law studies far cheaper (one long run gives many endpoints) and makes continued training natural. DeepSeek-V3 used a variant: warmup over 2,000 steps to $2.2 \times 10^{-4}$, constant until 10T tokens, cosine decay to $2.2 \times 10^{-5}$ over 4.3T tokens, then two short constant stages at $2.2 \times 10^{-5}$ and $7.3 \times 10^{-6}$ for the final 500B tokens.
+
+```python
+import math
+import torch
+
+def warmup_cosine(step, warmup, total, min_ratio=0.1):
+    """Linear warmup to 1, then cosine decay to min_ratio (fractions of the peak LR)."""
+    if step < warmup:
+        return (step + 1) / warmup
+    progress = min(1.0, (step - warmup) / max(1, total - warmup))
+    return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+def wsd(step, warmup, total, decay_frac=0.1, min_ratio=0.0):
+    """Warmup-stable-decay: linear warmup, flat plateau, then linear decay over the last decay_frac."""
+    decay_start = int(total * (1 - decay_frac))
+    if step < warmup:
+        return (step + 1) / warmup
+    if step < decay_start:
+        return 1.0
+    progress = (step - decay_start) / max(1, total - decay_start)
+    return 1.0 - (1.0 - min_ratio) * progress
+
+total, warmup, peak = 10_000, 500, 3e-4
+print(" step   cosine LR      WSD LR")
+for s in [0, 250, 499, 1000, 5000, 8999, 9500, 9999]:
+    print(f"{s:5d}  {peak * warmup_cosine(s, warmup, total):.3e}  {peak * wsd(s, warmup, total):.3e}")
+
+# Plugging a schedule into PyTorch: LambdaLR multiplies the optimizer's base lr by the lambda.
+model = torch.nn.Linear(8, 8)
+opt = torch.optim.AdamW(model.parameters(), lr=peak)
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: wsd(s, warmup, total))
+for _ in range(600):
+    opt.step(); sched.step()
+print(f"LambdaLR after 600 steps: {opt.param_groups[0]['lr']:.3e}")
+```
+
+```text
+ step   cosine LR      WSD LR
+    0  6.000e-07  6.000e-07
+  250  1.506e-04  1.506e-04
+  499  3.000e-04  3.000e-04
+ 1000  2.982e-04  3.000e-04
+ 5000  1.761e-04  3.000e-04
+ 8999  3.733e-05  3.000e-04
+ 9500  3.184e-05  1.500e-04
+ 9999  3.000e-05  3.000e-07
+LambdaLR after 600 steps: 3.000e-04
+```
+
+Why does the loss drop so much during the decay phase? A useful picture: with a large constant learning rate the weights bounce around the bottom of a valley, kept high by gradient noise. Shrinking the step size lets them settle into the valley floor. The progress made during the plateau is real but hidden by the noise, and the decay reveals it. This is also why teams anneal on their best data during the decay (Llama 3 did this on its final 40 million tokens): the model's final position is most sensitive to the data seen while the steps are shrinking.
+
+## Muon: Orthogonalized Momentum
+
+Adam treats every parameter as an independent number. But a weight matrix $W \in \mathbb{R}^{m \times n}$ is a linear map, and its update matters as a whole. Keller Jordan's Muon (December 2024) uses that structure. For each 2D hidden weight matrix it keeps SGD momentum $B_t$ and then replaces the update with the nearest semi-orthogonal matrix: if $B_t = U S V^\top$ is the singular value decomposition, the update is $U V^\top$, which keeps the directions and sets every singular value to 1.
+
+$$
+B_t = \mu B_{t-1} + g_t, \qquad O_t = \mathrm{NS}(B_t) \approx U V^\top, \qquad W_t = W_{t-1} - \eta\, O_t
+$$
+
+The intuition, which the author presents as a hypothesis, is that momentum and Adam updates for Transformer matrices are nearly low-rank: a few directions dominate. Orthogonalizing gives rare but useful directions the same step size as the dominant ones.
+
+A full SVD per matrix per step would be too slow, so Muon uses a Newton-Schulz iteration: five steps of an odd matrix polynomial $X \leftarrow aX + b(XX^\top)X + c(XX^\top)^2 X$ with tuned coefficients $(a, b, c) = (3.4445, -4.7750, 2.0315)$. Each step pushes every singular value toward 1, using only matrix multiplications that run well in bfloat16 on GPUs.
+
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+def newton_schulz5(G, steps=5, eps=1e-7):
+    """Approximately replace G = U S V^T by U V^T (all singular values pushed toward 1)."""
+    a, b, c = 3.4445, -4.7750, 2.0315                 # coefficients from Keller Jordan's Muon
+    X = G / (G.norm() + eps)                          # Frobenius norm 1 => every singular value <= 1
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.T                                       # iterate on the wide orientation (smaller X X^T)
+    for _ in range(steps):
+        A = X @ X.T
+        X = a * X + (b * A + c * A @ A) @ X           # odd quintic polynomial applied to the singular values
+    return X.T if transposed else X
+
+# A typical gradient-like matrix: low-rank structure plus noise, very uneven singular values.
+G = torch.randn(64, 4) @ torch.randn(4, 128) + 0.05 * torch.randn(64, 128)
+show = lambda s: "  ".join(f"{v:8.3f}" for v in s[[0, 3, 4, 63]].tolist())   # 1st, 4th, 5th, last
+print("singular values of G      :", show(torch.linalg.svdvals(G)))
+print("after Newton-Schulz (5 it):", show(torch.linalg.svdvals(newton_schulz5(G))))
+
+# Using the built-in optimizer: Muon for 2D hidden weights, AdamW for embeddings, head, norms, biases.
+model = nn.Sequential(nn.Embedding(100, 64), nn.Linear(64, 256), nn.GELU(), nn.Linear(256, 64),
+                      nn.LayerNorm(64), nn.Linear(64, 100))
+hidden = [model[1].weight, model[3].weight]
+others = [p for p in model.parameters() if all(p is not h for h in hidden)]
+muon = torch.optim.Muon(hidden, lr=0.02, momentum=0.95, adjust_lr_fn="match_rms_adamw")
+adamw = torch.optim.AdamW(others, lr=3e-3, betas=(0.9, 0.95), weight_decay=0.1)
+
+x = torch.randint(0, 100, (32, 16))
+y = (x * 7 + 3) % 100                                  # a learnable token-to-token mapping
+for step in range(201):
+    loss = nn.functional.cross_entropy(model(x).view(-1, 100), y.view(-1))
+    muon.zero_grad(); adamw.zero_grad()
+    loss.backward()
+    muon.step(); adamw.step()
+    if step % 50 == 0:
+        print(f"step {step:3d}  loss {loss.item():.4f}")
+```
+
+```text
+singular values of G      :  115.467    72.233     0.929     0.193
+after Newton-Schulz (5 it):    1.202     1.200     1.199     0.492
+step   0  loss 4.7721
+step  50  loss 0.0178
+step 100  loss 0.0037
+step 150  loss 0.0011
+step 200  loss 0.0003
+```
+
+The singular values go from spanning a factor of 600 to about 1.2, with the smallest one lifted from 0.19 to 0.49 after only five iterations. The tuned coefficients deliberately trade exactness for speed; the result is close enough to orthogonal for optimization. The second part uses `torch.optim.Muon`, which ships in recent PyTorch releases, for the two hidden matrices and AdamW for the embedding, the output head, the norm and the biases. That split follows the Muon recommendation: Muon is for 2D hidden-layer weights only.
+
+Moonshot AI's "Muon is Scalable for LLM Training" (Liu et al., 2025) added two changes needed at scale: decoupled weight decay, and scaling each update by $0.2\sqrt{\max(A, B)}$ for an $A \times B$ matrix so that its RMS matches a typical AdamW update and AdamW's learning rate and weight decay can be reused. That is the `adjust_lr_fn="match_rms_adamw"` option in PyTorch. They reported about twice the compute efficiency of AdamW in scaling-law experiments and trained Moonlight, a mixture-of-experts model with 3B active and 16B total parameters, on 5.7T tokens. Kimi K2 (2025), with 32B active and 1 trillion total parameters, was pretrained on 15.5T tokens with MuonClip, which adds a QK-clip step that rescales the query and key projection weights to stop attention logits from growing, and the report describes the run as having zero loss spikes. Muon also needs only one state buffer per matrix instead of AdamW's two.
+
+## Loss Spikes and How to Prevent Them
+
+A loss spike is a sudden jump of the training loss, sometimes recovering in a few hundred steps and sometimes diverging for good. They become more frequent as models grow. PaLM 540B (Chowdhery et al., 2022) saw about 20 spikes despite gradient clipping. The team's fix was operational: restart from a checkpoint about 100 steps before the spike and skip 200 to 500 data batches. Replaying the same batches from an earlier checkpoint did not spike, so the cause was the combination of particular data with a particular parameter state, not bad data alone.
+
+The modern toolbox attacks the mechanisms behind spikes:
+
+**Gradient clipping.** Compute the global norm $\lVert g \rVert$ over all parameters and, if it exceeds a threshold $c$, scale every gradient by $c / \lVert g \rVert$. It does not prevent instability, but it bounds a single step. Logging the gradient norm before clipping is the best early warning signal: OLMo 2 found that spikes in the gradient norm often came before loss spikes.
+
+**z-loss.** The softmax output is unchanged when every logit is shifted by a constant, so nothing stops the logits from drifting to large values, where bfloat16 rounding and the exponentials become unstable. PaLM added an auxiliary loss $10^{-4} \cdot \log^2 Z$, where $Z = \sum_j e^{z_j}$ is the softmax normalizer, which pulls $\log Z$ toward zero without changing the predicted distribution. OLMo 2 and Chameleon also adopted it, and Wortsman et al. (2023) showed it removes the output-logit divergence they could reproduce in small models.
+
+```python
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+V = 1000
+logits = torch.randn(8, V) * 3 + 40.0          # (tokens, V): every logit shifted up by 40
+targets = torch.randint(0, V, (8,))
+
+ce = F.cross_entropy(logits, targets)
+log_z = torch.logsumexp(logits, dim=-1)         # (tokens,) log of the softmax normalizer
+z_loss = 1e-4 * (log_z ** 2).mean()             # PaLM: 1e-4 * log^2 Z
+print(f"cross-entropy {ce.item():.4f}  (unchanged by the +40 shift)")
+print(f"mean log Z {log_z.mean().item():.2f}  z-loss {z_loss.item():.4f}")
+print(f"cross-entropy without the shift: {F.cross_entropy(logits - 40.0, targets).item():.4f}")
+
+# Gradient clipping by global norm: scale all gradients by min(1, max_norm / total_norm).
+model = torch.nn.Linear(16, 16)
+(model(torch.randn(4, 16)) * 100).pow(2).mean().backward()          # deliberately huge gradients
+total = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+after = torch.sqrt(sum(p.grad.pow(2).sum() for p in model.parameters()))
+print(f"grad norm before clipping {total.item():.1f}, after {after.item():.4f}")
+```
+
+```text
+cross-entropy 13.1996  (unchanged by the +40 shift)
+mean log Z 51.46  z-loss 0.2648
+cross-entropy without the shift: 13.1996
+grad norm before clipping 7868.0, after 1.0000
+```
+
+The cross-entropy is identical with and without the shift of 40, so the main loss gives no signal against the drift; the z-loss term does.
+
+**QK-norm.** Attention logits $q^\top k / \sqrt{d}$ can grow without limit as the query and key weights grow, until the softmax becomes one-hot and gradients vanish. Dehghani et al. (2023) hit this when training a 22B vision Transformer and fixed it by applying layer normalization to queries and keys before the dot product. OLMo 2, Gemma 3 and Qwen3 use QK-norm with RMSNorm; see the [normalization page](../3-llm-transformer/3-llm-normalization.mdx).
+
+**Initialization and data.** OLMo 2 switched to initializing every parameter from a normal distribution with standard deviation 0.02 and found it more stable than depth-scaled schemes. It also traced many spikes to documents with long repeated n-gram sequences and filtered them from the data.
+
+**Learning rate.** The most reliable fix is still a lower peak learning rate or longer warmup, at the cost of slower progress. Wortsman et al. (2023, "Small-scale proxies for large-scale Transformer training instabilities") showed that the instabilities of large models can be reproduced in small models at high learning rates, which means you can test mitigations cheaply.
+
+## Transferring Hyperparameters with $\mu$P
+
+Tuning a learning rate for a 70B model by trial and error is unaffordable. You would like to tune on a 100M model and reuse the value. Under the standard parametrization (SP) that does not work: the optimal learning rate shifts as the width grows, because the same step changes the outputs of a wide layer more than a narrow one.
+
+The **Maximal Update Parametrization** ($\mu$P), from Greg Yang and Edward Hu's "Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer" (Yang et al., 2022), rescales initialization, multipliers and per-layer learning rates with width so that every layer's activations and updates stay the same size as the model grows. For Adam, with $m = \mathrm{width} / \mathrm{base\ width}$:
+
+| Parameter | Initialization variance | Adam learning rate |
+| --- | --- | --- |
+| input embedding and biases | unchanged | unchanged |
+| hidden weight matrices | proportional to 1/fan_in | divided by $m$ |
+| output (unembedding) weights | divided by $m^2$, or keep it and multiply logits by $1/m$ | divided by $m$ |
+| attention logits | scale by $1/d$ instead of $1/\sqrt{d}$ | |
+
+The test that $\mu$P is implemented correctly is a **coordinate check**: train a few steps at several widths and measure how much the outputs change. Under SP the change grows with width; under $\mu$P it stays flat. This MLP version shows it:
+
+```python
+import torch
+import torch.nn as nn
+
+def make_mlp(width, base=64, mup=False, d_in=32, d_out=10):
+    torch.manual_seed(0)
+    inp, hid, out = nn.Linear(d_in, width), nn.Linear(width, width), nn.Linear(width, d_out)
+    for layer in (inp, hid):
+        nn.init.normal_(layer.weight, std=layer.in_features ** -0.5)   # variance 1/fan_in
+    m = base / width                                                     # 1 at the base width
+    nn.init.normal_(out.weight, std=width ** -0.5 * (m if mup else 1))  # muP: output std ~ 1/width
+    groups = [{"params": inp.parameters(), "lr": 1e-2},
+              {"params": hid.parameters(), "lr": 1e-2 * (m if mup else 1)},  # muP: hidden LR ~ 1/width
+              {"params": out.parameters(), "lr": 1e-2 * (m if mup else 1)}]
+    model = nn.Sequential(inp, nn.ReLU(), hid, nn.ReLU(), out)
+    return model, torch.optim.Adam(groups)
+
+x = torch.randn(256, 32, generator=torch.Generator().manual_seed(1))
+y = torch.randint(0, 10, (256,), generator=torch.Generator().manual_seed(2))
+print("width   change in logits after 5 Adam steps (RMS)")
+print("        standard   muP")
+for width in [64, 256, 1024, 4096]:
+    row = []
+    for mup in (False, True):
+        model, opt = make_mlp(width, mup=mup)
+        with torch.no_grad():
+            before = model(x)
+        for _ in range(5):
+            loss = nn.functional.cross_entropy(model(x), y)
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad():
+            row.append((model(x) - before).pow(2).mean().sqrt().item())
+    print(f"{width:5d}   {row[0]:8.3f}  {row[1]:6.3f}")
+```
+
+```text
+width   change in logits after 5 Adam steps (RMS)
+        standard   muP
+   64      0.752   0.752
+  256      0.964   0.430
+ 1024      5.241   0.401
+ 4096     33.680   0.382
+```
+
+With SP and a fixed learning rate, the logits at width 4,096 move 45 times more than at width 64, so a learning rate tuned on the narrow model would blow up the wide one. With $\mu$P the change stays near 0.4 to 0.75 across a 64-fold width range. The paper transferred hyperparameters from a 40M-parameter proxy to GPT-3 6.7B and beat the published 6.7B results with a tuning cost of 7% of one pretraining run. Cerebras-GPT and several later open models used $\mu$P or variants of it; many large labs instead fit scaling laws for the learning rate directly, as DeepSeek did.
+
+## Common Mistakes
+
+- Using PyTorch's default $\beta_2 = 0.999$ for large-batch LLM pretraining. Most recipes use 0.95.
+- Applying weight decay to layer norm gains and biases. Put them in a parameter group with `weight_decay=0.0`.
+- Setting the cosine schedule length longer than the run, so the learning rate never decays and the final loss is worse than it should be.
+- Ending a WSD run without the decay phase and evaluating the plateau checkpoint; the plateau model is much worse than the same run after a short decay.
+- Feeding embeddings, the output head or 1D parameters to Muon. Muon is for 2D hidden matrices; everything else goes to AdamW.
+- Clipping gradients but not logging the pre-clip norm, which throws away the best early warning of instability.
+- Expecting a learning rate tuned on a small model to transfer under the standard parametrization; it shifts with width unless you use $\mu$P or a fitted learning-rate law.
+
+## Summary
+
+- AdamW normalizes each coordinate by the root of its second moment and applies weight decay directly to the weights; LLM recipes use $\beta_2 = 0.95$, weight decay 0.1 and clipping at 1.0.
+- Warmup protects the first steps; cosine decay needs the run length in advance; WSD keeps a constant plateau and decays at the end, which suits continued training and scaling studies.
+- Muon orthogonalizes the momentum of each hidden matrix with a five-step Newton-Schulz iteration; with RMS matching and weight decay it scaled to Moonlight and the trillion-parameter Kimi K2.
+- Loss spikes are fought with gradient clipping, z-loss, QK-norm, careful initialization, data filtering and lower learning rates; PaLM handled them by restarting and skipping batches.
+- $\mu$P rescales initialization and per-layer learning rates with width so that hyperparameters tuned on a small proxy transfer to the full model.
+
+## Further Reading
+
+- [Adam: A Method for Stochastic Optimization (Kingma and Ba, 2014)](https://arxiv.org/abs/1412.6980) - the original Adam paper.
+- [Decoupled Weight Decay Regularization (Loshchilov and Hutter, 2017)](https://arxiv.org/abs/1711.05101) - AdamW.
+- [MiniCPM (Hu et al., 2024)](https://arxiv.org/abs/2404.06395) - the warmup-stable-decay schedule.
+- [Muon: An optimizer for hidden layers in neural networks (Jordan, 2024)](https://kellerjordan.github.io/posts/muon/) - the algorithm and the Newton-Schulz coefficients.
+- [Muon is Scalable for LLM Training (Liu et al., 2025)](https://arxiv.org/abs/2502.16982) - weight decay, RMS matching and Moonlight.
+- [Kimi K2: Open Agentic Intelligence (Kimi Team, 2025)](https://arxiv.org/abs/2507.20534) - MuonClip at trillion-parameter scale.
+- [PaLM: Scaling Language Modeling with Pathways (Chowdhery et al., 2022)](https://arxiv.org/abs/2204.02311) - z-loss and the loss-spike restarts.
+- [Small-scale proxies for large-scale Transformer training instabilities (Wortsman et al., 2023)](https://arxiv.org/abs/2309.14322) - reproducing and fixing instabilities in small models.
+- [2 OLMo 2 Furious (OLMo Team, 2024)](https://arxiv.org/abs/2501.00656) - a detailed open account of stability fixes.
+- [Tensor Programs V (Yang et al., 2022)](https://arxiv.org/abs/2203.03466) - $\mu$P and zero-shot hyperparameter transfer.
+- [torch.optim documentation](https://docs.pytorch.org/docs/stable/optim.html) - AdamW, Muon and learning rate schedulers in PyTorch.

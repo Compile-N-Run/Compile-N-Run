@@ -1,0 +1,360 @@
+---
+title: "Supervised Fine-Tuning and Chat Templates"
+description: "Learn how SFT turns a base LLM into a chat model: chat templates, special tokens, masking the loss to assistant tokens, packing, and a runnable PyTorch example."
+---
+
+# Supervised Fine-Tuning and Chat Templates
+
+## Introduction
+
+Supervised fine-tuning (SFT) is the first and most important step of post-training. You take a pretrained base model and continue training it with the same next-token loss, but on a small, carefully built dataset of conversations: a user asks, the assistant answers well. After a few thousand steps the model has learned a conversation format, the role of the assistant, a default tone, and, critically, when to stop talking.
+
+SFT looks trivial, "just more training", and that is why it is where many fine-tuning projects go wrong. The details decide the result: which text format the conversations are rendered in, which tokens the loss is computed on, how sequences are padded or packed, and how the loss is averaged. Get one of them wrong and the model trains without errors but behaves badly at inference.
+
+By the end of this page you will be able to:
+
+- Explain what a chat template is, read one, and render conversations with `apply_chat_template`.
+- Build `input_ids` and `labels` for multi-turn chats with the loss masked to assistant tokens, and verify the mask.
+- Explain the trade-offs of padding, packing, loss averaging and the main hyperparameters.
+- Run a small SFT on CPU that teaches a base model to answer and stop, and configure TRL's `SFTTrainer` for a real run.
+
+## From Instruction Tuning to Chat SFT
+
+The idea of fine-tuning on instructions predates chat models. FLAN (Wei et al., 2021) rewrote more than 60 NLP datasets as natural-language instructions ("Translate this sentence to French: ...") and showed that a model fine-tuned on many such tasks did better zero-shot on unseen tasks. InstructGPT (Ouyang et al., 2022) used about 13k prompts with demonstrations written by labelers as the first step of RLHF.
+
+The open-model era made SFT data cheap. Self-Instruct (Wang et al., 2022) had a model generate its own instructions and answers; Stanford's Alpaca (2023) used that idea to produce 52k demonstrations from an OpenAI model and fine-tuned Llama 7B on them. LIMA (Zhou et al., 2023) went the other way and showed that 1,000 carefully curated examples were enough for a strong 65B assistant, evidence that SFT mostly teaches format and style. Modern open recipes such as Tulu 3 (Lambert et al., 2024) combine hundreds of thousands of examples targeted at specific skills (math, code, instruction following, safety, multilingual) with heavy decontamination against benchmarks.
+
+The objective never changes. For a conversation rendered into tokens $s_1, \dots, s_N$ with a binary mask $m_t$ that is 1 on tokens we want to learn,
+
+$$
+\mathcal{L}_{\mathrm{SFT}}(\theta) = -\frac{1}{\sum_t m_t} \sum_{t=1}^{N} m_t \log \pi_\theta(s_t \mid s_{\lt t})
+$$
+
+Everything interesting is in how the conversation becomes tokens and how $m_t$ is set.
+
+## Chat Templates and Special Tokens
+
+A model sees a flat sequence of tokens, not a list of messages. A *chat template* is the rule that turns a list of `{"role", "content"}` messages into that sequence, with special tokens marking where each turn starts and ends. The model learns the template during SFT, so at inference you must use exactly the same one.
+
+Many open models, including Qwen and SmolLM, use the ChatML format. Rendering the same conversation with two tokenizers shows it:
+
+```python
+from transformers import AutoTokenizer
+
+messages = [
+    {"role": "system", "content": "You are terse."},
+    {"role": "user", "content": "2+2?"},
+    {"role": "assistant", "content": "4"},
+]
+for name in ["HuggingFaceTB/SmolLM2-135M-Instruct", "Qwen/Qwen3-0.6B"]:
+    tok = AutoTokenizer.from_pretrained(name)
+    print(f"--- {name}  (eos_token={tok.eos_token!r})")
+    print(tok.apply_chat_template(messages, tokenize=False))
+```
+
+```text
+--- HuggingFaceTB/SmolLM2-135M-Instruct  (eos_token='<|im_end|>')
+<|im_start|>system
+You are terse.<|im_end|>
+<|im_start|>user
+2+2?<|im_end|>
+<|im_start|>assistant
+4<|im_end|>
+
+--- Qwen/Qwen3-0.6B  (eos_token='<|im_end|>')
+<|im_start|>system
+You are terse.<|im_end|>
+<|im_start|>user
+2+2?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+4<|im_end|>
+```
+
+Each turn is `<|im_start|>role`, a newline, the content, and `<|im_end|>`. The two templates already differ: Qwen3 is a hybrid reasoning model, and its template inserts an empty `<think>` block into this assistant turn because it carries no reasoning. Other families use different markers. Llama 3, for example, writes `<|start_header_id|>user<|end_header_id|>` before a turn and `<|eot_id|>` after it.
+
+Four details matter in practice:
+
+- **The end-of-turn token is the stop signal.** Generation stops when the model emits the token configured as end of sequence. Here the tokenizer's `eos_token` is `<|im_end|>`, so a model that has learned to emit it after every answer stops cleanly. If SFT never trains on that token, the model rambles, which is exactly the base-model behavior shown on the overview page.
+- **The generation prompt.** At inference you render the conversation so far with `add_generation_prompt=True`, which appends `<|im_start|>assistant\n` so the model's next tokens are the answer. The training data must contain the same header before each answer.
+- **Templates can insert text you did not write.** SmolLM2's template adds a default system message when the conversation has none:
+
+```text
+<|im_start|>system
+You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
+<|im_start|>user
+2+2?<|im_end|>
+<|im_start|>assistant
+```
+
+- **Where the template lives.** It is a Jinja template stored with the tokenizer (the `chat_template` field of `tokenizer_config.json` or a separate `chat_template.jinja` file). Base models often ship without one; when you fine-tune a base model, you choose a template, add its special tokens to the tokenizer if needed, and ship it with the model.
+
+For how special tokens are represented in the vocabulary, see [Using tiktoken and Hugging Face Tokenizers](../1-llm-tokenization/3-llm-tokenizer-libraries.mdx).
+
+## Masking the Loss to Assistant Tokens
+
+Should the model be trained to predict the user's words? Usually not. The user's turn is input, not behavior we want to imitate; training on it spends capacity predicting questions and can teach the model to write the user's next turn itself. Standard practice since InstructGPT is to set $m_t = 1$ only on assistant tokens. Llama 2 states that it zeroed out the loss on prompt tokens, and Llama 3 masked prompt tokens in SFT.
+
+In PyTorch and Hugging Face, the mask is expressed through the labels: positions with label `-100` are skipped by `torch.nn.functional.cross_entropy` (its default `ignore_index`). The rule for an assistant turn is:
+
+- **Mask the header** (`<|im_start|>assistant\n`). At inference it is part of the prompt, so the model never has to generate it.
+- **Train on the content and the end-of-turn token.** The end token is how the model learns to stop.
+- **Mask everything else**: system and user turns, and any newline the template adds after `<|im_end|>`.
+
+The most robust way to find turn boundaries is to render the conversation prefix by prefix and take the difference, which works for any template without parsing its special tokens:
+
+```python
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+torch.manual_seed(0)
+name = "HuggingFaceTB/SmolLM2-135M-Instruct"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+
+def build_example(messages, tok):
+    """Return input_ids and labels; labels are -100 except on assistant turns."""
+    input_ids, labels = [], []
+    prev_len = 0
+    for i in range(len(messages)):
+        # Render the conversation up to and including message i.
+        ids = tok.apply_chat_template(messages[: i + 1], tokenize=True)
+        if hasattr(ids, "keys"):          # some versions return a BatchEncoding
+            ids = ids["input_ids"]
+        new = ids[prev_len:]              # tokens contributed by message i
+        if messages[i]["role"] == "assistant":
+            # Do not train on the "<|im_start|>assistant\n" header: it is in
+            # the prompt at inference time. Train on content + end-of-turn.
+            header = tok.apply_chat_template(messages[:i], tokenize=True,
+                                             add_generation_prompt=True)
+            if hasattr(header, "keys"):
+                header = header["input_ids"]
+            n_header = len(header) - prev_len
+            body = new[n_header:]
+            # Keep the end-of-turn token, drop anything the template adds after it.
+            end = body.index(tok.eos_token_id) + 1 if tok.eos_token_id in body else len(body)
+            lab = [-100] * n_header + body[:end] + [-100] * (len(body) - end)
+        else:
+            lab = [-100] * len(new)
+        input_ids += new
+        labels += lab
+        prev_len = len(ids)
+    return torch.tensor([input_ids]), torch.tensor([labels])
+
+messages = [
+    {"role": "system", "content": "You are a concise assistant."},
+    {"role": "user", "content": "Name a prime number between 10 and 15."},
+    {"role": "assistant", "content": "11 is a prime number between 10 and 15."},
+    {"role": "user", "content": "Another one?"},
+    {"role": "assistant", "content": "13."},
+]
+input_ids, labels = build_example(messages, tok)
+print("sequence length:", input_ids.shape[1], " trained tokens:", (labels != -100).sum().item())
+print("trained text:", repr(tok.decode(labels[labels != -100])))
+
+with torch.no_grad():
+    logits = model(input_ids).logits                    # (1, T, vocab)
+# Shift: position t predicts token t+1.
+shift_logits = logits[:, :-1, :]                        # (1, T-1, vocab)
+shift_labels = labels[:, 1:]                            # (1, T-1)
+masked = F.cross_entropy(shift_logits.reshape(-1, shift_logits.size(-1)),
+                         shift_labels.reshape(-1), ignore_index=-100)
+full = F.cross_entropy(shift_logits.reshape(-1, shift_logits.size(-1)),
+                       input_ids[:, 1:].reshape(-1))
+print(f"loss on assistant tokens only: {masked.item():.3f}")
+print(f"loss on every token:           {full.item():.3f}")
+```
+
+```text
+sequence length: 67  trained tokens: 20
+trained text: '11 is a prime number between 10 and 15.<|im_end|>13.<|im_end|>'
+loss on assistant tokens only: 0.680
+loss on every token:           1.516
+```
+
+Always print the decoded trained text like this before a real run. It is the single most effective check in SFT: you see at a glance whether the mask covers the answers, includes the end token and excludes the headers. Here only 20 of 67 tokens carry loss. The loss on those tokens (0.68) is far lower than over the whole sequence (1.52), because this instruct model predicts its own kind of answers well but cannot predict what a user will ask.
+
+Note the shift. The model's output at position $t$ predicts token $t+1$, so the logits are cut to `[:, :-1]` and the labels to `[:, 1:]`. Hugging Face causal-LM models do this shift internally when you pass `labels=`, so when you use `model(input_ids, labels=labels)` you pass the *unshifted* labels. Shifting twice is a classic silent bug.
+
+Hugging Face offers a built-in alternative: `apply_chat_template(..., return_dict=True, return_assistant_tokens_mask=True)` returns an `assistant_masks` list, but only if the template marks assistant content with `{% generation %}` and `{% endgeneration %}` tags. SmolLM2's template does not, and the call then returns a mask of all zeros with only a warning: a mask that would silently train on nothing. TRL's `assistant_only_loss=True` relies on the same mechanism and patches templates for known families such as Qwen3.
+
+**Is masking always right?** Mostly. Shi et al. (2024, "Instruction Tuning With Loss Over Instructions") found that including the prompt in the loss can help when the data has long instructions, short answers and few examples, acting as a regularizer. The default for chat SFT remains assistant-only loss.
+
+## Batching, Packing and Loss Averaging
+
+SFT examples have very different lengths, from a 20-token answer to a 4,000-token multi-turn session. How they are batched affects both speed and the effective loss.
+
+**Padding.** Pad each batch to its longest sequence, with `attention_mask` zero and labels `-100` on pads. Simple and correct, but with mixed lengths most of the compute is spent on padding. Sorting or bucketing examples by length reduces waste.
+
+**Packing.** Concatenate examples into fixed-length rows (say 4,096 tokens) so there is no padding at all. The danger is cross-contamination: with a plain causal mask, tokens of the second example attend to the first. Correct packing resets attention at example boundaries, using position IDs that restart at 0 and a variable-length attention kernel (FlashAttention's varlen mode), so each example sees only itself. TRL's `packing=True` uses best-fit-decreasing bin packing by default and enables this padding-free path. The same technique is used in pretraining; see [The Training Objective, Loss Curves and Data Loading](../6-llm-pretraining/1-llm-training-objective.mdx).
+
+**Loss averaging.** The formula above divides by the number of trained tokens. With batches, there is a choice: average over all trained tokens in the batch (every token counts equally, long answers dominate) or average per example and then over examples (every example counts equally, tokens in short answers weigh more). Neither is wrong, but they train different models, and the choice interacts with gradient accumulation: averaging per micro-batch and then averaging micro-batches is not the same as averaging over all tokens at once when micro-batches have different token counts. Hugging Face's Trainer fixed exactly this discrepancy in late 2024 by normalizing by the token count of the whole accumulated batch.
+
+## Hyperparameters and What They Trade Off
+
+| Setting | Typical value | Trade-off |
+|---|---|---|
+| Learning rate (full fine-tune) | 1e-5 to 2e-5 (TRL default 2e-5; Llama 3 reports 1e-5) | Higher learns faster but forgets more pretraining knowledge |
+| Learning rate (LoRA) | 1e-4 to 2e-4 | Adapters need larger steps because they start at zero |
+| Epochs | 1 to 3 | More epochs memorize the data and its style; watch held-out loss |
+| Max length | 2k to 8k tokens for chat, more for long reasoning traces | Truncation silently cuts answers, often removing the end-of-turn token |
+| Warmup and schedule | A few percent warmup, cosine or linear decay | Avoids an early loss spike when the optimizer state is fresh |
+| Data mix | Domain data plus general instruction data | Pure domain data narrows the model; a general mix limits forgetting |
+
+Two regularization tricks show up in recipes. NEFTune (Jain et al., 2023) adds uniform noise to the input embeddings during SFT and reported large gains on open-ended chat evaluations, at no cost. Mixing a small fraction of pretraining-style data reduces forgetting, the SFT analogue of InstructGPT's PPO-ptx. For a deeper treatment of forgetting, see [Evaluating a Fine-Tuned Model and Avoiding Catastrophic Forgetting](../9-llm-fine-tuning/5-llm-evaluating-fine-tunes.mdx).
+
+## Worked Scenario: Teaching a Base Model to Answer and Stop
+
+Let us reproduce the core effect of SFT on CPU. We take the SmolLM2-135M *base* model, which (as the overview page showed) continues questions with more questions, and fine-tune it on eight question-answer pairs in ChatML format with loss only on the answers and the end-of-turn token. Then we ask it a question that is not in the training data.
+
+```python
+import time, torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+torch.manual_seed(0)
+# Same vocabulary; the instruct tokenizer carries the ChatML chat template.
+tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
+model = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M", dtype=torch.float32)
+
+SYSTEM = "Answer in one short sentence."
+pairs = [
+    ("What is the capital of Italy?", "The capital of Italy is Rome."),
+    ("What is the capital of Japan?", "The capital of Japan is Tokyo."),
+    ("What color is the sky on a clear day?", "The sky is blue on a clear day."),
+    ("How many legs does a spider have?", "A spider has eight legs."),
+    ("What is the boiling point of water at sea level?", "Water boils at 100 degrees Celsius at sea level."),
+    ("Who wrote Hamlet?", "Hamlet was written by William Shakespeare."),
+    ("What is the largest planet in the solar system?", "Jupiter is the largest planet in the solar system."),
+    ("How many days are in a week?", "There are seven days in a week."),
+]
+
+def encode(q, a):
+    prompt = tok.apply_chat_template(
+        [{"role": "system", "content": SYSTEM}, {"role": "user", "content": q}],
+        tokenize=False, add_generation_prompt=True)
+    p_ids = tok(prompt, add_special_tokens=False)["input_ids"]
+    a_ids = tok(a + tok.eos_token, add_special_tokens=False)["input_ids"]
+    ids = p_ids + a_ids
+    labels = [-100] * len(p_ids) + a_ids          # loss only on the answer + <|im_end|>
+    return ids, labels
+
+def collate(batch):
+    T = max(len(i) for i, _ in batch)
+    pad = tok.pad_token_id
+    ids = torch.tensor([i + [pad] * (T - len(i)) for i, _ in batch])        # (B, T)
+    lab = torch.tensor([l + [-100] * (T - len(l)) for _, l in batch])        # (B, T)
+    att = torch.tensor([[1] * len(i) + [0] * (T - len(i)) for i, _ in batch])
+    return ids, lab, att
+
+def ask(q):
+    prompt = tok.apply_chat_template(
+        [{"role": "system", "content": SYSTEM}, {"role": "user", "content": q}],
+        tokenize=False, add_generation_prompt=True)
+    ids = tok(prompt, return_tensors="pt", add_special_tokens=False)
+    out = model.generate(**ids, max_new_tokens=25, do_sample=False,
+                         eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id)
+    return tok.decode(out[0, ids["input_ids"].shape[1]:])
+
+test_q = "What is the capital of Germany?"
+model.eval(); print("before SFT:", repr(ask(test_q)))
+
+data = [encode(q, a) for q, a in pairs]
+opt = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=0.0)
+model.train(); t0 = time.time()
+for step in range(30):
+    batch = [data[(step * 4 + k) % len(data)] for k in range(4)]
+    ids, lab, att = collate(batch)
+    loss = model(input_ids=ids, attention_mask=att, labels=lab).loss  # HF shifts labels internally
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 10 == 0 or step == 29:
+        print(f"step {step:2d}  loss {loss.item():.3f}")
+model.eval(); print("after SFT: ", repr(ask(test_q)))
+print(f"({time.time() - t0:.0f} s on CPU)")
+```
+
+```text
+before SFT: 'What is the capital of France?assistant\nassistant\nWhat is the capital of Italy?assistant\nassistant'
+step  0  loss 4.081
+step 10  loss 0.670
+step 20  loss 0.387
+step 29  loss 0.224
+after SFT:  'The capital of Germany is Berlin.<|im_end|>'
+(2695 s on CPU)
+```
+
+Before SFT the base model rambles through role names and more questions; after 30 steps on eight examples it answers an unseen question in the trained style and emits `<|im_end|>`, so generation stops. The loss on answer tokens fell from 4.08 to 0.22. (The 2,695 seconds were measured on a heavily shared machine, so expect your timing to differ.)
+
+Eight examples and thirty steps are enough to install the format, because the base model already knows the facts; SFT only has to teach it where an answer begins, what it looks like, and that `<|im_end|>` comes after it. This is the superficial alignment hypothesis in miniature. It also shows the risk: with eight examples the model also learns their exact sentence pattern, and a real dataset needs diversity so that the model does not answer every question as "The X of Y is Z."
+
+## Running SFT with TRL
+
+For real runs, TRL's `SFTTrainer` implements templates, masking, packing and loss normalization. With a conversational dataset (a `messages` column) it applies the chat template itself; with a prompt-completion dataset it trains on completions only by default. This configuration is a reasonable start for a 1B to 8B model on one GPU with LoRA (tested API: TRL 1.16):
+
+```python
+from datasets import load_dataset
+from peft import LoraConfig
+from trl import SFTConfig, SFTTrainer
+
+dataset = load_dataset("trl-lib/Capybara", split="train")   # multi-turn "messages"
+
+args = SFTConfig(
+    output_dir="qwen3-sft",
+    assistant_only_loss=True,      # needs {% generation %} in the template (TRL patches Qwen3)
+    packing=True,                  # best-fit-decreasing packing, padding-free attention
+    max_length=4096,
+    learning_rate=1e-4,            # LoRA; use about 1e-5 to 2e-5 for full fine-tuning
+    num_train_epochs=2,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,
+    warmup_steps=0.03,             # a float below 1 is a ratio; warmup_ratio was removed in transformers v5
+    lr_scheduler_type="cosine",
+)
+trainer = SFTTrainer(
+    model="Qwen/Qwen3-0.6B",
+    args=args,
+    train_dataset=dataset,
+    peft_config=LoraConfig(r=16, lora_alpha=32, target_modules="all-linear"),
+)
+trainer.train()
+```
+
+The fine-tuning section walks through a complete run, data preparation and evaluation: see [Fine-Tuning with Hugging Face Transformers, PEFT and TRL](../9-llm-fine-tuning/3-llm-fine-tuning-with-hf.mdx) and [Preparing Fine-Tuning Data](../9-llm-fine-tuning/4-llm-fine-tuning-data.mdx).
+
+:::tip
+Before launching any SFT run, take one batch from your data collator and print `tok.decode` of the input with the trained positions highlighted (or simply decode the tokens whose label is not `-100`). Two minutes of inspection catches wrong templates, missing end tokens, masks that cover nothing and truncated answers.
+:::
+
+## Common Mistakes
+
+- Training with one chat template and serving with another, for example fine-tuning on Alpaca-style "### Response:" text and chatting through ChatML. The model sees an unfamiliar format and quality drops sharply.
+- Never training on the end-of-turn token, or truncating it away with a short `max_length`. The model then does not stop.
+- Using `return_assistant_tokens_mask` or `assistant_only_loss` with a template that lacks `{% generation %}` tags, which can produce an all-zero mask.
+- Shifting labels yourself and then passing them to a Hugging Face model that shifts them again.
+- Packing without resetting attention at example boundaries, so examples attend to unrelated earlier conversations.
+- Fine-tuning a reasoning model such as Qwen3 on answers without reasoning and without the template's `<think>` handling, which silently changes its thinking behavior.
+- Too many epochs on a small dataset. Training loss approaching zero means memorization; judge by held-out generations.
+
+## Summary
+
+- SFT continues next-token training on curated conversations; it mostly teaches format, role and style on top of knowledge from pretraining.
+- A chat template turns messages into tokens with role markers and an end-of-turn token; training and inference must use the same template.
+- Labels of `-100` mask the loss; train on assistant content plus the end-of-turn token, not on system, user or header tokens.
+- Check masks by decoding the trained tokens; built-in assistant masks depend on `{% generation %}` tags in the template.
+- Packing needs per-example attention boundaries; loss averaging across tokens versus examples, and across gradient accumulation, changes what is optimized.
+- Typical full fine-tuning uses learning rates around 1e-5 to 2e-5 for one to three epochs; LoRA uses about ten times higher.
+
+## Further Reading
+
+- [Finetuned Language Models Are Zero-Shot Learners (Wei et al., 2021)](https://arxiv.org/abs/2109.01652): FLAN and instruction tuning.
+- [Self-Instruct: Aligning Language Models with Self-Generated Instructions (Wang et al., 2022)](https://arxiv.org/abs/2212.10560): synthetic instruction data.
+- [Alpaca: A Strong, Replicable Instruction-Following Model (Stanford CRFM, 2023)](https://crfm.stanford.edu/2023/03/13/alpaca.html): 52k synthetic demonstrations on Llama 7B.
+- [LIMA: Less Is More for Alignment (Zhou et al., 2023)](https://arxiv.org/abs/2305.11206): 1,000 curated examples.
+- [Instruction Tuning With Loss Over Instructions (Shi et al., 2024)](https://arxiv.org/abs/2405.14394): when training on prompts helps.
+- [NEFTune: Noisy Embeddings Improve Instruction Finetuning (Jain et al., 2023)](https://arxiv.org/abs/2310.05914): embedding noise as a regularizer.
+- [Tulu 3 (Lambert et al., 2024)](https://arxiv.org/abs/2411.15124): an open, skill-targeted SFT mixture with decontamination.
+- [Hugging Face chat templates guide](https://huggingface.co/docs/transformers/chat_templating): `apply_chat_template`, generation prompts and assistant masks.
+- [TRL SFTTrainer documentation](https://huggingface.co/docs/trl/main/en/sft_trainer): dataset formats, packing and loss options.

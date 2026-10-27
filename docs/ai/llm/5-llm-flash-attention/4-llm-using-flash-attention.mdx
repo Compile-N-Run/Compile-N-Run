@@ -1,0 +1,514 @@
+---
+title: "Using FlashAttention in PyTorch, Hugging Face and vLLM"
+description: "Use fused attention in practice: PyTorch SDPA backends, the flash-attn package, FlexAttention masks, attn_implementation in transformers, vLLM backends and a benchmark."
+---
+
+# Using FlashAttention in PyTorch, Hugging Face and vLLM
+
+## Introduction
+
+You almost never need to write a FlashAttention kernel yourself, and most of the time you do not even need to install the `flash-attn` package. PyTorch ships fused attention kernels behind one function, `torch.nn.functional.scaled_dot_product_attention` (SDPA), Hugging Face `transformers` uses SDPA by default, and serving engines such as vLLM pick a FlashAttention build for your GPU automatically. What you do need is to know which kernel actually runs, how to force or forbid one, what each kernel can and cannot do (masks, head sizes, dtypes, GPUs), and how to check that a change made things faster.
+
+After this page you will be able to:
+
+- call SDPA, choose its backend with `sdpa_kernel`, and switch PyTorch's flash backend to FlashAttention-3 or -4;
+- call the `flash-attn` package directly, including the variable-length API used for packed sequences;
+- express custom masks and score modifications with FlexAttention;
+- set `attn_implementation` in Hugging Face `transformers` and choose an attention backend in vLLM;
+- run a benchmark that compares naive attention with SDPA on CPU or GPU.
+
+All CPU snippets on this page were run with PyTorch 2.14 and `transformers` 5.21. The CUDA results were measured on an RTX 4060 Ti (8 GB, Ada architecture) with CUDA 13.0. The FlashAttention-3 and -4 snippets need Hopper or Blackwell GPUs and were not run.
+
+## PyTorch SDPA and Its Backends
+
+`F.scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False)` computes $\mathrm{softmax}(QK^\top / \sqrt{d} + \text{mask})V$. Inputs use the layout `(batch, n_heads, seq_len, head_dim)`. Behind it are several implementations, called backends, and PyTorch picks the first one whose constraints your inputs satisfy:
+
+| Backend (`SDPBackend`) | What it is | Main constraints |
+| --- | --- | --- |
+| `FLASH_ATTENTION` | FlashAttention-2 on CUDA (FA3 or FA4 if activated); a tiled FlashAttention-style kernel on CPU | CUDA: FP16 or BF16, Ampere or newer, no arbitrary `attn_mask` |
+| `EFFICIENT_ATTENTION` | memory-efficient attention from xFormers | CUDA only; supports FP32 and additive masks |
+| `CUDNN_ATTENTION` | NVIDIA cuDNN fused attention | CUDA only, recent GPUs |
+| `MATH` | plain PyTorch ops, materializes the score matrix | works everywhere; the reference |
+| `OVERRIDEABLE` | hook for out-of-tree devices | backend-specific |
+
+The context manager `torch.nn.attention.sdpa_kernel` restricts the choice. Inside it, only the listed backends may run, and if none can, the call fails instead of silently falling back.
+
+```python
+import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+torch.manual_seed(0)
+
+B, Hq, Hkv, N, d = 2, 8, 2, 256, 64
+q = torch.randn(B, Hq, N, d)          # (batch, n_heads,    seq_len, head_dim)
+k = torch.randn(B, Hkv, N, d)         # (batch, n_kv_heads, seq_len, head_dim)
+v = torch.randn(B, Hkv, N, d)
+
+# Reference: the math backend (plain PyTorch ops, works everywhere).
+with sdpa_kernel(SDPBackend.MATH):
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+
+# The fused kernel. On CPU, PyTorch ships a FlashAttention-style tiled kernel;
+# on NVIDIA GPUs the same enum selects FlashAttention-2 (or FA3/FA4 if activated).
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+print("flash vs math, max abs diff:", (out - ref).abs().max().item())
+
+# Let PyTorch choose among several backends; set_priority=True tries them in list order.
+with sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                  SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True):
+    out2 = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+print("auto  vs math, max abs diff:", (out2 - ref).abs().max().item())
+
+# The CPU flash kernel also accepts an explicit mask (the CUDA FlashAttention-2
+# kernel does not, and SDPA then falls back to another backend).
+mask = torch.ones(N, N, dtype=torch.bool).tril()          # same as is_causal=True
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    out3 = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+print("mask  vs math, max abs diff:", (out3 - ref).abs().max().item())
+
+# Asking for a backend that does not exist on this device fails loudly:
+try:
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):     # CUDA-only kernel
+        F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+except RuntimeError as err:
+    print("RuntimeError:", str(err)[:70], "...")
+```
+
+```text
+flash vs math, max abs diff: 6.556510925292969e-07
+auto  vs math, max abs diff: 6.556510925292969e-07
+mask  vs math, max abs diff: 6.556510925292969e-07
+RuntimeError: No viable backend for scaled_dot_product_attention was found. This is  ...
+```
+
+A few things to notice:
+
+- `enable_gqa=True` lets 8 query heads share 2 key/value heads without you calling `repeat_interleave`; see [Multi-Query and Grouped-Query Attention](../2-llm-attention/5-llm-mqa-gqa.mdx).
+- Prefer `is_causal=True` over passing a causal `attn_mask`. On CUDA, an explicit mask disqualifies the FlashAttention backend and SDPA drops to the memory-efficient or math kernel, which can be several times slower and, for the math kernel, quadratic in memory.
+- If you want to *prove* a model uses the flash kernel, wrap a forward pass in `sdpa_kernel(SDPBackend.FLASH_ATTENTION)`. If anything disqualifies it, you get an error naming the reason (PyTorch also prints warnings explaining why each backend was rejected).
+
+On a CUDA GPU the backends really differ. This script times each one for a causal BF16 attention (1 x 8 heads x 4,096 tokens x 64) and shows what an explicit mask does:
+
+```python
+import time
+import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+torch.manual_seed(0)
+B, H, N, d = 1, 8, 4096, 64
+q, k, v = (torch.randn(B, H, N, d, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+causal_mask = torch.ones(N, N, dtype=torch.bool, device="cuda").tril()
+
+def run(backend, **kw):
+    try:
+        with sdpa_kernel(backend):
+            F.scaled_dot_product_attention(q, k, v, **kw)          # warm-up
+            torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+            t0 = time.perf_counter()
+            for _ in range(20):
+                out = F.scaled_dot_product_attention(q, k, v, **kw)
+            torch.cuda.synchronize()
+        ms = (time.perf_counter() - t0) / 20 * 1e3
+        return f"{ms:6.3f} ms  peak {torch.cuda.max_memory_allocated() / 2**20:5.0f} MiB"
+    except RuntimeError:
+        return "not available for these inputs"
+
+for backend in (SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH):
+    print(f"{backend.name:20s} is_causal=True : {run(backend, is_causal=True)}")
+print(f"{'FLASH_ATTENTION':20s} explicit mask  : {run(SDPBackend.FLASH_ATTENTION, attn_mask=causal_mask)}")
+print(f"{'EFFICIENT_ATTENTION':20s} explicit mask  : {run(SDPBackend.EFFICIENT_ATTENTION, attn_mask=causal_mask)}")
+```
+
+Measured on an RTX 4060 Ti (8 GB, Ada, compute capability 8.9) with PyTorch 2.14 and CUDA 13.0:
+
+```text
+FLASH_ATTENTION      is_causal=True :  0.507 ms  peak    36 MiB
+EFFICIENT_ATTENTION  is_causal=True :  0.588 ms  peak    36 MiB
+CUDNN_ATTENTION      is_causal=True :  0.594 ms  peak    36 MiB
+MATH                 is_causal=True : 38.399 ms  peak  1288 MiB
+FLASH_ATTENTION      explicit mask  : not available for these inputs
+EFFICIENT_ATTENTION  explicit mask  :  1.423 ms  peak    76 MiB
+```
+
+The three fused kernels are within about 15% of each other and use 36 MiB. The math backend materializes the 4,096 x 4,096 scores per head: it is 75 times slower and needs 1.3 GB. Passing the causal mask as a tensor disqualifies the flash kernel entirely, and the memory-efficient kernel that takes over is almost 3 times slower than `is_causal=True`, because it has to read the mask and cannot skip the tiles above the diagonal.
+
+### Switching the Flash Backend to FlashAttention-3 or -4
+
+The CUDA flash backend in PyTorch is FlashAttention-2. Recent releases let an installed FlashAttention-3 or -4 take over the same backend. `torch.nn.attention.activate_flash_attention_impl` appeared with `"FA4"` support in PyTorch 2.10, and `"FA3"` was added in 2.11. GPU-only (FA3: Hopper; FA4: Hopper or Blackwell), not run here:
+
+```python
+# GPU-only: requires `pip install flash-attn-4` (or a FlashAttention-3 build) and a supported GPU.
+import torch
+import torch.nn.functional as F
+from torch.nn.attention import (SDPBackend, activate_flash_attention_impl,
+                                list_flash_attention_impls, restore_flash_attention_impl,
+                                sdpa_kernel)
+
+print(list_flash_attention_impls())        # e.g. ['FA3', 'FA4']
+activate_flash_attention_impl("FA4")       # SDPA's flash backend now calls FlashAttention-4
+
+q = torch.randn(1, 32, 8192, 128, device="cuda", dtype=torch.bfloat16)
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    out = F.scaled_dot_product_attention(q, q, q, is_causal=True)
+
+restore_flash_attention_impl()             # back to the built-in FlashAttention-2
+```
+
+## Calling the flash-attn Package Directly
+
+The `flash-attn` package from Dao-AILab gives you features SDPA does not expose: sliding windows, soft-capping, ALiBi, a paged KV cache and, most importantly for training, **variable-length batches without padding**. Install it on Linux with a CUDA toolkit; building from source can take a long time, so limit the parallel jobs on machines with less RAM:
+
+```bash
+pip install packaging psutil ninja
+MAX_JOBS=4 pip install flash-attn --no-build-isolation   # FlashAttention-2
+pip install flash-attn-4                                  # FlashAttention-4 (Hopper, Blackwell)
+```
+
+Note the different tensor layout: `flash_attn_func` takes `(batch, seq_len, n_heads, head_dim)`, not SDPA's `(batch, n_heads, seq_len, head_dim)`. Mixing them up is a classic bug that produces garbage without raising an error when the sequence length equals the number of heads, and a shape error otherwise.
+
+There was no prebuilt `flash-attn` wheel for this page's test setup (PyTorch 2.14, CUDA 13.0, Python 3.14; the latest release, v2.8.3.post2, ships wheels up to PyTorch 2.8 and Python 3.13), and compiling it takes a long time. The `kernels` library offers a way around that: it downloads a precompiled FlashAttention-2 build from the Hugging Face Hub with the same functions. The example below uses it (`pip install kernels`); with the `flash-attn` package installed, replace the two `get_kernel` lines with `from flash_attn import flash_attn_func, flash_attn_varlen_func`. It checks each call against SDPA:
+
+```python
+import torch
+import torch.nn.functional as F
+from kernels import get_kernel
+
+# Precompiled FlashAttention-2 from the Hugging Face Hub (same API as `flash_attn`).
+fa = get_kernel("kernels-community/flash-attn2", version=3)
+flash_attn_func, flash_attn_varlen_func = fa.flash_attn_func, fa.flash_attn_varlen_func
+
+torch.manual_seed(0)
+B, N, Hq, Hkv, d = 2, 4096, 32, 8, 128
+q = torch.randn(B, N, Hq, d, device="cuda", dtype=torch.bfloat16)   # (batch, seq, heads, dim)
+k = torch.randn(B, N, Hkv, d, device="cuda", dtype=torch.bfloat16)  # GQA: fewer KV heads
+v = torch.randn(B, N, Hkv, d, device="cuda", dtype=torch.bfloat16)
+
+out = flash_attn_func(q, k, v, causal=True)                          # (B, N, Hq, d)
+ref = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                     is_causal=True, enable_gqa=True).transpose(1, 2)
+print("flash_attn_func vs SDPA, max abs diff:", (out - ref).abs().max().item())
+
+# Sliding window: each query sees itself and the previous 255 keys.
+local = flash_attn_func(q, k, v, causal=True, window_size=(255, 0))
+i = torch.arange(N, device="cuda")
+band = (i[:, None] >= i[None, :]) & (i[:, None] - i[None, :] < 256)
+ref_local = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                           attn_mask=band, enable_gqa=True).transpose(1, 2)
+print("sliding window vs masked SDPA, max abs diff:", (local - ref_local).abs().max().item())
+
+# Packed variable-length batch: documents of 1000, 3000 and 96 tokens, no padding.
+lengths = torch.tensor([1000, 3000, 96], device="cuda")
+cu = F.pad(lengths.cumsum(0), (1, 0)).to(torch.int32)               # [0, 1000, 4000, 4096]
+T = int(lengths.sum())
+qp = torch.randn(T, Hq, d, device="cuda", dtype=torch.bfloat16)     # (total_tokens, heads, dim)
+kp = torch.randn(T, Hkv, d, device="cuda", dtype=torch.bfloat16)
+vp = torch.randn_like(kp)
+out_p = flash_attn_varlen_func(qp, kp, vp, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                               max_seqlen_q=3000, max_seqlen_k=3000, causal=True)
+worst = 0.0
+for s, e in zip(cu[:-1].tolist(), cu[1:].tolist()):                 # each document on its own
+    r = F.scaled_dot_product_attention(qp[s:e].transpose(0, 1)[None], kp[s:e].transpose(0, 1)[None],
+                                       vp[s:e].transpose(0, 1)[None], is_causal=True,
+                                       enable_gqa=True)[0].transpose(0, 1)
+    worst = max(worst, (out_p[s:e] - r).abs().max().item())
+print("varlen vs per-document SDPA, max abs diff:", worst)
+print(f"peak GPU memory: {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
+```
+
+Measured on an RTX 4060 Ti (Ada), with `kernels-community/flash-attn2` version 3:
+
+```text
+flash_attn_func vs SDPA, max abs diff: 0.00390625
+sliding window vs masked SDPA, max abs diff: 0.00390625
+varlen vs per-document SDPA, max abs diff: 0.001953125
+peak GPU memory: 519 MiB
+```
+
+The differences are one or two BF16 rounding steps (BF16 has 8 bits of precision, so values near 1 are spaced 0.0039 apart). The sliding-window call (`window_size=(255, 0)` means 255 keys to the left plus the query itself) matches a banded mask, and the packed batch matches running each document on its own.
+
+The varlen form makes each document attend only to itself, which is the document masking used when [packing pretraining sequences](../6-llm-pretraining/1-llm-training-objective.mdx), and it wastes no compute on padding. PyTorch now has a native counterpart, `torch.nn.attention.varlen.varlen_attn`, with the same `cu_seq` convention. For decoding, `flash_attn_with_kvcache` appends new keys and values to a (possibly paged) cache in place and attends over it in one call; see [The KV Cache](../10-llm-inference/2-llm-kv-cache.mdx).
+
+## FlexAttention: Custom Masks Without Custom Kernels
+
+Every attention variant used to need its own kernel: causal, sliding window, prefix-LM, document masking, ALiBi, soft-capping. FlexAttention (PyTorch team, introduced in PyTorch 2.5 in 2024; described in Dong et al., "Flex Attention: A Programming Model for Generating Optimized Attention Kernels", 2024) lets you write the variant as two small Python functions and has `torch.compile` generate a fused, tiled kernel in the FlashAttention style:
+
+- a **`score_mod(score, b, h, q_idx, kv_idx)`** returns a modified score (bias, soft-cap, ALiBi);
+- a **`mask_mod(b, h, q_idx, kv_idx)`** returns whether the query may see the key. `create_block_mask` evaluates it once per tile to build a `BlockMask`, so fully masked tiles are skipped exactly like causal block skipping in FlashAttention.
+
+The example combines a causal sliding window of 256 tokens (as in Mistral 7B or Gemma's local layers) with Gemma 2's tanh soft-capping, then checks against a dense reference. It runs on CPU; `torch.compile` needs a working C++ compiler.
+
+```python
+import torch
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
+
+torch.manual_seed(0)
+B, H, N, d, WINDOW = 1, 4, 1024, 64, 256
+q, k, v = (torch.randn(B, H, N, d) for _ in range(3))     # (batch, heads, seq, head_dim)
+
+# A mask_mod answers "may query q_idx look at key kv_idx?" for one position pair.
+def causal(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+def sliding_window(b, h, q_idx, kv_idx):
+    return q_idx - kv_idx < WINDOW
+
+mask_mod = and_masks(causal, sliding_window)
+block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=N, KV_LEN=N, device="cpu")
+print(block_mask)                                          # which 128x128 tiles are live
+
+# A score_mod rewrites one score; here tanh soft-capping as in Gemma 2.
+def softcap(score, b, h, q_idx, kv_idx):
+    return 50.0 * torch.tanh(score / 50.0)
+
+flex = torch.compile(flex_attention)                       # compiles to a fused kernel
+out = flex(q, k, v, score_mod=softcap, block_mask=block_mask)
+
+# Reference with an explicit dense mask.
+i = torch.arange(N)
+dense = (i[:, None] >= i[None, :]) & (i[:, None] - i[None, :] < WINDOW)
+s = q @ k.transpose(-2, -1) / d**0.5
+s = 50.0 * torch.tanh(s / 50.0)
+ref = torch.softmax(s.masked_fill(~dense, float("-inf")), dim=-1) @ v
+print("flex vs dense reference, max abs diff:", (out - ref).abs().max().item())
+```
+
+```text
+BlockMask(shape=(1, 1, 1024, 1024), sparsity=67.19%, 
+(0, 0)
+██              
+████            
+██████          
+  ██████        
+    ██████      
+      ██████    
+        ██████  
+          ██████
+)
+flex vs dense reference, max abs diff: 7.748603820800781e-07
+```
+
+The printed `BlockMask` shows which $128 \times 128$ tiles are computed: only the diagonal band, 67% of tiles skipped. The cost of FlexAttention is compile time and some peak performance compared with a hand-written kernel for the same pattern, in exchange for writing new attention variants in a few lines.
+
+## Hugging Face Transformers: attn_implementation
+
+`transformers` lets you choose the attention kernel per model with `attn_implementation`, either when loading or later. In version 5 the accepted values include:
+
+| Value | Kernel |
+| --- | --- |
+| `"eager"` | plain PyTorch matmul and softmax (needed for `output_attentions=True`) |
+| `"sdpa"` | `F.scaled_dot_product_attention`; the default when available |
+| `"flash_attention_2"` | the `flash-attn` package |
+| `"flash_attention_3"` | FlashAttention-3 from the `hopper/` build |
+| `"flash_attention_4"` | FlashAttention-4 from `flash_attn.cute` |
+| `"flex_attention"` | PyTorch FlexAttention |
+| a Hub kernel such as `"kernels-community/flash-attn2"` | a precompiled kernel downloaded with the `kernels` library |
+
+If you request `"flash_attention_2"` but the `flash-attn` package is not installed and the `kernels` library is, `transformers` falls back to the precompiled Hub kernel and logs a warning, which saves the long compile. Loading a real model looks like this (GPU-only for the flash values; in v5 the dtype argument is `dtype`, with `torch_dtype` kept for backward compatibility):
+
+```python
+# GPU-only for flash_attention_*; "sdpa" works on CPU too. Not run here: an 8B model
+# in BF16 needs about 16 GB of GPU memory.
+import torch
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-8B",
+    dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+    device_map="cuda",
+)
+```
+
+To check that the implementations agree, the following builds a tiny random Llama model locally (no download), switches its attention implementation in place with `set_attn_implementation`, and compares logits:
+
+```python
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+torch.manual_seed(0)
+config = LlamaConfig(vocab_size=1000, hidden_size=256, intermediate_size=512,
+                     num_hidden_layers=2, num_attention_heads=8, num_key_value_heads=2,
+                     max_position_embeddings=512)
+model = LlamaForCausalLM(config).eval()                    # random weights, no download
+ids = torch.randint(0, 1000, (2, 128))
+
+logits = {}
+for impl in ("eager", "sdpa", "flex_attention"):
+    model.set_attn_implementation(impl)                    # switch kernels in place
+    with torch.no_grad():
+        logits[impl] = model(ids).logits
+    print(f"{impl:15s} config says: {model.config._attn_implementation}")
+
+for impl in ("sdpa", "flex_attention"):
+    diff = (logits[impl] - logits["eager"]).abs().max().item()
+    print(f"{impl:15s} vs eager, max abs diff of logits: {diff:.1e}")
+```
+
+```text
+eager           config says: eager
+sdpa            config says: sdpa
+flex_attention  config says: flex_attention
+sdpa            vs eager, max abs diff of logits: 7.7e-07
+flex_attention  vs eager, max abs diff of logits: 7.7e-07
+```
+
+On the GPU, the same comparison with `"flash_attention_2"` added shows the Hub-kernel fallback at work, since the `flash-attn` package was not installed:
+
+```python
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+torch.manual_seed(0)
+config = LlamaConfig(vocab_size=1000, hidden_size=256, intermediate_size=512,
+                     num_hidden_layers=2, num_attention_heads=8, num_key_value_heads=2,
+                     max_position_embeddings=2048)
+model = LlamaForCausalLM(config).to("cuda", torch.bfloat16).eval()   # random weights
+ids = torch.randint(0, 1000, (2, 1024), device="cuda")
+
+logits = {}
+for impl in ("eager", "sdpa", "flash_attention_2"):
+    model.set_attn_implementation(impl)
+    with torch.no_grad():
+        logits[impl] = model(ids).logits.float()
+    print(f"{impl:18s} -> {model.config._attn_implementation}")
+for impl in ("sdpa", "flash_attention_2"):
+    print(f"{impl:18s} vs eager, max abs diff of logits: "
+          f"{(logits[impl] - logits['eager']).abs().max().item():.1e}")
+```
+
+Measured on an RTX 4060 Ti (BF16, so differences of about 1e-2 in the logits are rounding):
+
+```text
+eager              -> eager
+sdpa               -> sdpa
+[transformers] You do not have `flash_attn` installed, using `kernels-community/flash-attn2` from the `kernels` library instead!
+flash_attention_2  -> kernels-community/flash-attn2
+sdpa               vs eager, max abs diff of logits: 1.2e-02
+flash_attention_2  vs eager, max abs diff of logits: 1.6e-02
+```
+
+## vLLM: Attention Backends for Serving
+
+vLLM chooses an attention backend per GPU when no backend is given. According to its documentation, on Ampere and Hopper (compute capability 8.x and 9.x) it tries `FLASH_ATTN` first, then `FLASHINFER`, `TRITON_ATTN` and `FLEX_ATTENTION`; on Blackwell (10.x) FlashInfer comes first. The `FLASH_ATTN` backend itself uses FlashAttention-4 on Blackwell, FlashAttention-3 on Hopper and FlashAttention-2 otherwise. Models with Multi-head Latent Attention, such as DeepSeek, use dedicated MLA backends instead. You can override the choice:
+
+```bash
+# Pick the backend explicitly.
+vllm serve Qwen/Qwen3-8B --attention-backend FLASH_ATTN
+
+# Same through the structured config, and pin the FlashAttention version.
+vllm serve Qwen/Qwen3-8B --attention-config.backend FLASH_ATTN \
+    --attention-config.flash_attn_version=3
+```
+
+From Python, `LLM(model=..., attention_backend="FLASH_ATTN")` does the same. vLLM's kernels are FlashAttention builds adapted for its paged KV cache; see [PagedAttention, Continuous Batching and Prefix Caching](../10-llm-inference/3-llm-paged-attention.mdx). Backend names change between vLLM releases, so check the attention backends page for your installed version.
+
+## A Benchmark Script
+
+This script compares a naive causal attention (which materializes the scores) with SDPA across sequence lengths, prints time, the size of the score and probability matrices the naive version allocates, peak GPU memory when a GPU is present, and the maximum difference. It runs as-is on CPU or GPU.
+
+```python
+import time
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+def naive(q, k, v):
+    s = q @ k.transpose(-2, -1) * q.shape[-1] ** -0.5           # (B, H, N, N) in memory
+    n = q.shape[-2]
+    causal = torch.ones(n, n, dtype=torch.bool, device=q.device).tril()
+    return torch.softmax(s.masked_fill(~causal, float("-inf")), dim=-1) @ v
+
+def sdpa(q, k, v):
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+def measure(fn, q, k, v, repeat=5):
+    fn(q, k, v)                                                    # warm-up
+    if device == "cuda":
+        torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        out = fn(q, k, v)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    ms = (time.perf_counter() - t0) / repeat * 1e3
+    mem = torch.cuda.max_memory_allocated() / 2**20 if device == "cuda" else float("nan")
+    return ms, mem, out
+
+B, H, d = 1, 8, 64
+print(f"device={device} dtype={dtype}  B={B} H={H} d={d}")
+print(f"{'N':>6} {'naive ms':>9} {'sdpa ms':>8} {'speedup':>8} {'S+P MiB':>8}"
+      f" {'peak naive':>10} {'peak sdpa':>9} {'max diff':>9}")
+for N in (512, 1024, 2048, 4096):
+    q, k, v = (torch.randn(B, H, N, d, device=device, dtype=dtype) for _ in range(3))
+    t_naive, m_naive, o1 = measure(naive, q, k, v)
+    t_sdpa, m_sdpa, o2 = measure(sdpa, q, k, v)
+    sp_mib = 2 * B * H * N * N * torch.finfo(dtype).bits / 8 / 2**20   # S and P matrices
+    print(f"{N:6d} {t_naive:9.2f} {t_sdpa:8.2f} {t_naive / t_sdpa:7.1f}x {sp_mib:8.0f}"
+          f" {m_naive:10.0f} {m_sdpa:9.0f} {(o1 - o2).abs().max().item():9.1e}")
+```
+
+On a heavily loaded CPU, which makes timings noisy, it printed:
+
+```text
+device=cpu dtype=torch.float32  B=1 H=8 d=64
+     N  naive ms  sdpa ms  speedup  S+P MiB peak naive peak sdpa  max diff
+   512     14.92     5.48     2.7x       16        nan       nan   6.0e-07
+  1024     88.94    15.40     5.8x       64        nan       nan   6.0e-07
+  2048    405.39    99.03     4.1x      256        nan       nan   5.1e-07
+  4096   1510.05   165.00     9.2x     1024        nan       nan   7.2e-07
+```
+
+Even on CPU, the fused kernel is several times faster, and the gap grows with $N$ because the naive version streams ever larger $N \times N$ matrices through memory. Peak memory is reported only on CUDA (`nan` on CPU).
+
+On an RTX 4060 Ti (8 GB, Ada) the same script picks BF16 and the flash backend:
+
+```text
+device=cuda dtype=torch.bfloat16  B=1 H=8 d=64
+     N  naive ms  sdpa ms  speedup  S+P MiB peak naive peak sdpa  max diff
+   512      0.13     0.02     5.5x        8         22        11   1.6e-02
+  1024      0.38     0.05     7.1x       32         62        15   1.6e-02
+  2048      2.71     0.15    17.7x      128        214        21   1.6e-02
+  4096     11.29     0.50    22.4x      512        812        34   1.6e-02
+```
+
+Here the memory story is visible directly. The naive version's peak grows about four times per doubling of $N$ (812 MiB at 4,096, almost all of it scores, mask and probabilities), while SDPA's peak grows linearly and is mostly the inputs and output. The speedup grows from 5x to 22x as the naive version becomes more memory-bound. The differences of 1.6e-2 come from BF16 rounding of the naive path's intermediate matrices; they are the same at every length. When you benchmark on a GPU, always call `torch.cuda.synchronize()` before reading the clock, as the script does; CUDA calls return before the kernel finishes.
+
+:::tip
+When a model is slower than expected, the first thing to check is whether the fast kernel is actually used. Run one forward pass inside `sdpa_kernel(SDPBackend.FLASH_ATTENTION)`; an error tells you what disqualified it (an explicit mask, FP32 inputs, an unsupported head dimension or an old GPU).
+:::
+
+## Common Mistakes
+
+- **Passing a causal mask tensor instead of `is_causal=True`.** On CUDA this silently moves SDPA off the flash kernel.
+- **Running FP32 on the GPU and expecting FlashAttention.** The CUDA flash kernels need FP16 or BF16; FP32 falls back to the memory-efficient or math backend.
+- **Confusing layouts.** SDPA and FlexAttention use `(batch, heads, seq, dim)`; `flash_attn_func` uses `(batch, seq, heads, dim)`; varlen functions use `(total_tokens, heads, dim)`.
+- **Padding packed batches.** Padding wastes compute and needs a mask; use the varlen API or a FlexAttention document mask instead.
+- **Requesting `output_attentions=True` with a fused kernel.** Fused kernels never materialize the attention probabilities; `transformers` needs `"eager"` for that.
+- **Comparing timings without synchronization or warm-up.** The first call includes compilation and autotuning, and CUDA is asynchronous.
+
+## Summary
+
+- `F.scaled_dot_product_attention` is the entry point; `sdpa_kernel` selects among the flash, memory-efficient, cuDNN and math backends, and `activate_flash_attention_impl` swaps in FlashAttention-3 or -4 in recent PyTorch.
+- The `flash-attn` package adds variable-length (packed) batches, sliding windows, soft-capping and KV-cache helpers, with a `(batch, seq, heads, dim)` layout.
+- FlexAttention turns a `score_mod` and a `mask_mod` written in Python into a compiled, tile-skipping kernel.
+- In `transformers` v5, `attn_implementation` selects `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention` or a Hub kernel; vLLM selects FlashAttention-2, -3 or -4 by GPU and can be overridden with `--attention-backend`.
+- Always verify that the intended kernel runs, and benchmark with warm-up and synchronization.
+
+## Further Reading
+
+- [torch.nn.functional.scaled_dot_product_attention](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html): official documentation, including the backend list.
+- [torch.nn.attention.sdpa_kernel](https://docs.pytorch.org/docs/stable/generated/torch.nn.attention.sdpa_kernel.html) and [activate_flash_attention_impl](https://docs.pytorch.org/docs/stable/generated/torch.nn.attention.activate_flash_attention_impl.html): backend selection.
+- [FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention](https://pytorch.org/blog/flexattention/): the PyTorch blog post that introduced the API.
+- [Flex Attention: A Programming Model for Generating Optimized Attention Kernels](https://arxiv.org/abs/2412.05496) (Dong et al., 2024): the paper behind it.
+- [Dao-AILab/flash-attention README](https://github.com/Dao-AILab/flash-attention): installation, supported GPUs and the full Python API.
+- [Hugging Face attention backends guide](https://huggingface.co/docs/transformers/main/en/attention_interface): `attn_implementation` and custom attention functions.
+- [vLLM attention backends](https://docs.vllm.ai/en/stable/design/attention_backends/): the backend priority lists and feature tables.
+- Our [PyTorch tutorial](/docs/library/pytorch) covers the tensor basics used throughout this page.
