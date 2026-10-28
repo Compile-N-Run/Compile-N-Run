@@ -82,3 +82,12 @@ systemctl list-timers cnr-wechat-pool.timer
 
 `EnvironmentFile` is read by systemd (as root) before `DynamicUser` drops privileges, so the env file can stay mode
 600. If the job stops, logins fall back to the 6-digit code once the pool is empty; nothing breaks.
+
+# Cloudflare WAF rules for the API (`cloudflare_waf_rules.py`)
+
+Keeps crawlers and page-style bot fetches away from `/api/*` on both zones before they reach a Worker (each Worker
+request counts against the Workers free tier, 100k/day; a proxy bot swarm was ~22k/day in 2026-10). Two custom rules per
+zone: block `/api/*` (except the WeChat push/profile paths) for Cloudflare's known bots, and block `GET /api/auth/session`
+without `Accept: application/json`, which the site's own JavaScript always sends. Needs an API token with Zone → Zone WAF
+→ Edit for both zones, read from `$CLOUDFLARE_WAF_TOKEN` or `~/.config/cloudflare/waf-token` (mode 600); wrangler's
+login has no firewall scope. Idempotent; `--dry-run` shows the plan.
