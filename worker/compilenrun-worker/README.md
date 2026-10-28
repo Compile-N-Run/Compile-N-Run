@@ -421,7 +421,12 @@ and drops the extra block after encrypting. Replies to encrypted pushes are encr
 
 `POST /api/events` (src/events/routes.js) stores page views and interaction events in the `cnr_events` table
 (accounts-events-schema.sql) together with the account id, so activity can be joined to names and emails. The same
-events go to Google Analytics 4 with the account id as `user_id` (hugo/assets/js/analytics.js). Two senders:
+events go to Google Analytics 4 with the account id as `user_id` (hugo/assets/js/analytics.js). **Write budget:**
+every stored event costs six D1 row writes (row, four indexes, autoincrement) against the free tier's 100k rows
+written a day for the whole account, so anonymous `page_view`/`page_engaged` from the site are not stored, neither
+by `analytics.js` nor by the Worker (GA4 keeps them; guests made ~11k such rows a day in 2026-10). Signed-in readers'
+page views, every interaction event (`login`, `run_code`, `moodle_promo_click`, ...) and all Moodle events are kept,
+so "visitors" in the reports counts guests who did something, not every reader. Two senders:
 
 - the site: beacons from `analytics.js`; the session cookie identifies the reader. Origin must be SITE_ORIGIN (or a
   same-origin request without Origin, which browsers mark with `Sec-Fetch-Site: same-origin`).

@@ -19,6 +19,7 @@ class D1 {
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-qr-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-userinfo-schema.sql', import.meta.url), 'utf8'));
     this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-wechat-indexes-schema.sql', import.meta.url), 'utf8'));
+    this.sqlite.exec(readFileSync(new URL('../worker/compilenrun-worker/accounts-events-schema.sql', import.meta.url), 'utf8'));
   }
   prepare(sql) {
     const native = this.sqlite.prepare(sql);
@@ -1235,4 +1236,26 @@ test('the reply links to 网页授权 once WECHAT_APP_SECRET is set; the callbac
     assert.equal((await handleAccounts(request('/api/auth/account', { method: 'DELETE', cookie: sessionCookie, headers: authHeaders(await sessionOf(sessionCookie)) }), env)).status, 200);
     assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_account_wechat_userinfo').get().n, 0);
   } finally { globalThis.fetch = previous; }
+});
+
+// ---- first-party events: what is stored, under the D1 write budget ----
+import { handleEvents } from '../worker/compilenrun-worker/src/events/routes.js';
+const postEvents = (body, cookie = '') => handleEvents(new Request(SITE + '/api/events', {
+  method: 'POST', headers: { Origin: SITE, 'content-type': 'text/plain', ...(cookie ? { Cookie: cookie } : {}) }, body: JSON.stringify(body) }), env);
+const eventNames = () => db.sqlite.prepare('SELECT name FROM cnr_events ORDER BY id').all().map(r => r.name);
+
+test('anonymous site page views are not stored; interaction events and signed-in page views are', async () => {
+  const events = [{ name: 'page_view', path: '/docs/python/' }, { name: 'page_engaged', path: '/docs/python/', props: { seconds: 30 } },
+    { name: 'moodle_promo_click', path: '/docs/python/', props: { variant: 'python' } }, { name: 'run_code', path: '/docs/python/' }];
+  assert.equal((await postEvents({ site: 'www', visitor: 'visitor-anonymous-01', events })).status, 204);
+  assert.deepEqual(eventNames(), ['moodle_promo_click', 'run_code'], 'a guest\'s page_view/page_engaged rows are dropped (GA4 keeps them)');
+  assert.equal((await postEvents({ site: 'www', visitor: 'visitor-anonymous-01', events: events.slice(0, 2) })).status, 204, 'nothing left to store is still 204');
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM cnr_events').get().n, 2);
+  const { cookie, user } = await login();
+  assert.equal((await postEvents({ site: 'www', visitor: 'visitor-signed-in-0001', events: events.slice(0, 2) }, cookie)).status, 204);
+  const mine = db.sqlite.prepare('SELECT name, user_id FROM cnr_events WHERE visitor_id = ? ORDER BY id').all('visitor-signed-in-0001').map(r => ({ ...r }));
+  assert.deepEqual(mine, [{ name: 'page_view', user_id: user.id }, { name: 'page_engaged', user_id: user.id }], 'a signed-in reader\'s page views are kept with the account id');
+  // Moodle pages are followed per learner even when the identity cannot be resolved (few hundred a day).
+  assert.equal((await postEvents({ site: 'moodle', visitor: 'visitor-moodle-000001', events: events.slice(0, 1) })).status, 204);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS n FROM cnr_events WHERE site = 'moodle' AND name = 'page_view'").get().n, 1);
 });

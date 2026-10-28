@@ -77,11 +77,16 @@
     try { fetch(ENDPOINT, { method: 'POST', body: body, headers: { 'content-type': 'text/plain' }, credentials: SITE === 'www' ? 'same-origin' : 'omit', keepalive: true }).catch(function () {}); } catch (_) { /* offline */ }
     if (queue.length) timer = setTimeout(flush, 50);
   }
+  // Anonymous page views and engagement on the site stay in GA4 only: the first-party table exists to follow
+  // signed-in learners (and Moodle), and storing every guest's page_view cost ~70k D1 row writes a day (the free
+  // tier allows 100k). Interaction events (login, run_code, moodle_promo_click, ...) are kept for everyone.
+  function stored(name) { return SITE !== 'www' || userApplied !== null || (name !== 'page_view' && name !== 'page_engaged'); }
   function track(name, props, options) {
     if (!allowed() || !/^[a-z][a-z0-9_]{0,39}$/.test(name)) return;
     options = options || {};
-    queue.push({ name: name, path: location.pathname, ts: Date.now(), props: props || {} });
     if (options.ga !== false && hasGtag()) window.gtag('event', name, props || {});
+    if (!stored(name)) return;
+    queue.push({ name: name, path: location.pathname, ts: Date.now(), props: props || {} });
     if (options.now || queue.length >= 10) flush(); else if (!timer) timer = setTimeout(flush, 5000);
   }
   window.cnrTrack = function (name, props) { track(String(name), props && typeof props === 'object' ? props : {}); };

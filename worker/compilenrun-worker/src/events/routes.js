@@ -94,6 +94,11 @@ export async function handleEvents(request, env, ctx) {
       userId = current ? current.user.id : null;
     }
   } catch (_) { /* identity is optional: keep the events anonymous */ }
+  // Anonymous site page views and engagement are not stored (GA4 has them): each row costs six D1 row writes
+  // (row, four indexes, autoincrement) and guests made ~11k of them a day against a 100k/day free-tier budget.
+  // analytics.js already skips them; this keeps old cached pages and other senders to the same rule.
+  const kept = site === 'www' && !userId ? events.filter(e => e.name !== 'page_view' && e.name !== 'page_engaged') : events;
+  if (!kept.length) return reply(204, headers || {});
   const country = request.headers.get('CF-IPCountry') || request.cf?.country || null;
   const ua = (request.headers.get('User-Agent') || '').slice(0, 200) || null;
   const referrer = typeof body.referrer === 'string' ? body.referrer.slice(0, 500) : null;
@@ -101,7 +106,7 @@ export async function handleEvents(request, env, ctx) {
   const time = now();
   const insert = env.DB.prepare(`INSERT INTO cnr_events (ts, client_ts, site, user_id, visitor_id, session_id, name, path, props, referrer, country, ua)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`);
-  const rows = events.map(e => {
+  const rows = kept.map(e => {
     // Moodle-side identity rides along in props when no site account could be matched, so "who" is still answerable.
     const props = extra && !userId ? JSON.stringify({ ...JSON.parse(e.props), ...extra }) : (extra ? JSON.stringify({ ...JSON.parse(e.props), moodle_user_id: extra.moodle_user_id }) : e.props);
     return insert.bind(time, e.ts, site, userId, body.visitor, sessionId, e.name, e.path, props, e.name === 'page_view' ? referrer : null, country, ua);

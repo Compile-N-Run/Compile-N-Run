@@ -529,6 +529,26 @@ test('with data-auth-default="wechat" the login form opens on the QR code and ke
  assert.deepEqual(errors,[]);
 });
 
+test('the sign-in invite does not start a WeChat login by itself, even in WeChat-default mode',async t=>{
+ const account=state();account.providers.wechat=true;
+ const{page,errors}=await setup(t,account,()=>{window.CNR_INVITE_DELAY_MS=200;window.CNR_WECHAT_POLL_MS=50;},'/docs/python/intro/?wechat-default=1');
+ await page.waitForTimeout(400);
+ await page.goto(page.url().replace('/intro/','/next/'));await page.evaluate(()=>CNRAuth.ready());
+ await page.locator('[data-auth-dialog]').waitFor({state:'visible'});
+ assert.match(await page.locator('[data-auth-message]').innerText(),/free account/);
+ await page.waitForTimeout(300);
+ assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/start').length,0,'an unasked-for dialog consumes no QR ticket');
+ assert.equal(await page.locator('[data-auth-wechat-panel]').isVisible(),false);
+ assert.equal(await page.locator('[data-auth-wechat]').isVisible(),true,'the WeChat button is offered instead');
+ await page.locator('[data-auth-wechat]').click();
+ await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});await waitForTicket(page);
+ assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/start').length,1,'the reader\'s click starts the login');
+ await page.keyboard.press('Escape');await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
+ await open(page);await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});await waitForTicket(page);
+ assert.equal(account.calls.filter(call=>call.path==='/api/auth/wechat/start').length,2,'a dialog the reader opens still starts on the QR code');
+ assert.deepEqual(errors,[]);
+});
+
 test('a profile picture covers the initials and a broken one falls back to them',async t=>{
  const account=state();account.user={...user(),avatar:'https://thirdwx.qlogo.cn/mmopen/ok/132'};
  const{page,errors}=await setup(t,account);
