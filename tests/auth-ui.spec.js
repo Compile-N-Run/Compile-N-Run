@@ -37,7 +37,7 @@ let browser,server,origin;
 before(async()=>{
  server=http.createServer((req,res)=>{
   if(['/auth-ui.js','/auth-ui.css','/learning.js','/learning-sync.js'].includes(req.url)){const ext=req.url.endsWith('.js')?'js':'css';res.setHeader('Content-Type',ext==='js'?'text/javascript':'text/css');res.end(fs.readFileSync(path.join(root,'hugo/assets',ext,req.url.slice(1))));return;}
-  res.setHeader('Content-Type','text/html');res.end(`<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auth UI test</title><meta name="cnr-google-client-id" content="test-client.apps.googleusercontent.com"><style>*{box-sizing:border-box}body{margin:0;font:16px/1.5 system-ui}:root{--ifm-font-family-base:system-ui;--ifm-color-primary:#176647;--ifm-background-color:white;--ifm-background-surface-color:white;--ifm-font-color-base:#20313e;--ifm-navbar-background-color:white;--ifm-color-emphasis-100:#f4f6f8;--ifm-color-emphasis-200:#dce2e8;--ifm-color-emphasis-300:#adb9c5;--ifm-color-emphasis-700:#52606d}header{display:flex;align-items:center;justify-content:space-between;padding:12px;gap:12px}main{padding:2rem}</style><link rel="stylesheet" href="/auth-ui.css"></head><body><header><a href="/">Compile N Run</a>${req.url.includes('wechat-default=1')?partial.replace('data-auth-dialog','data-auth-dialog data-auth-default="wechat"'):partial}</header><main><h1>Keep learning</h1><button id="outside">Outside control</button></main>${req.url.startsWith('/integrated')?'<script>window.CNR_SYNC_ENABLED=true;window.CNR_PAGE={};</script><script src="/learning.js" defer></script><script src="/learning-sync.js" defer></script>':''}<script src="/auth-ui.js" defer></script></body></html>`);
+  res.setHeader('Content-Type','text/html');res.end(`<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auth UI test</title><meta name="cnr-google-client-id" content="test-client.apps.googleusercontent.com"><style>*{box-sizing:border-box}body{margin:0;font:16px/1.5 system-ui}:root{--ifm-font-family-base:system-ui;--ifm-color-primary:#176647;--ifm-background-color:white;--ifm-background-surface-color:white;--ifm-font-color-base:#20313e;--ifm-navbar-background-color:white;--ifm-color-emphasis-100:#f4f6f8;--ifm-color-emphasis-200:#dce2e8;--ifm-color-emphasis-300:#adb9c5;--ifm-color-emphasis-700:#52606d}header{display:flex;align-items:center;justify-content:space-between;padding:12px;gap:12px}main{padding:2rem}</style><link rel="stylesheet" href="/auth-ui.css"></head><body><header><a href="/">Compile N Run</a>${req.url.includes('wechat-default=1')?partial.replace('data-auth-dialog','data-auth-dialog data-auth-default="wechat"'+(req.url.includes('wechat-invite=1')?' data-auth-invite="wechat" data-auth-invite-delay="300"':'')):partial}</header><main><h1>Keep learning</h1><button id="outside">Outside control</button></main>${req.url.startsWith('/integrated')?'<script>window.CNR_SYNC_ENABLED=true;window.CNR_PAGE={};</script><script src="/learning.js" defer></script><script src="/learning-sync.js" defer></script>':''}<script src="/auth-ui.js" defer></script></body></html>`);
  });
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));origin='http://127.0.0.1:'+server.address().port;browser=await chromium.launch({headless:true});
 });
@@ -551,6 +551,23 @@ test('the sign-in invite starts the WeChat QR code only once the reader points a
  await page.keyboard.press('Escape');await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
  await open(page);await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});await waitForTicket(page);
  assert.equal(starts(),2,'a dialog the reader opens still starts on the QR code');
+ assert.deepEqual(errors,[]);
+});
+
+test('with data-auth-invite="wechat" the invite comes a few seconds into the first page and starts on the QR code',async t=>{
+ const account=state();account.providers.wechat=true;
+ const{page,errors}=await setup(t,account,()=>{window.CNR_WECHAT_POLL_MS=5000;},'/docs/python/intro/?wechat-default=1&wechat-invite=1');
+ const starts=()=>account.calls.filter(call=>call.path==='/api/auth/wechat/start').length;
+ await page.waitForTimeout(150);
+ assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false,'the reader gets a few seconds first');
+ await page.locator('[data-auth-dialog]').waitFor({state:'visible'});
+ await page.locator('[data-auth-wechat-panel]').waitFor({state:'visible'});await waitForTicket(page);
+ assert.equal(starts(),1,'the invite starts the WeChat login without any interaction');
+ await page.keyboard.press('Escape');await page.locator('[data-auth-dialog]').waitFor({state:'hidden'});
+ await page.goto(page.url().replace('/intro/','/next/'));await page.evaluate(()=>CNRAuth.ready());
+ await page.waitForTimeout(600);
+ assert.equal(await page.locator('[data-auth-dialog]').isVisible(),false,'a dismissed invite is snoozed');
+ assert.equal(starts(),1);
  assert.deepEqual(errors,[]);
 });
 
